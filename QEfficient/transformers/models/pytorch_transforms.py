@@ -225,6 +225,8 @@ try:
         Qwen3_5GatedDeltaNet,
         Qwen3_5RMSNorm,
         Qwen3_5TextModel,
+        Qwen3_5VisionAttention,
+        Qwen3_5VisionModel,
     )
 
     from QEfficient.transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -233,6 +235,8 @@ try:
         QEffQwen3_5ForCausalLM,
         QEffQwen3_5GatedDeltaNet,
         QEffQwen3_5TextModel,
+        QEffQwen3_5VisionAttention,
+        QEffQwen3_5VisionModel,
     )
 
     _QWEN3_5_AVAILABLE = True
@@ -757,6 +761,8 @@ if _QWEN3_5_AVAILABLE:
             Qwen3_5DecoderLayer: QEffQwen3_5DecoderLayer,
             Qwen3_5Attention: QEffQwen3_5Attention,
             Qwen3_5GatedDeltaNet: QEffQwen3_5GatedDeltaNet,
+            Qwen3_5VisionAttention: QEffQwen3_5VisionAttention,
+            Qwen3_5VisionModel: QEffQwen3_5VisionModel,
         }
     )
 

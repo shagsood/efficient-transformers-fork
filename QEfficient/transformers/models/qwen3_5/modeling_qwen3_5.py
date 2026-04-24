@@ -24,6 +24,10 @@ RMSNorm convention: weight=zeros, forward = x * (1.0 + weight) → GemmaCustomRM
 RoPE: MRoPE with partial_rotary_factor=0.25, mrope_section=[11,11,10].
   cos/sin already have shape [bs, seq_len, head_dim] — no position_ids indexing in apply_rotary_pos_emb.
   Rotary embedding handles 2D position_ids internally (expands to 3D for temporal/height/width).
+
+VLM path (QEffQwen3_5ForConditionalGeneration):
+  Two-QPC pipeline: vision encoder (Qwen3_5VisionModel) + text decoder (QEffQwen3_5ForCausalLM).
+  Reference: QEfficient/transformers/models/qwen3_vl/modeling_qwen3_vl.py (no deepstack in Qwen3.5).
 """
 
 import math
@@ -37,9 +41,13 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Attention,
     Qwen3_5DecoderLayer,
     Qwen3_5ForCausalLM,
+    Qwen3_5ForConditionalGeneration,
     Qwen3_5GatedDeltaNet,
     Qwen3_5TextModel,
+    Qwen3_5VisionAttention,
+    Qwen3_5VisionModel,
     apply_rotary_pos_emb,
+    apply_rotary_pos_emb_vision,
     torch_chunk_gated_delta_rule,
 )
 
@@ -651,3 +659,263 @@ class QEffQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
             new_conv_states,
             new_recurrent_states,
         )
+
+
+# ---------------------------------------------------------------------------
+# VLM path — Vision Encoder + Decoder
+# ---------------------------------------------------------------------------
+# Reference: QEfficient/transformers/models/qwen3_vl/modeling_qwen3_vl.py
+#
+# Qwen3.5 differences vs Qwen3VL:
+#   - No deepstack features (simpler return from VisionModel)
+#   - VisionAttention takes config arg (not (dim, num_heads))
+#   - Image injection via masked_scatter on image_token_id positions
+# ---------------------------------------------------------------------------
+
+
+class QEffQwen3_5VisionAttention(Qwen3_5VisionAttention):
+    """
+    Replace Flash Attention cu_seqlens path with a block-diagonal static attention
+    mask so the vision encoder is ONNX-exportable at a fixed image size.
+
+    Block-diagonal mask: each image's patches attend only to each other.
+    Built entirely from tensor ops (no Python loops) — QAIC-safe.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+
+        # Block-diagonal mask from cu_seqlens — purely broadcastable, no Python loops
+        attention_mask = torch.full(
+            [1, seq_length, seq_length], torch.finfo(q.dtype).min, device=q.device, dtype=q.dtype
+        )
+        rows = torch.arange(seq_length, device=q.device).view(1, -1)
+        cols = torch.arange(seq_length, device=q.device).view(-1, 1)
+        start = cu_seqlens[:-1].view(-1, 1, 1)
+        end = cu_seqlens[1:].view(-1, 1, 1)
+        block_mask = (rows >= start) & (rows < end) & (cols >= start) & (cols < end)
+        final_mask = torch.ones((seq_length, seq_length), dtype=q.dtype, device=q.device) * torch.finfo(q.dtype).min
+        final_mask = torch.where(block_mask.any(dim=0), torch.zeros_like(final_mask), final_mask)
+        attention_mask[0] = final_mask
+
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        attn_weights = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.head_dim)
+        attn_weights = attn_weights + attention_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(0, 1).reshape(seq_length, -1)
+        return self.proj(attn_output)
+
+
+class QEffQwen3_5VisionModel(Qwen3_5VisionModel):
+    """
+    Override forward to take grid_thw as 4D (bs, t, h, w) for static ONNX shapes,
+    and override rot_pos_emb / fast_pos_embed_interpolate accordingly.
+    No deepstack — returns merged_embeds directly.
+    """
+
+    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        # grid_thw: (bs, t, h, w)
+        max_hw = max(grid_thw.shape)
+        freq_table = self.rotary_pos_emb(max_hw)
+        device = freq_table.device
+        bs, num_frames, height, width = grid_thw.shape
+        merged_h = height // self.spatial_merge_size
+        merged_w = width // self.spatial_merge_size
+
+        block_rows = torch.arange(merged_h, device=device)
+        block_cols = torch.arange(merged_w, device=device)
+        intra_r = torch.arange(self.spatial_merge_size, device=device)
+        intra_c = torch.arange(self.spatial_merge_size, device=device)
+
+        row_idx = (
+            (block_rows[:, None, None, None] * self.spatial_merge_size + intra_r[None, None, :, None])
+            .expand(merged_h, merged_w, self.spatial_merge_size, self.spatial_merge_size)
+            .reshape(-1)
+        )
+        col_idx = (
+            (block_cols[None, :, None, None] * self.spatial_merge_size + intra_c[None, None, None, :])
+            .expand(merged_h, merged_w, self.spatial_merge_size, self.spatial_merge_size)
+            .reshape(-1)
+        )
+        coords = torch.stack((row_idx, col_idx), dim=-1)
+        if num_frames > 1:
+            coords = coords.repeat(num_frames, 1)
+        return freq_table[coords].flatten(1)
+
+    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        bs, t, h, w = grid_thw.shape
+        h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
+        w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+        h_fl = h_idxs.int()
+        w_fl = w_idxs.int()
+        max_idx = torch.tensor(self.num_grid_per_side - 1)
+        h_cl = torch.minimum(h_fl + 1, max_idx)
+        w_cl = torch.minimum(w_fl + 1, max_idx)
+        dh = h_idxs - h_fl
+        dw = w_idxs - w_fl
+        bh = h_fl * self.num_grid_per_side
+        bh_c = h_cl * self.num_grid_per_side
+        idxs = [
+            (bh[None].T + w_fl[None]).flatten(),
+            (bh[None].T + w_cl[None]).flatten(),
+            (bh_c[None].T + w_fl[None]).flatten(),
+            (bh_c[None].T + w_cl[None]).flatten(),
+        ]
+        wts = [
+            ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+            ((1 - dh)[None].T * dw[None]).flatten(),
+            (dh[None].T * (1 - dw)[None]).flatten(),
+            (dh[None].T * dw[None]).flatten(),
+        ]
+        dev = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+        idx_t = torch.stack(idxs, dim=0).to(dtype=torch.long, device=dev)
+        wt_t = torch.stack(wts, dim=0).to(dtype=dtype, device=dev)
+        pe = (self.pos_embed(idx_t) * wt_t[:, :, None]).sum(0)
+        pe = pe.repeat(t, 1)
+        ms = self.spatial_merge_size
+        pe = pe.view(t, h // ms, ms, w // ms, ms, -1).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
+        return pe.unsqueeze(0).expand(bs, -1, -1).reshape(-1, pe.size(1))
+
+    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: (num_patches, channel_size=1536)
+            grid_thw:      (bs, t=1, h, w) — 4D for static ONNX shape
+        Returns:
+            merged_embeds: (bs * merged_patches, out_hidden_size=1024)
+        """
+        hidden_states = self.patch_embed(hidden_states)
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        hidden_states = hidden_states + pos_embeds
+
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        seq_len = hidden_states.size(0)
+        emb = torch.cat((rotary_pos_emb.reshape(seq_len, -1),) * 2, dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        bs, t, h, w = grid_thw.shape
+        cu_seqlens = (h * w * torch.ones(bs, dtype=torch.int32, device=hidden_states.device)).cumsum(
+            dim=0, dtype=torch.int32
+        )
+        cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int32, device=hidden_states.device), cu_seqlens])
+
+        for blk in self.blocks:
+            hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+
+        return self.merger(hidden_states)
+
+
+class QEffQwen3_5EncoderWrapper(nn.Module):
+    """
+    Standalone vision encoder for separate ONNX/QPC export.
+    Runs once per image; output retained as vision_embeds for the decode loop.
+
+    Inputs:
+        pixel_values:   (num_patches, 1536)
+        image_grid_thw: (bs, 1, h, w)
+    Output:
+        image_embeds:   (bs, merged_patches, 1024)
+    """
+
+    def __init__(self, model: Qwen3_5ForConditionalGeneration):
+        super().__init__()
+        self.model = model
+
+    def get_submodules_for_export(self) -> Type[nn.Module]:
+        return {self.model.model.visual.blocks[0].__class__}
+
+    def forward(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
+        image_embeds = self.model.model.visual(pixel_values, grid_thw=image_grid_thw)
+        bs = image_grid_thw.shape[0]
+        split_size = torch.floor_divide(torch.tensor(image_embeds.size(0)), bs)
+        return image_embeds.reshape(bs, split_size, image_embeds.size(1))
+
+
+class QEffQwen3_5DecoderWrapper(nn.Module):
+    """
+    Text decoder with vision embedding injection.
+    Wraps QEffQwen3_5TextModel + lm_head for ONNX export.
+
+    Vision injection:
+        - Prefill (seq_len > 1): replace image_token_id slots with vision_embeds patches
+        - Decode (seq_len == 1): bypass injection, use text embedding directly
+        - image_idx: cumulative patch counter — ensures correct slice on multi-image inputs
+    """
+
+    def __init__(self, model: Qwen3_5ForConditionalGeneration):
+        super().__init__()
+        self.model = model
+        self.language_model = self.model.model.language_model
+
+    def get_submodules_for_export(self) -> Type[nn.Module]:
+        return {QEffQwen3_5DecoderLayer}
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        vision_embeds: torch.Tensor,
+        position_ids: torch.LongTensor,
+        image_idx: torch.LongTensor,
+        past_key_values: Optional[List[torch.FloatTensor]],
+        past_conv_states: Optional[List[torch.Tensor]] = None,
+        past_recurrent_states: Optional[List[torch.Tensor]] = None,
+        batch_index: Optional[torch.LongTensor] = None,
+        comp_ctx_lengths: Optional[torch.LongTensor] = None,
+    ):
+        inputs_embeds = self.model.get_input_embeddings()(input_ids)
+        C = inputs_embeds.shape[-1]
+
+        selected = input_ids == self.model.config.image_token_id
+        indices1 = selected.to(torch.int64).cumsum(1) - 1
+        indices1 = torch.where(indices1 != -1, indices1 + image_idx, indices1)
+        indices0 = torch.arange(selected.unsqueeze(0).shape[0]).view(-1, 1)
+        img_expanded = vision_embeds.reshape(-1, C).unsqueeze(0)[indices0, indices1]
+        image_embeds_placed = torch.where(selected.unsqueeze(-1), img_expanded, inputs_embeds)
+        # Decode step: seq_len==1, no vision injection needed
+        inputs_embeds = torch.where(input_ids.shape[1] == torch.tensor(1), inputs_embeds, image_embeds_placed)
+
+        outputs, new_conv_states, new_recurrent_states = self.language_model(
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            past_conv_states=past_conv_states,
+            past_recurrent_states=past_recurrent_states,
+            comp_ctx_lengths=comp_ctx_lengths,
+            batch_index=batch_index,
+            use_cache=True,
+        )
+
+        logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
+        hidden_states = outputs.last_hidden_state[torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
+        logits = self.model.lm_head(hidden_states).float()
+        image_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
+
+        return logits, vision_embeds, image_idx, outputs.past_key_values, new_conv_states, new_recurrent_states
+
+
+class QEffQwen3_5ForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+    """
+    Full Qwen3.5 VLM pipeline — two-QPC strategy:
+      1. Encoder QPC  — QEffQwen3_5EncoderWrapper  (vision encoder, once per image)
+      2. Decoder QPC  — QEffQwen3_5DecoderWrapper  (text+vision decoder loop)
+    """
+
+    def get_qeff_vision_encoder(self) -> QEffQwen3_5EncoderWrapper:
+        return QEffQwen3_5EncoderWrapper(self)
+
+    def get_qeff_language_decoder(self) -> QEffQwen3_5DecoderWrapper:
+        return QEffQwen3_5DecoderWrapper(self)
