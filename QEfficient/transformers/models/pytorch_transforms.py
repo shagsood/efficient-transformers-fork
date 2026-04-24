@@ -149,6 +149,13 @@ from transformers.models.olmo2.modeling_olmo2 import (
     Olmo2Model,
     Olmo2RMSNorm,
 )
+from transformers.models.olmo3.modeling_olmo3 import (
+    Olmo3Attention,
+    Olmo3DecoderLayer,
+    Olmo3ForCausalLM,
+    Olmo3Model,
+    Olmo3RMSNorm,
+)
 from transformers.models.phi.modeling_phi import PhiAttention, PhiDecoderLayer, PhiForCausalLM, PhiModel
 from transformers.models.phi3.modeling_phi3 import (
     Phi3Attention,
@@ -412,6 +419,12 @@ from QEfficient.transformers.models.olmo2.modeling_olmo2 import (
     QEffOlmo2ForCausalLM,
     QEffOlmo2Model,
 )
+from QEfficient.transformers.models.olmo3.modeling_olmo3 import (
+    QEffOlmo3Attention,
+    QEffOlmo3DecoderLayer,
+    QEffOlmo3ForCausalLM,
+    QEffOlmo3Model,
+)
 from QEfficient.transformers.models.phi.modeling_phi import (
     QEffPhiAttention,
     QEffPhiDecoderLayer,
@@ -524,6 +537,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         Qwen3MoeRMSNorm: CustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
         Olmo2RMSNorm: CustomRMSNormAIC,
+        Olmo3RMSNorm: CustomRMSNormAIC,
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
         Qwen3VLTextRMSNorm: CustomRMSNormAIC,
     }
@@ -709,6 +723,11 @@ class KVCacheTransform(ModuleMappingTransform):
         Olmo2DecoderLayer: QEffOlmo2DecoderLayer,
         Olmo2Model: QEffOlmo2Model,
         Olmo2ForCausalLM: QEffOlmo2ForCausalLM,
+        # Olmo3
+        Olmo3Attention: QEffOlmo3Attention,
+        Olmo3DecoderLayer: QEffOlmo3DecoderLayer,
+        Olmo3Model: QEffOlmo3Model,
+        Olmo3ForCausalLM: QEffOlmo3ForCausalLM,
         # Whisper encoder and decoder layers
         WhisperPositionalEmbedding: QEffWhisperPositionalEmbedding,
         WhisperAttention: QEffWhisperAttention,
