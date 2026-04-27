@@ -301,7 +301,7 @@ class QEffMolmo2DecoderWrapper(nn.Module):
 
         next_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
         image_idx = torch.where(image_idx < next_idx, next_idx, image_idx)
-        return logits, vision_embeds, image_idx, past_key_values
+        return logits, vision_embeds, image_idx, past_key_values.to_legacy_cache()
 
 
 class QEffMolmo2Model(nn.Module):
@@ -357,7 +357,7 @@ class QEffMolmo2Model(nn.Module):
         next_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
         image_idx = torch.where(image_idx < next_idx, next_idx, image_idx)
 
-        return logits, pixel_values, image_idx, past_key_values
+        return logits, pixel_values, image_idx, past_key_values.to_legacy_cache()
 
     def get_specializations(
         self,
