@@ -363,6 +363,18 @@
       "additional_params": {}
     },
     {
+      "model_name": "allenai/Molmo2-8B",
+      "model_type": "molmo2",
+      "batch_size": 1,
+      "prompt_len": 128,
+      "ctx_len": 512,
+      "img_size": null,
+      "img_url": "https://picsum.photos/id/237/536/354",
+      "text_prompt": "Can you describe the image in detail.",
+      "num_layers": 2,
+      "additional_params": {}
+    },
+    {
       "model_name": "OpenGVLab/InternVL2_5-1B",
       "model_type": "internvl_chat",
       "batch_size": 1,

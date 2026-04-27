@@ -457,11 +457,13 @@ class ModelConfig:
 
     MOLMO_MODELS = {
         "allenai/Molmo-7B-D-0924",
+        "allenai/Molmo2-8B",
     }
 
     SKIPPED_MODELS = {
         "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         "allenai/Molmo-7B-D-0924",
+        "allenai/Molmo2-8B",
         "meta-llama/Llama-3.2-11B-Vision-Instruct",
     }
 
