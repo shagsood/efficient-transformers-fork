@@ -195,6 +195,9 @@ class QEffMolmo2TextModel(nn.Module):
 
         if past_key_values is None:
             past_key_values = QEffDynamicCache()
+        elif not isinstance(past_key_values, QEffDynamicCache):
+            # ONNX export passes raw list-of-tuples; convert to the QEff cache here.
+            past_key_values = QEffDynamicCache.from_legacy_cache(past_key_values)
 
         hidden_states = inputs_embeds
 
