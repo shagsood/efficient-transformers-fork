@@ -400,6 +400,12 @@ from QEfficient.transformers.models.molmo.modeling_molmo import (
     QEffMolmoSequentialBlock,
     QEffMultiHeadDotProductAttention,
 )
+from QEfficient.transformers.models.molmo2.modeling_molmo2 import (
+    QEffMolmo2Attention,
+    QEffMolmo2DecoderLayer,
+    QEffMolmo2Model,
+    QEffMolmo2TextModel,
+)
 from QEfficient.transformers.models.mpt.modeling_mpt import (
     QEffMptAttention,
     QEffMptBlock,
@@ -923,6 +929,29 @@ class KVCacheExternalModuleMapperTransform(ExternalModuleMapperTransform):
         },
         "MultiHeadDotProductAttention": {
             "forward": QEffMultiHeadDotProductAttention.forward,
+        },
+        # Mapping for Molmo2
+        "Molmo2ForConditionalGeneration": {
+            "forward": QEffMolmo2Model.forward,
+            "get_qeff_vision_encoder": QEffMolmo2Model.get_qeff_vision_encoder,
+            "get_qeff_language_decoder": QEffMolmo2Model.get_qeff_language_decoder,
+            "get_specializations": QEffMolmo2Model.get_specializations,
+            "get_onnx_dynamic_axes": QEffMolmo2Model.get_onnx_dynamic_axes,
+            "get_output_names": QEffMolmo2Model.get_output_names,
+            "get_dummy_inputs": QEffMolmo2Model.get_dummy_inputs,
+            "get_inputs_info": QEffMolmo2Model.get_inputs_info,
+        },
+        "Molmo2RMSNorm": {"forward": CustomRMSNormAIC.forward},
+        "Molmo2Attention": {
+            "forward": QEffMolmo2Attention.forward,
+            "__qeff_init__": QEffMolmo2Attention.__qeff_init__,
+        },
+        "Molmo2DecoderLayer": {
+            "forward": QEffMolmo2DecoderLayer.forward,
+        },
+        "Molmo2TextModel": {
+            "forward": QEffMolmo2TextModel.forward,
+            "__qeff_init__": QEffMolmo2TextModel.__qeff_init__,
         },
         # Mapping for grok1 model
         "Grok1ModelForCausalLM": {"forward": QEffGrok1ModelForCausalLM.forward},
