@@ -245,6 +245,9 @@ class QEffViTMultiHeadDotProductAttention:
       "...qhd,...khd->...hqk"  (compute attn weights)
       "...hqk,...khd->...qhd"  (weighted sum over values)
     where `...` is the batch dim. QAIC only supports fixed-rank einsum.
+
+    Also applies attn_mask (used by image_pooling_2d to exclude invalid patches)
+    via additive masking — the original "sdpa" mode applied it via SDPA's mask arg.
     """
 
     def forward(self, inputs_q, inputs_kv=None, attn_mask=None):
@@ -275,6 +278,10 @@ class QEffViTMultiHeadDotProductAttention:
         xq_t = xq.permute(0, 2, 1, 3)  # (B, h, q, d)
         xk_t = xk.permute(0, 2, 3, 1)  # (B, h, d, k)
         attn_weights = torch.matmul(xq_t / math.sqrt(xq.size(-1)), xk_t)  # (B, h, q, k)
+        if attn_mask is not None:
+            # attn_mask: boolean [B, 1, 1, k] where True = attend, False = exclude.
+            # Convert to additive form: -10000.0 at masked positions.
+            attn_weights = torch.where(attn_mask, attn_weights, torch.tensor(-10000.0, dtype=attn_weights.dtype))
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(xq.dtype)
         attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
 
@@ -330,6 +337,9 @@ class QEffMolmo2VisionBackbone:
         pooled_features = self.image_pooling_2d(query, to_pool, attn_mask=attn_mask)
         pooled_features = pooled_features.reshape([batch_size, -1, pooled_features.shape[-1]])
         pooled_features = self.image_projector(pooled_features)
+        # Clamp to float16-safe range: the image projector can produce values up to ~82000
+        # which overflow float16 (max 65504) on QAIC hardware, causing inf/NaN propagation.
+        pooled_features = pooled_features.clamp(-60000.0, 60000.0)
         # Return flat 2D (batch_size * num_pooled_tokens, hidden); skip boolean valid_token filter
         # (NonZero → dynamic output shape, unsupported by QAIC). In our specs all tokens are valid.
         return pooled_features.view(-1, pooled_features.shape[-1])
@@ -381,9 +391,13 @@ class QEffMolmo2DecoderWrapper(nn.Module):
         selected = input_ids == image_patch_id
         indices1 = selected.to(torch.int64).cumsum(1) - 1
         indices1 = torch.where(indices1 != -1, indices1 + image_idx, indices1)
+        # Clamp to non-negative so ONNX Gather (advanced indexing decomposition)
+        # doesn't receive -1 indices — ONNX advanced indexing with negative values
+        # produces incorrect results. torch.where(selected, ...) discards the
+        # gathered values at non-image positions, so index 0 is a safe stand-in.
         indices0 = torch.arange(selected.shape[0]).view(-1, 1)
         # vision_embeds is 3D [B, num_pooled_tokens, hidden]; gather produces [B, S, hidden].
-        image_features_expanded = vision_embeds[indices0, indices1]
+        image_features_expanded = vision_embeds[indices0, indices1.clamp(min=0)]
         image_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded + inputs_embeds, inputs_embeds)
 
         inputs_embeds = torch.where(input_ids.shape[1] == torch.tensor(1), inputs_embeds, image_embeds)
@@ -439,7 +453,10 @@ class QEffMolmo2Model(nn.Module):
         indices1 = selected.to(torch.int64).cumsum(1) - 1
         indices1 = torch.where(indices1 != -1, indices1 + image_idx, indices1)
         indices0 = torch.arange(selected.shape[0]).view(-1, 1)
-        image_features_expanded = vision_embeds[indices0, indices1]
+        # Clamp to non-negative: ONNX advanced indexing decomposition (Gather-based)
+        # produces incorrect results with negative indices. torch.where(selected, ...)
+        # discards the gathered values at non-image positions anyway.
+        image_features_expanded = vision_embeds[indices0, indices1.clamp(min=0)]
         image_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded + inputs_embeds, inputs_embeds)
 
         inputs_embeds = torch.where(input_ids.shape[1] == torch.tensor(1), inputs_embeds, image_embeds)
