@@ -405,6 +405,8 @@ from QEfficient.transformers.models.molmo2.modeling_molmo2 import (
     QEffMolmo2DecoderLayer,
     QEffMolmo2Model,
     QEffMolmo2TextModel,
+    QEffMolmo2VisionBackbone,
+    QEffViTMultiHeadDotProductAttention,
 )
 from QEfficient.transformers.models.mpt.modeling_mpt import (
     QEffMptAttention,
@@ -931,6 +933,8 @@ class KVCacheExternalModuleMapperTransform(ExternalModuleMapperTransform):
             "forward": QEffMultiHeadDotProductAttention.forward,
         },
         # Mapping for Molmo2
+        "ViTMultiHeadDotProductAttention": {"forward": QEffViTMultiHeadDotProductAttention.forward},
+        "Molmo2VisionBackbone": {"forward": QEffMolmo2VisionBackbone.forward},
         "Molmo2ForConditionalGeneration": {
             "forward": QEffMolmo2Model.forward,
             "get_qeff_vision_encoder": QEffMolmo2Model.get_qeff_vision_encoder,

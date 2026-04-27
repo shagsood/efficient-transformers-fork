@@ -5,6 +5,7 @@
 #
 # -----------------------------------------------------------------------------
 
+import math
 from typing import List, Optional, Tuple, Type
 
 import torch
@@ -232,6 +233,104 @@ class QEffMolmo2TextModel(nn.Module):
         return hidden_states, past_key_values
 
 
+class QEffViTMultiHeadDotProductAttention:
+    """
+    Replaces einsum-with-ellipsis (unsupported by QAIC) with explicit matmul.
+
+    Original einsum patterns:
+      "...qhd,...khd->...hqk"  (compute attn weights)
+      "...hqk,...khd->...qhd"  (weighted sum over values)
+    where `...` is the batch dim. QAIC only supports fixed-rank einsum.
+    """
+
+    def forward(self, inputs_q, inputs_kv=None, attn_mask=None):
+        if inputs_kv is not None:
+            inputs_k = inputs_v = inputs_kv
+        else:
+            inputs_k = inputs_v = inputs_q
+
+        xq, xk, xv = self.wq(inputs_q), self.wk(inputs_k), self.wv(inputs_v)
+
+        xq = self._split_heads(xq, self.num_heads)
+        xk = self._split_heads(xk, self.num_key_value_heads)
+        xv = self._split_heads(xv, self.num_key_value_heads)
+
+        if self.num_heads != self.num_key_value_heads:
+            xk = xk.repeat_interleave(self.num_key_value_groups, dim=2, output_size=self.num_heads)
+            xv = xv.repeat_interleave(self.num_key_value_groups, dim=2, output_size=self.num_heads)
+
+        og_dtype = xq.dtype
+        if self.float32_attention:
+            xq = xq.to(torch.float)
+            xk = xk.to(torch.float)
+
+        dropout_p = 0.0 if not self.training else self.attention_dropout
+
+        # Replace "...qhd,...khd->...hqk" einsum:
+        # xq (B,q,h,d) → (B,h,q,d); xk (B,k,h,d) → (B,h,d,k)
+        xq_t = xq.permute(0, 2, 1, 3)  # (B, h, q, d)
+        xk_t = xk.permute(0, 2, 3, 1)  # (B, h, d, k)
+        attn_weights = torch.matmul(xq_t / math.sqrt(xq.size(-1)), xk_t)  # (B, h, q, k)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(xq.dtype)
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=self.training)
+
+        # Replace "...hqk,...khd->...qhd" einsum:
+        # xv (B,k,h,d) → (B,h,k,d)
+        xv_t = xv.permute(0, 2, 1, 3)  # (B, h, k, d)
+        attn_output = torch.matmul(attn_weights.to(xv.dtype), xv_t)  # (B, h, q, d)
+        attn_output = attn_output.permute(0, 2, 1, 3)  # (B, q, h, d)
+
+        attn_output = attn_output.to(og_dtype)
+        attn_output = self._merge_heads(attn_output)
+        attn_output = self.wo(attn_output)
+        attn_output = self.residual_dropout(attn_output)
+        return attn_output
+
+
+class QEffMolmo2VisionBackbone:
+    """
+    Patched forward for Molmo2VisionBackbone to fix two ONNX export issues:
+    1. torch.tile emits ONNX Size ops (for rank-padding logic) → replaced with .expand().
+    2. boolean valid_token indexing emits NonZero (dynamic output size) → removed; callers
+       receive the full flat 2D output and must handle potential invalid tokens via masking.
+    """
+
+    def forward(self, images: torch.Tensor, pooled_patches_idx: torch.Tensor) -> torch.Tensor:
+        batch_size, _ = images.shape[:2]
+        images = images.to(device=self.device, dtype=self.dtype)
+        image_features = self.encode_image(images)
+
+        image_features = self.image_feature_dropout(image_features)
+        dim = image_features.shape[-1]
+        valid = pooled_patches_idx >= 0
+
+        batch_idx = torch.arange(pooled_patches_idx.shape[0], dtype=torch.long, device=pooled_patches_idx.device)
+        # expand() avoids the ONNX Size op that torch.tile emits for its ndim-padding logic.
+        batch_idx = batch_idx.view(batch_size, 1, 1).expand(
+            -1, pooled_patches_idx.shape[1], pooled_patches_idx.shape[2]
+        )
+
+        to_pool = image_features.reshape(batch_size, -1, dim)[batch_idx, torch.clip(pooled_patches_idx, 0)]
+        to_pool = to_pool * valid.to(self.dtype)[:, :, :, None]
+        to_pool = to_pool.reshape([-1, pooled_patches_idx.shape[-1], dim])
+
+        if self.adapter_config.pooling_attention_mask:
+            attn_mask = valid.reshape([-1, 1, 1, valid.shape[-1]])
+            denom = valid.view(-1, to_pool.shape[-2]).float().sum(-1)
+            denom = torch.where(denom == 0, 1, denom)
+            query = to_pool.sum(-2, keepdim=True) / denom[:, None, None].to(to_pool.dtype)
+        else:
+            attn_mask = None
+            query = to_pool.mean(-2, keepdim=True)
+
+        pooled_features = self.image_pooling_2d(query, to_pool, attn_mask=attn_mask)
+        pooled_features = pooled_features.reshape([batch_size, -1, pooled_features.shape[-1]])
+        pooled_features = self.image_projector(pooled_features)
+        # Return flat 2D (batch_size * num_pooled_tokens, hidden); skip boolean valid_token filter
+        # (NonZero → dynamic output shape, unsupported by QAIC). In our specs all tokens are valid.
+        return pooled_features.view(-1, pooled_features.shape[-1])
+
+
 class QEffMolmo2EncoderWrapper(nn.Module):
     def __init__(self, model):
         super().__init__()
@@ -297,7 +396,7 @@ class QEffMolmo2DecoderWrapper(nn.Module):
         logits = self.model.lm_head(hidden_states)
         batch_arange = torch.arange(logits.shape[0])
         logit_index = position_ids.to(torch.int32).argmax(1)
-        logits = logits[batch_arange, logit_index]
+        logits = logits[batch_arange, logit_index].unsqueeze(1)
 
         next_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
         image_idx = torch.where(image_idx < next_idx, next_idx, image_idx)
@@ -352,7 +451,7 @@ class QEffMolmo2Model(nn.Module):
         logits = self.lm_head(hidden_states)
         batch_arange = torch.arange(logits.shape[0])
         logit_index = position_ids.to(torch.int32).argmax(1)
-        logits = logits[batch_arange, logit_index]
+        logits = logits[batch_arange, logit_index].unsqueeze(1)
 
         next_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
         image_idx = torch.where(image_idx < next_idx, next_idx, image_idx)
@@ -458,6 +557,19 @@ class QEffMolmo2Model(nn.Module):
             }
             if continuous_batching:
                 lang_decode["full_batch_size"] = kv_cache_batch_size
+
+            # Single-QPC mode: the ONNX graph still has the vision-side inputs (pixel_values,
+            # image_token_pooling), so their symbolic dims need concrete values in every spec.
+            if not kv_offload:
+                vision_dims = {
+                    "num_crops": num_crops,
+                    "num_patches": num_patches_per_crop,
+                    "pixels_per_patch": pixels_per_patch,
+                    "num_pooled_tokens": num_pooled_tokens,
+                    "pool_dim": pool_dim,
+                }
+                lang_prefill.update(vision_dims)
+                lang_decode.update(vision_dims)
 
             lang = [lang_prefill, lang_decode]
 
