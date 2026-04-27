@@ -1612,6 +1612,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                         if ("vision_embeds" in output_name or "deepstack_features" in output_name)
                         else kv_cache_dtype
                     )
+            # Molmo2: vision_embeds is a regular input (no RetainedState).
+            # Add it to custom_io so QAIC uses float16 end-to-end.
+            if hasattr(self.model.config, "model_type") and self.model.config.model_type == "molmo2":
+                custom_io_lang["vision_embeds"] = CUSTOM_IO_DTYPE_MAP[target_dtype]
 
             # outputs
             for output_name in output_names["lang"]:
@@ -1839,7 +1843,15 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             k: v
             for k, v in inputs.items()
             if k
-            in {"pixel_values", "image_masks", "image_input_idx", "valid_idx", "aspect_ratio_ids", "aspect_ratio_mask"}
+            in {
+                "pixel_values",
+                "image_masks",
+                "image_input_idx",
+                "valid_idx",
+                "aspect_ratio_ids",
+                "aspect_ratio_mask",
+                "image_token_pooling",
+            }
         }
 
         vision_inputs_fp16 = {"pixel_values", "image_masks"}
@@ -1862,13 +1874,21 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             )  # Need to use -1 as position_ids for invalid tokens
 
         not_mllama = hasattr(self.model.config, "model_type") and self.model.config.model_type != "mllama"
+        # Molmo2 passes vision_embeds as a regular input each step (no RetainedState)
+        # because the QAIC compiler dead-code-eliminates the RetainedState buffer.
+        is_molmo2 = hasattr(self.model.config, "model_type") and self.model.config.model_type == "molmo2"
         if not_mllama:
             lang_inputs["image_idx"] = np.array([[0]])
         if self.vision_model.qpc_path:
             vision_session.deactivate()
         lang_session.activate()
 
-        lang_session.set_buffers(vision_outputs)
+        if is_molmo2:
+            # vision_embeds is a declared regular input; pass it directly.
+            # The vision QPC outputs float16; cast to match lang QPC input precision.
+            lang_inputs["vision_embeds"] = vision_outputs["vision_embeds"]
+        else:
+            lang_session.set_buffers(vision_outputs)
 
         if self.comp_ctx_lengths_prefill is not None:
             list_of_comp_ctx_lengths_prefill = [
@@ -1907,7 +1927,7 @@ class _QEffAutoModelForImageTextToTextDualQPC:
                 if x.startswith("past_") or x.endswith("_RetainedState")
             ]
         )
-        if not_mllama:
+        if not_mllama and not is_molmo2:
             lang_session.skip_buffers(vision_outputs.keys())
         # Get first token
         lang_inputs["input_ids"] = outputs["logits"].argmax(2)

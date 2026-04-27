@@ -398,9 +398,7 @@ class QEffMolmo2DecoderWrapper(nn.Module):
         indices0 = torch.arange(selected.shape[0]).view(-1, 1)
         # vision_embeds is 3D [B, num_pooled_tokens, hidden]; gather produces [B, S, hidden].
         image_features_expanded = vision_embeds[indices0, indices1.clamp(min=0)]
-        image_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded + inputs_embeds, inputs_embeds)
-
-        inputs_embeds = torch.where(input_ids.shape[1] == torch.tensor(1), inputs_embeds, image_embeds)
+        inputs_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded + inputs_embeds, inputs_embeds)
 
         hidden_states, past_key_values = self.model.model.transformer.forward(
             inputs_embeds=inputs_embeds,
@@ -418,7 +416,7 @@ class QEffMolmo2DecoderWrapper(nn.Module):
 
         next_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
         image_idx = torch.where(image_idx < next_idx, next_idx, image_idx)
-        return logits, vision_embeds, image_idx, past_key_values.to_legacy_cache()
+        return logits, image_idx, past_key_values.to_legacy_cache()
 
 
 class QEffMolmo2Model(nn.Module):
@@ -457,9 +455,7 @@ class QEffMolmo2Model(nn.Module):
         # produces incorrect results with negative indices. torch.where(selected, ...)
         # discards the gathered values at non-image positions anyway.
         image_features_expanded = vision_embeds[indices0, indices1.clamp(min=0)]
-        image_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded + inputs_embeds, inputs_embeds)
-
-        inputs_embeds = torch.where(input_ids.shape[1] == torch.tensor(1), inputs_embeds, image_embeds)
+        inputs_embeds = torch.where(selected.unsqueeze(-1), image_features_expanded + inputs_embeds, inputs_embeds)
 
         hidden_states, past_key_values = self.model.transformer.forward(
             inputs_embeds=inputs_embeds,
@@ -652,8 +648,11 @@ class QEffMolmo2Model(nn.Module):
 
         output_names = {}
         if kv_offload:
-            lang_output_names.insert(1, "vision_embeds_RetainedState")
-            lang_output_names.insert(2, "image_idx_output")
+            # vision_embeds is passed as a regular input each step (no RetainedState).
+            # The QAIC compiler eliminates vision_embeds_RetainedState via dead-code
+            # analysis on the decode specialization (seq_len=1) where selected is
+            # always False. Passing it explicitly avoids this compiler limitation.
+            lang_output_names.insert(1, "image_idx_output")
             output_names["vision"] = vision_output_names
             output_names["lang"] = lang_output_names
         else:
