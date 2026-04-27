@@ -202,8 +202,12 @@ class QEffMolmo2TextModel(nn.Module):
 
         hidden_states = inputs_embeds
 
-        cos = self.cos_cached[position_ids]
-        sin = self.sin_cached[position_ids]
+        # Clamp before RoPE lookup: cloud_ai_100_generate uses -1 for padding positions,
+        # which is an invalid GatherND index in ONNX. Clamp to 0 — padding token output
+        # is discarded anyway (logit is extracted at the last valid position).
+        pos_clamp = position_ids.clamp(min=0)
+        cos = self.cos_cached[pos_clamp]
+        sin = self.sin_cached[pos_clamp]
 
         # For ONNX export / CPU validation the cache is fresh (seq_length=0). Use the current input
         # seq_len so _create_causal_mask produces a [B,1,S,S] causal mask. In the AI 100 runtime
@@ -395,7 +399,7 @@ class QEffMolmo2DecoderWrapper(nn.Module):
 
         logits = self.model.lm_head(hidden_states)
         batch_arange = torch.arange(logits.shape[0])
-        logit_index = position_ids.to(torch.int32).argmax(1)
+        logit_index = position_ids.clamp(min=0).argmax(1)
         logits = logits[batch_arange, logit_index].unsqueeze(1)
 
         next_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
@@ -450,7 +454,7 @@ class QEffMolmo2Model(nn.Module):
 
         logits = self.lm_head(hidden_states)
         batch_arange = torch.arange(logits.shape[0])
-        logit_index = position_ids.to(torch.int32).argmax(1)
+        logit_index = position_ids.clamp(min=0).argmax(1)
         logits = logits[batch_arange, logit_index].unsqueeze(1)
 
         next_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
