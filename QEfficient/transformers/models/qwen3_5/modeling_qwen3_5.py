@@ -852,7 +852,7 @@ class QEffQwen3_5DecoderWrapper(nn.Module):
 
     Vision injection:
         - Prefill (seq_len > 1): replace image_token_id slots with vision_embeds patches
-        - Decode (seq_len == 1): bypass injection, use text embedding directly
+        - Decode (seq_len == 1): same injection path (handles image-token prefill correctly)
         - image_idx: cumulative patch counter — ensures correct slice on multi-image inputs
     """
 
@@ -882,11 +882,11 @@ class QEffQwen3_5DecoderWrapper(nn.Module):
         selected = input_ids == self.model.config.image_token_id
         indices1 = selected.to(torch.int64).cumsum(1) - 1
         indices1 = torch.where(indices1 != -1, indices1 + image_idx, indices1)
+        # Keep gather indices non-negative for ONNX safety on non-image tokens.
+        safe_indices1 = torch.where(indices1 < 0, torch.zeros_like(indices1), indices1)
         indices0 = torch.arange(selected.unsqueeze(0).shape[0]).view(-1, 1)
-        img_expanded = vision_embeds.reshape(-1, C).unsqueeze(0)[indices0, indices1]
-        image_embeds_placed = torch.where(selected.unsqueeze(-1), img_expanded, inputs_embeds)
-        # Decode step: seq_len==1, no vision injection needed
-        inputs_embeds = torch.where(input_ids.shape[1] == torch.tensor(1), inputs_embeds, image_embeds_placed)
+        img_expanded = vision_embeds.reshape(-1, C).unsqueeze(0)[indices0, safe_indices1]
+        inputs_embeds = torch.where(selected.unsqueeze(-1), img_expanded, inputs_embeds)
 
         outputs, new_conv_states, new_recurrent_states = self.language_model(
             inputs_embeds=inputs_embeds,
@@ -902,7 +902,8 @@ class QEffQwen3_5DecoderWrapper(nn.Module):
         logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
         hidden_states = outputs.last_hidden_state[torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
         logits = self.model.lm_head(hidden_states).float()
-        image_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
+        next_image_idx = (indices1.max() + 1).unsqueeze(0).unsqueeze(0)
+        image_idx = torch.where(image_idx < next_image_idx, next_image_idx, image_idx)
 
         return logits, vision_embeds, image_idx, outputs.past_key_values, new_conv_states, new_recurrent_states
 
