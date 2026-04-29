@@ -5,7 +5,6 @@
 #
 # -----------------------------------------------------------------------------
 
-import copy
 from typing import List, Optional, Tuple, Type, Union
 
 import torch
@@ -17,10 +16,10 @@ from transformers.modeling_outputs import (
 )
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3Attention,
-    Gemma3Config,
     Gemma3DecoderLayer,
     Gemma3ForCausalLM,
     Gemma3ForConditionalGeneration,
+    Gemma3TextConfig,
     Gemma3TextModel,
     logger,
     repeat_kv,
@@ -58,11 +57,12 @@ class QEffGemma3CustomRMSNormAIC(nn.Module):
     """
 
     def forward(self, hidden_states):
-        return GemmaRMSNormFunc.apply(
+        out = GemmaRMSNormFunc.apply(
             hidden_states,
             (self.weight).to(hidden_states.dtype) + 1.0,
             self.variance_epsilon if hasattr(self, "variance_epsilon") else self.eps,
         )
+        return out.to(hidden_states.dtype)
 
 
 class QEffGemma3RotaryEmbedding(nn.Module):
@@ -131,8 +131,8 @@ def qeff_apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
 
     # Apply rotation
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -180,37 +180,24 @@ def _is_local(layer_idx: int, pattern: int = 6) -> bool:
 class QEffGemma3Attention(Gemma3Attention):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Gemma3Config, layer_idx: Optional[int] = None):
+    def __init__(self, config: Gemma3TextConfig, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
         # Define the general __qeff_init__() for any changes in the init calls
         # Set the init in the module mapping pytorch transforms
         self.__qeff_init__()
 
     def __qeff_init__(self):
-        self.rotary_emb = QEffGemma3RotaryEmbedding(
-            self.head_dim,
-            self.config,
-            max_position_embeddings=self.config.max_position_embeddings,
-            base=self.config.rope_theta,
-        )
-
-        config = copy.deepcopy(self.config)
-        config.rope_theta = config.rope_local_base_freq
-        config.rope_scaling = {"rope_type": "default", "factor": 1.0}
-        self.is_local = _is_local(self.layer_idx, self.config._sliding_window_pattern)
-        self.window = self.config.sliding_window if self.is_local else None
-
-        self.rotary_emb_local = QEffGemma3RotaryEmbedding(
-            self.head_dim,
-            config,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
+        # In Transformers v4.57, each Gemma3Attention owned its own `rotary_emb` and `rotary_emb_local`
+        # instances, and __qeff_init__ replaced them with QEffGemma3RotaryEmbedding
+        #
+        # In Transformers v5.5+, `rotary_emb` was lifted out of each attention layer and placed as a
+        # single shared instance on Gemma3TextModel. Gemma3Attention no longer owns a `rotary_emb`.
+        pass
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Optional[torch.Tensor],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -238,11 +225,8 @@ class QEffGemma3Attention(Gemma3Attention):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-        if self.is_sliding:
-            cos, sin = self.rotary_emb_local(value_states, seq_len=self.config.max_position_embeddings)
-        else:
-            cos, sin = self.rotary_emb(value_states, seq_len=self.config.max_position_embeddings)
 
+        cos, sin = position_embeddings
         query_states, key_states = qeff_apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -298,8 +282,7 @@ class QEffGemma3DecoderLayer(Gemma3DecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings_global: Optional[torch.Tensor] = None,
-        position_embeddings_local: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -328,7 +311,7 @@ class QEffGemma3DecoderLayer(Gemma3DecoderLayer):
 
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
-            position_embeddings=None,
+            position_embeddings=position_embeddings,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_value,
@@ -430,15 +413,24 @@ class QEffGemma3TextModel(Gemma3TextModel):
         # embed positions
         hidden_states = inputs_embeds
 
+        # Compute position embeddings per layer_type using the single shared rotary_emb (TF5.5+)
+        position_embeddings = {}
+        if hasattr(self, "rotary_emb"):
+            for layer_type in set(self.config.layer_types):
+                position_embeddings[layer_type] = self.rotary_emb(hidden_states, position_ids, layer_type)
+
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            layer_type = self.config.layer_types[i] if hasattr(self.config, "layer_types") else None
+            layer_pos_emb = position_embeddings.get(layer_type) if layer_type else None
             layer_outputs = decoder_layer(
                 hidden_states,
+                position_embeddings=layer_pos_emb,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
@@ -597,7 +589,7 @@ class QEffGemma3ForCausalLMModel(Gemma3ForCausalLM):
 class QEffGemma3EncoderWrapper(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.model = model
+        self.model = model.model
         self.model.vision_model = self.model.vision_tower
 
     def get_submodules_for_export(self) -> Type[nn.Module]:
@@ -611,6 +603,8 @@ class QEffGemma3EncoderWrapper(nn.Module):
 
     def forward(self, pixel_values):
         image_features = self.model.get_image_features(pixel_values=pixel_values)
+        if hasattr(image_features, "pooler_output"):
+            image_features = image_features.pooler_output
         return image_features
 
 
@@ -667,6 +661,11 @@ class QEffGemma3DecoderWrapper(nn.Module):
 
 
 class QEffGemma3ForConditionalGeneration(Gemma3ForConditionalGeneration):
+    def __qeff_init__(self):
+        # Module mapping swaps class post-init; set language_model alias here so existing
+        # call sites referencing self.language_model continue to work in TF5.5.
+        self.language_model = self.model.language_model
+
     def get_qeff_vision_encoder(self):
         return QEffGemma3EncoderWrapper(self)
 
@@ -683,6 +682,8 @@ class QEffGemma3ForConditionalGeneration(Gemma3ForConditionalGeneration):
         comp_ctx_lengths: Optional[List[int]] = None,
     ):
         image_features = self.get_image_features(pixel_values=pixel_values)
+        if hasattr(image_features, "pooler_output"):
+            image_features = image_features.pooler_output
         inputs_embeds = self.get_input_embeddings()(input_ids)
         B, N, C = inputs_embeds.shape
         selected = input_ids == self.config.image_token_index
