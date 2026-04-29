@@ -266,7 +266,11 @@ class QEFFAutoModel(QEFFTransformersBase):
         if pooling:
             self.model, _ = PoolingTransform.apply(self.model, pooling)
 
-        self.model.base_model.config.use_cache = True
+        # Encoder-only models (e.g. BERT) should not be forced into cache mode.
+        if getattr(self.model.config, "is_decoder", False) or getattr(self.model.config, "is_encoder_decoder", False):
+            self.model.base_model.config.use_cache = True
+        else:
+            object.__setattr__(self.model.base_model.config, "use_cache", None)
 
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
 

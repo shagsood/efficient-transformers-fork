@@ -98,7 +98,8 @@ class QEffPhiAttention(PhiAttention):
             key_states[..., self.rotary_ndims :],
         )
         # [batch_size, seq_length, num_heads, head_dim // config.partial_rotary_factor]
-        query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin, position_ids)
+        # transformers>=5: position_ids no longer a parameter to apply_rotary_pos_emb
+        query_rot, key_rot = apply_rotary_pos_emb(query_rot, key_rot, cos, sin)
 
         # [batch_size, seq_length, num_heads, head_dim]
         query_states = torch.cat((query_rot, query_pass), dim=-1)

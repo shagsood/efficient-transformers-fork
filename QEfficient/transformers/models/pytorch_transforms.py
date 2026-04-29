@@ -174,9 +174,15 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLTextModel,
     Qwen2_5_VLVisionAttention,
 )
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2RMSNorm as Qwen2_5RMSNorm,
-)
+try:
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        Qwen2_5_VLRMSNorm as Qwen2_5RMSNorm,
+    )
+except ImportError:
+    # transformers<5.3 exposed it as Qwen2RMSNorm
+    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+        Qwen2RMSNorm as Qwen2_5RMSNorm,
+    )
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3DecoderLayer,
@@ -235,10 +241,26 @@ from transformers.models.whisper.modeling_whisper import (
     WhisperModel,
     WhisperPositionalEmbedding,
 )
+from transformers.models.bert.modeling_bert import BertModel
+from transformers.models.roberta.modeling_roberta import RobertaModel
+from transformers.models.xlm_roberta.modeling_xlm_roberta import XLMRobertaModel
+from transformers.models.wav2vec2.modeling_wav2vec2 import (
+    Wav2Vec2Encoder,
+    Wav2Vec2EncoderStableLayerNorm,
+)
 
 from QEfficient.base.pytorch_transforms import ExternalModuleMapperTransform, ModuleMappingTransform
 from QEfficient.customop import CustomRMSNormAIC, GemmaCustomRMSNormAIC
 from QEfficient.transformers.embeddings.embedding_utils import POOLING_MAP, PooledModel, validate_user_pooling_function
+from QEfficient.transformers.models.bert.modeling_bert import (
+    QEffBertModel,
+    QEffRobertaModel,
+    QEffXLMRobertaModel,
+)
+from QEfficient.transformers.models.wav2vec2.modeling_wav2vec2 import (
+    QEffWav2Vec2Encoder,
+    QEffWav2Vec2EncoderStableLayerNorm,
+)
 from QEfficient.transformers.models.codegen.modeling_codegen import (
     QEffCodeGenAttention,
     QEffCodeGenBlock,
@@ -526,6 +548,13 @@ class CustomOpsTransform(ModuleMappingTransform):
         Olmo2RMSNorm: CustomRMSNormAIC,
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
         Qwen3VLTextRMSNorm: CustomRMSNormAIC,
+        # BERT-family: replace _create_attention_masks with ONNX-safe version (TF5.5)
+        BertModel: QEffBertModel,
+        RobertaModel: QEffRobertaModel,
+        XLMRobertaModel: QEffXLMRobertaModel,
+        # Wav2Vec2: same masking fix as BERT-family (TF5.5)
+        Wav2Vec2Encoder: QEffWav2Vec2Encoder,
+        Wav2Vec2EncoderStableLayerNorm: QEffWav2Vec2EncoderStableLayerNorm,
     }
 
 

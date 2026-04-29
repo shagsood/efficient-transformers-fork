@@ -7,7 +7,28 @@
 
 import torch
 from transformers.quantizers.quantizer_awq import AwqQuantizer
-from transformers.utils.quantization_config import AwqBackendPackingMethod, AwqConfig, AWQLinearVersion
+
+try:
+    # transformers >= 5.0: AwqBackendPackingMethod → AwqBackend, AWQLinearVersion → AwqFormat
+    from transformers.utils.quantization_config import AwqBackend, AwqConfig, AwqFormat
+
+    AwqBackendPackingMethod = AwqBackend
+    AwqBackendPackingMethod_AUTOAWQ = AwqBackend.LEGACY_AWQ
+    AWQLinearVersion = AwqFormat
+    AWQLinearVersion_GEMM = AwqFormat.GEMM
+
+    def _awq_version_from_str(s):
+        # transformers 5.x removed AWQLinearVersion.from_str — standard enum constructor works
+        return AwqFormat(s.lower() if isinstance(s, str) else s)
+except ImportError:
+    # transformers < 5.0 legacy API
+    from transformers.utils.quantization_config import AwqBackendPackingMethod, AwqConfig, AWQLinearVersion
+
+    AwqBackendPackingMethod_AUTOAWQ = AwqBackendPackingMethod.AUTOAWQ
+    AWQLinearVersion_GEMM = AWQLinearVersion.GEMM
+
+    def _awq_version_from_str(s):
+        return AWQLinearVersion.from_str(s)
 
 from QEfficient.transformers.quantizers.awq import WQLinear_GEMM
 from QEfficient.transformers.quantizers.quantizer_utils import (
@@ -24,16 +45,16 @@ class QEffAwqConfig(AwqConfig):
         Safety checker that arguments are correct
         """
 
-        if self.backend not in [AwqBackendPackingMethod.AUTOAWQ]:
+        if self.backend not in [AwqBackendPackingMethod_AUTOAWQ]:
             raise ValueError(
-                f"Only quantization backend {AwqBackendPackingMethod.AUTOAWQ} is supported - not recognized backend {self.backend}"
+                f"Only quantization backend {AwqBackendPackingMethod_AUTOAWQ} is supported - not recognized backend {self.backend}"
             )
 
         if isinstance(self.version, str):
-            self.version = AWQLinearVersion.from_str(self.version)
-        if self.version not in [AWQLinearVersion.GEMM]:
+            self.version = _awq_version_from_str(self.version)
+        if self.version not in [AWQLinearVersion_GEMM]:
             raise ValueError(
-                f"Only {AWQLinearVersion.GEMM} version in supported - not recognized version {self.version}"
+                f"Only {AWQLinearVersion_GEMM} version in supported - not recognized version {self.version}"
             )
 
         do_fuse = getattr(self, "do_fuse", None)

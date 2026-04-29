@@ -10,7 +10,19 @@ from collections.abc import Iterable
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from transformers.cache_utils import Cache, CacheLayerMixin, EncoderDecoderCache, HybridCache, HybridChunkedCache
+from transformers.cache_utils import Cache, CacheLayerMixin, EncoderDecoderCache
+
+try:
+    # transformers<5.3 had these hybrid cache classes
+    from transformers.cache_utils import HybridCache, HybridChunkedCache
+except ImportError:
+    # transformers>=5.3 removed/relocated hybrid cache types.
+    # Keep lightweight local bases so downstream hybrid wrappers still import.
+    class HybridCache:  # type: ignore[no-redef]
+        pass
+
+    class HybridChunkedCache:  # type: ignore[no-redef]
+        pass
 
 from QEfficient.customop import (
     CtxGatherFunc,
@@ -390,6 +402,14 @@ class QEffDynamicCache(Cache):
         for layer in self.layers:
             legacy_cache += ((layer.keys, layer.values),)
         return legacy_cache
+
+    def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        layer = self.layers[layer_idx]
+        return (layer.keys, layer.values)
+
+    def __iter__(self):
+        for idx in range(len(self.layers)):
+            yield self[idx]
 
     def get_seq_length(self, layer_idx: Optional[int] = 0, cache_position: Optional[torch.LongTensor] = None) -> int:
         """
