@@ -771,12 +771,15 @@ class QEffGemma4DecoderWrapper(nn.Module):
             past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.language_model.config, past_key_values)
 
         special_image_mask = input_ids == self.config.image_token_id
-        llm_input_ids = input_ids.clone()
-        llm_input_ids[special_image_mask] = self.config.text_config.pad_token_id
+        # ONNX-safe replacement for `llm_input_ids[special_image_mask] = pad_token_id`.
+        # Boolean-indexed assignment exports as `NonZero + ScatterND` with dynamic output
+        # shape, which QAIC rejects. `torch.where` keeps the shape static.
+        pad_fill = torch.full_like(input_ids, self.config.text_config.pad_token_id)
+        llm_input_ids = torch.where(special_image_mask, pad_fill, input_ids)
         inputs_embeds = self.model.get_input_embeddings()(llm_input_ids)
 
         next_image_idx = image_idx
-        if vision_embeds is not None and input_ids.shape[1] != 1 and special_image_mask.any():
+        if vision_embeds is not None and input_ids.shape[1] != 1:
             if vision_embeds.dim() == 2:
                 vision_embeds = vision_embeds.unsqueeze(0)
             if next_image_idx is None:
@@ -797,11 +800,20 @@ class QEffGemma4DecoderWrapper(nn.Module):
         if _is_onnx_export():
             _DISABLE_EXPORT_FP16_CLAMP = True
         try:
+            # Pre-compute per_layer_inputs from llm_input_ids to avoid the
+            # `get_per_layer_inputs(input_ids=None, ...)` codepath in TF5.5's
+            # Gemma4TextModel, which reverses the embedding via `.nonzero()[:, 2]`
+            # and emits a dynamic-shape NonZero that QAIC rejects.
+            per_layer_inputs = None
+            if getattr(self.language_model, "hidden_size_per_layer_input", None):
+                per_layer_inputs = self.language_model.get_per_layer_inputs(llm_input_ids, None)
+
             outputs = self.language_model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
+                per_layer_inputs=per_layer_inputs,
                 use_cache=True,
                 mm_token_type_ids=mm_token_type_ids,
             )
