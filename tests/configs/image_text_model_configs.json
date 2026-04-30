@@ -115,6 +115,50 @@
       }
     },
     {
+      "model_name": "google/gemma-4-31B-it",
+      "model_type": "gemma4",
+      "batch_size": 1,
+      "prompt_len": 128,
+      "ctx_len": 2048,
+      "img_size": 896,
+      "img_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/datasets/cat_style_layout.png",
+      "text_prompt": "Can you describe the image in detail.",
+      "num_layers": 6,
+      "additional_params": {
+        "text_config": {
+          "head_dim": 256,
+          "hidden_size": 2560,
+          "intermediate_size": 10240,
+          "num_hidden_layers": 6,
+          "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention"
+          ],
+          "sliding_window": 1024,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 16
+        },
+        "vision_config": {
+          "hidden_size": 1152,
+          "intermediate_size": 4304,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 16,
+          "num_hidden_layers": 2,
+          "head_dim": 72,
+          "patch_size": 16,
+          "default_output_length": 280,
+          "pooling_kernel_size": 3,
+          "position_embedding_size": 10240,
+          "standardize": true,
+          "model_type": "gemma4_vision"
+        }
+      }
+    },
+    {
       "model_name": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
       "model_type": "mistral3",
       "batch_size": 1,
@@ -598,21 +642,21 @@
       "text_prompt": "Can you describe the image in detail.",
       "num_layers": 2,
       "additional_params": {
-        
+
       }
     },
     {
-      "model_name": "llava-hf/llava-1.5-7b-hf",
-      "model_type": "llava",
+      "model_name": "google/gemma-4-31B-it",
+      "model_type": "gemma4",
       "batch_size": 1,
-      "prompt_len": 784,
-      "ctx_len": 1024,
-      "img_size": 336,
-      "img_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/ai2d-demo.jpg",
-      "text_prompt": "What does the label 15 represent? (1) lava (2) core (3) tunnel (4) ash cloud",
-      "num_layers": 1,
+      "prompt_len": 128,
+      "ctx_len": 2048,
+      "img_size": 896,
+      "img_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/datasets/cat_style_layout.png",
+      "text_prompt": "Can you describe the image in detail.",
+      "num_layers": 6,
       "additional_params": {
+      }
     }
-  }
   ]
 }

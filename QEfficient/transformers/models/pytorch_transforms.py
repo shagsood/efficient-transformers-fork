@@ -54,7 +54,9 @@ from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4RMSNorm,
     Gemma4TextAttention,
     Gemma4TextDecoderLayer,
+    Gemma4TextExperts,
     Gemma4TextModel,
+    Gemma4TextRouter,
 )
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2Block, GPT2LMHeadModel, GPT2Model
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
@@ -183,6 +185,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLTextModel,
     Qwen2_5_VLVisionAttention,
 )
+
 try:
     from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
         Qwen2_5_VLRMSNorm as Qwen2_5RMSNorm,
@@ -192,6 +195,7 @@ except ImportError:
     from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
         Qwen2RMSNorm as Qwen2_5RMSNorm,
     )
+from transformers.models.bert.modeling_bert import BertModel
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3DecoderLayer,
@@ -231,6 +235,7 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeVisionAttention,
     Qwen3VLMoeVisionModel,
 )
+from transformers.models.roberta.modeling_roberta import RobertaModel
 from transformers.models.starcoder2.modeling_starcoder2 import (
     Starcoder2Attention,
     Starcoder2DecoderLayer,
@@ -241,6 +246,10 @@ from transformers.models.t5.modeling_t5 import (
     T5Attention,
     T5LayerNorm,
 )
+from transformers.models.wav2vec2.modeling_wav2vec2 import (
+    Wav2Vec2Encoder,
+    Wav2Vec2EncoderStableLayerNorm,
+)
 from transformers.models.whisper.modeling_whisper import (
     WhisperAttention,
     WhisperDecoder,
@@ -250,13 +259,7 @@ from transformers.models.whisper.modeling_whisper import (
     WhisperModel,
     WhisperPositionalEmbedding,
 )
-from transformers.models.bert.modeling_bert import BertModel
-from transformers.models.roberta.modeling_roberta import RobertaModel
 from transformers.models.xlm_roberta.modeling_xlm_roberta import XLMRobertaModel
-from transformers.models.wav2vec2.modeling_wav2vec2 import (
-    Wav2Vec2Encoder,
-    Wav2Vec2EncoderStableLayerNorm,
-)
 
 from QEfficient.base.pytorch_transforms import ExternalModuleMapperTransform, ModuleMappingTransform
 from QEfficient.customop import CustomRMSNormAIC, GemmaCustomRMSNormAIC
@@ -265,10 +268,6 @@ from QEfficient.transformers.models.bert.modeling_bert import (
     QEffBertModel,
     QEffRobertaModel,
     QEffXLMRobertaModel,
-)
-from QEfficient.transformers.models.wav2vec2.modeling_wav2vec2 import (
-    QEffWav2Vec2Encoder,
-    QEffWav2Vec2EncoderStableLayerNorm,
 )
 from QEfficient.transformers.models.codegen.modeling_codegen import (
     QEffCodeGenAttention,
@@ -321,7 +320,9 @@ from QEfficient.transformers.models.gemma4.modeling_gemma4 import (
     QEffGemma4ForConditionalGeneration,
     QEffGemma4TextAttention,
     QEffGemma4TextDecoderLayer,
+    QEffGemma4TextExperts,
     QEffGemma4TextModel,
+    QEffGemma4TextRouter,
 )
 from QEfficient.transformers.models.gpt2.modeling_gpt2 import (
     QEffGPT2Attention,
@@ -535,6 +536,10 @@ from QEfficient.transformers.models.t5.modeling_t5 import (
     QEffT5Attention,
     QEffT5LayerNorm,
 )
+from QEfficient.transformers.models.wav2vec2.modeling_wav2vec2 import (
+    QEffWav2Vec2Encoder,
+    QEffWav2Vec2EncoderStableLayerNorm,
+)
 from QEfficient.transformers.models.whisper.modeling_whisper import (
     QEffWhisperAttention,
     QEffWhisperDecoder,
@@ -677,6 +682,8 @@ class KVCacheTransform(ModuleMappingTransform):
         Gemma4TextModel: QEffGemma4TextModel,
         Gemma4ForCausalLM: QEffGemma4ForCausalLM,
         Gemma4ForConditionalGeneration: QEffGemma4ForConditionalGeneration,
+        Gemma4TextExperts: QEffGemma4TextExperts,
+        Gemma4TextRouter: QEffGemma4TextRouter,
         # GPT_OSS
         GptOssAttention: QEffGptOssAttention,
         GptOssDecoderLayer: QEffGptOssDecoderLayer,
