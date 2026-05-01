@@ -10,7 +10,13 @@ from collections.abc import Iterable
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from transformers.cache_utils import Cache, CacheLayerMixin, EncoderDecoderCache, HybridCache, HybridChunkedCache
+from transformers.cache_utils import Cache, CacheLayerMixin, DynamicCache, EncoderDecoderCache
+
+try:
+    from transformers.cache_utils import HybridCache, HybridChunkedCache
+except ImportError:
+    HybridCache = DynamicCache
+    HybridChunkedCache = DynamicCache
 
 from QEfficient.customop import (
     CtxGatherFunc,

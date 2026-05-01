@@ -7,7 +7,14 @@
 
 import torch
 from transformers.quantizers.quantizer_awq import AwqQuantizer
-from transformers.utils.quantization_config import AwqBackendPackingMethod, AwqConfig, AWQLinearVersion
+
+try:
+    from transformers.utils.quantization_config import AwqBackend, AwqConfig, AwqFormat
+
+    AwqBackendPackingMethod = AwqBackend
+    AWQLinearVersion = AwqFormat
+except ImportError:
+    from transformers.utils.quantization_config import AwqBackendPackingMethod, AwqConfig, AWQLinearVersion
 
 from QEfficient.transformers.quantizers.awq import WQLinear_GEMM
 from QEfficient.transformers.quantizers.quantizer_utils import (

@@ -176,7 +176,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLVisionAttention,
 )
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2RMSNorm as Qwen2_5RMSNorm,
+    Qwen2_5_VLRMSNorm as Qwen2_5RMSNorm,
 )
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
@@ -216,6 +216,16 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeTextSparseMoeBlock,
     Qwen3VLMoeVisionAttention,
     Qwen3VLMoeVisionModel,
+)
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    Qwen3_5MoeAttention,
+    Qwen3_5MoeDecoderLayer,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeGatedDeltaNet,
+    Qwen3_5MoeRMSNorm,
+    Qwen3_5MoeRMSNormGated,
+    Qwen3_5MoeSparseMoeBlock,
+    Qwen3_5MoeTextModel,
 )
 from transformers.models.starcoder2.modeling_starcoder2 import (
     Starcoder2Attention,
@@ -465,6 +475,15 @@ from QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe import (
     QEffQwen3MoeRotaryEmbedding,
     QEffQwen3MoeSparseMoeBlock,
 )
+from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+    QEffQwen3_5MoeAttention,
+    QEffQwen3_5MoeDecoderLayer,
+    QEffQwen3_5MoeForCausalLM,
+    QEffQwen3_5MoeGatedDeltaNet,
+    QEffQwen3_5MoeGatedDeltaNetCustomRMSNormAIC,
+    QEffQwen3_5MoeSparseMoeBlock,
+    QEffQwen3_5MoeTextModel,
+)
 from QEfficient.transformers.models.qwen3_vl.modeling_qwen3_vl import (
     QEffQwen3VLForConditionalGeneration,
     QEffQwen3VLModel,
@@ -533,6 +552,8 @@ class CustomOpsTransform(ModuleMappingTransform):
         PixtralRMSNorm: CustomRMSNormAIC,
         GraniteMoeRMSNorm: CustomRMSNormAIC,
         Qwen3MoeRMSNorm: CustomRMSNormAIC,
+        Qwen3_5MoeRMSNorm: GemmaCustomRMSNormAIC,
+        Qwen3_5MoeRMSNormGated: QEffQwen3_5MoeGatedDeltaNetCustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
         Olmo2RMSNorm: CustomRMSNormAIC,
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
@@ -595,6 +616,13 @@ class KVCacheTransform(ModuleMappingTransform):
         Qwen3MoeAttention: QEffQwen3MoeAttention,
         Qwen3MoeRotaryEmbedding: QEffQwen3MoeRotaryEmbedding,
         Qwen3MoeSparseMoeBlock: QEffQwen3MoeSparseMoeBlock,
+        # Qwen3.5 MoE (qwen3_5_moe)
+        Qwen3_5MoeForCausalLM: QEffQwen3_5MoeForCausalLM,
+        Qwen3_5MoeTextModel: QEffQwen3_5MoeTextModel,
+        Qwen3_5MoeDecoderLayer: QEffQwen3_5MoeDecoderLayer,
+        Qwen3_5MoeAttention: QEffQwen3_5MoeAttention,
+        Qwen3_5MoeGatedDeltaNet: QEffQwen3_5MoeGatedDeltaNet,
+        Qwen3_5MoeSparseMoeBlock: QEffQwen3_5MoeSparseMoeBlock,
         # Qwen3VLMoe
         Qwen3VLMoeForConditionalGeneration: QEffQwen3VLMoeForConditionalGeneration,
         Qwen3VLMoeModel: QEffQwen3VLMoeModel,

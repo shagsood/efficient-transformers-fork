@@ -18,6 +18,34 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 # Placeholder for all non-transformer models registered in QEfficient
 import warnings  # noqa: I001
 
+import transformers
+import transformers.utils as transformers_utils
+
+try:
+    from transformers import HybridCache as _TransformersHybridCache  # noqa: F401
+except ImportError:
+    from transformers.cache_utils import DynamicCache as _DynamicCache
+
+    class HybridCache(_DynamicCache):
+        pass
+
+    class HybridChunkedCache(HybridCache):
+        pass
+
+    _orig_tf_getattr = type(transformers).__getattr__
+
+    def _patched_tf_getattr(self, name):
+        if name == "HybridCache":
+            return HybridCache
+        if name == "HybridChunkedCache":
+            return HybridChunkedCache
+        return _orig_tf_getattr(self, name)
+
+    type(transformers).__getattr__ = _patched_tf_getattr
+
+if not hasattr(transformers_utils, "FLAX_WEIGHTS_NAME"):
+    transformers_utils.FLAX_WEIGHTS_NAME = "flax_model.msgpack"
+
 import QEfficient.utils.model_registery  # noqa: F401
 from QEfficient.base import (
     QEFFAutoModel,
