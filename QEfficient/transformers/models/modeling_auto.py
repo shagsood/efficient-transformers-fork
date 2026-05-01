@@ -1830,6 +1830,14 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             inputs["cross_attention_mask"] = torch.nn.functional.pad(
                 inputs["cross_attention_mask"], (0, 0, 0, 0, 0, padded_len - input_ids_length)
             )
+        # mm_token_type_ids (Gemma3, Gemma4, ...) has a dynamic seq_len axis tied to
+        # input_ids. The compiled spec is seq_len=prefill_seq_len for prefill and
+        # seq_len=1 for decode — pad + chunk it alongside input_ids. Pad with 0
+        # (= text token type, non-image).
+        if "mm_token_type_ids" in inputs:
+            inputs["mm_token_type_ids"] = torch.nn.functional.pad(
+                inputs["mm_token_type_ids"], (0, padded_len - input_ids_length), "constant", 0
+            )
 
         for k, v in inputs.items():
             inputs[k] = np.array(v)
@@ -1891,6 +1899,10 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             chunk_inputs["position_ids"] = lang_inputs["position_ids"][
                 ..., i * prefill_seq_len : (i + 1) * prefill_seq_len
             ]
+            if "mm_token_type_ids" in lang_inputs:
+                chunk_inputs["mm_token_type_ids"] = lang_inputs["mm_token_type_ids"][
+                    :, i * prefill_seq_len : (i + 1) * prefill_seq_len
+                ]
             outputs = lang_session.run(chunk_inputs)
             chunk_inputs["image_idx"] = outputs["image_idx_output"]
 
@@ -1914,6 +1926,12 @@ class _QEffAutoModelForImageTextToTextDualQPC:
         if "cross_attention_mask" in lang_inputs:
             bs, _, num_images, img_tiles = lang_inputs["cross_attention_mask"].shape
             lang_inputs["cross_attention_mask"] = torch.ones((bs, 1, num_images, img_tiles), dtype=torch.int64).numpy()
+        # Decode step expects mm_token_type_ids of length 1 (matches input_ids).
+        # Decode tokens are text, so fill with 0.
+        if "mm_token_type_ids" in lang_inputs:
+            lang_inputs["mm_token_type_ids"] = np.zeros(
+                (lang_inputs["input_ids"].shape[0], 1), dtype=lang_inputs["mm_token_type_ids"].dtype
+            )
         generated_ids[:, 0] = lang_inputs["input_ids"].squeeze(1)
 
         if streamer:
