@@ -1850,7 +1850,15 @@ class _QEffAutoModelForImageTextToTextDualQPC:
             k: v
             for k, v in inputs.items()
             if k
-            in {"pixel_values", "image_masks", "image_input_idx", "valid_idx", "aspect_ratio_ids", "aspect_ratio_mask"}
+            in {
+                "pixel_values",
+                "image_masks",
+                "image_input_idx",
+                "valid_idx",
+                "aspect_ratio_ids",
+                "aspect_ratio_mask",
+                "image_position_ids",
+            }
         }
 
         vision_inputs_fp16 = {"pixel_values", "image_masks"}
