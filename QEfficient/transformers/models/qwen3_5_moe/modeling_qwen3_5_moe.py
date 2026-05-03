@@ -499,25 +499,42 @@ class QEffQwen3_5MoeGatedDeltaNet(Qwen3_5MoeGatedDeltaNet):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if cache_params is not None and recurrent_state is not None:
-            # Compute BOTH paths; torch.where selects — single ONNX, hardware predicates
-            recurrent_out, recurrent_S = self._recurrent_step_batched(query, key, value, g, beta, recurrent_state)
+            if getattr(self, "_decode_only", False):
+                core_attn_out, last_recurrent_state = self._recurrent_step_batched(
+                    query, key, value, g, beta, recurrent_state
+                )
+            elif getattr(self, "_prefill_only", False):
+                core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                    query, key, value,
+                    g=g, beta=beta,
+                    position_ids=position_ids,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    mask_causal=self._mask_causal,
+                    mask_strict=self._mask_strict,
+                    ones_lower=self._ones_lower,
+                    eye=self._eye,
+                )
+            else:
+                recurrent_out, recurrent_S = self._recurrent_step_batched(query, key, value, g, beta, recurrent_state)
 
-            chunk_out, chunk_S = self.chunk_gated_delta_rule(
-                query, key, value,
-                g=g, beta=beta,
-                position_ids=position_ids,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                mask_causal=self._mask_causal,
-                mask_strict=self._mask_strict,
-                ones_lower=self._ones_lower,
-                eye=self._eye,
-            )
+                chunk_out, chunk_S = self.chunk_gated_delta_rule(
+                    query, key, value,
+                    g=g, beta=beta,
+                    position_ids=position_ids,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    mask_causal=self._mask_causal,
+                    mask_strict=self._mask_strict,
+                    ones_lower=self._ones_lower,
+                    eye=self._eye,
+                )
 
-            is_decode = hidden_states.shape[1] == torch.tensor(1)
-            core_attn_out = torch.where(is_decode, recurrent_out, chunk_out)
-            last_recurrent_state = torch.where(is_decode, recurrent_S, chunk_S)
+                is_decode = hidden_states.shape[1] == torch.tensor(1)
+                core_attn_out = torch.where(is_decode, recurrent_out, chunk_out)
+                last_recurrent_state = torch.where(is_decode, recurrent_S, chunk_S)
             cache_params.recurrent_states[self.layer_idx] = last_recurrent_state
         else:
             core_attn_out, _ = self.chunk_gated_delta_rule(
@@ -607,7 +624,10 @@ class QEffQwen3_5MoeDecoderLayer(Qwen3_5MoeDecoderLayer):
 
 
 # ---------------------------------------------------------------------------
-# ONNX-safe MoE: static loop over ALL experts (correctness-first)
+# ONNX-safe MoE: batched BMM over top-k experts (compiler-friendly)
+# Gathers only top_k expert weights per token via top_i index, then does one
+# batched matmul per projection. Produces O(top_k) weight references per layer
+# instead of O(num_experts) — ~32x fewer constants for 256/8 configs.
 # ---------------------------------------------------------------------------
 
 
@@ -617,20 +637,126 @@ class QEffQwen3_5MoeSparseMoeBlock(Qwen3_5MoeSparseMoeBlock):
         T = B * S
         x = hidden_states.view(T, H)
 
+        # Shared expert (always active for all tokens)
         shared_out = self.shared_expert(x)
         shared_out = F.sigmoid(self.shared_expert_gate(x)) * shared_out
 
-        router_logits, routing_weights, top_i = self.gate(x)
+        # Router selects top_k experts per token
+        _, routing_weights, top_i = self.gate(x)
+        K = top_i.shape[-1]
+
+        # Gather top_k expert weights per token
+        # gate_up_proj: [E, 2*I, H] -> gather -> [T*K, 2*I, H]
+        # down_proj:    [E, H, I]   -> gather -> [T*K, H, I]
+        flat_top_i = top_i.reshape(-1)
+        gate_up_w = self.experts.gate_up_proj[flat_top_i]
+        down_w = self.experts.down_proj[flat_top_i]
+
+        # Expand input for each top_k slot: [T, H] -> [T, K, H] -> [T*K, 1, H]
+        expert_in = x.unsqueeze(1).expand(-1, K, -1).reshape(T * K, 1, H)
+
+        # Batched linear: F.linear(x, W) == x @ W.T
+        gate_up = torch.bmm(expert_in, gate_up_w.transpose(-1, -2))  # [T*K, 1, 2*I]
+        gate, up = gate_up.chunk(2, dim=-1)
+        h = self.experts.act_fn(gate) * up  # [T*K, 1, I]
+        down_out = torch.bmm(h, down_w.transpose(-1, -2))  # [T*K, 1, H]
+
+        # Weight by routing scores and sum over top_k
+        down_out = down_out.view(T, K, H)
+        weighted = down_out * routing_weights.unsqueeze(-1)
+        expert_out = torch.einsum("tkh->th", weighted)
+
+        return (expert_out + shared_out).view(B, S, H)
+
+
+# ---------------------------------------------------------------------------
+# Expert blocking: scatter-gather dispatch with NSP tree reduction
+# Ported from upstream feat/qwen3_prefill_moe_new (qwen3_moe)
+# ---------------------------------------------------------------------------
+
+EXPERT_BLOCKING_NUM_NSP = 2
+
+
+def _reduce_nsp_tree(values: torch.Tensor, num_lanes: int) -> torch.Tensor:
+    current = values
+    width = num_lanes
+    while width > 1:
+        pair_count = width // 2
+        reduced = current[0 : 2 * pair_count : 2] + current[1 : 2 * pair_count : 2]
+        if width % 2 == 1:
+            reduced = torch.cat((reduced, current[width - 1 : width]), dim=0)
+        current = reduced
+        width = pair_count + (width % 2)
+    return current[0]
+
+
+def _gather_expert_forward_blocked(x, T2Ei, W_gate_up, W_down, act_fn, T):
+    """Scatter-gather expert dispatch for blocked NSP lanes.
+    x: [T, H], T2Ei: [N, T] bool mask, W_gate_up: [N, 2*I, H], W_down: [N, H, I]"""
+    batch_size = T2Ei.shape[0]
+    hidden_size = x.shape[-1]
+
+    scatter_idx = torch.cumsum(T2Ei.long(), dim=1) - 1
+    src_positions = torch.arange(T, dtype=torch.int64, device=x.device).unsqueeze(0).expand(batch_size, -1)
+    safe_dest = torch.where(T2Ei, scatter_idx.long(), torch.full_like(scatter_idx, T - 1, dtype=torch.int64))
+    safe_src = torch.where(T2Ei, src_positions, torch.zeros_like(src_positions))
+    gather_idx = torch.zeros(batch_size, T, dtype=torch.int64, device=x.device)
+    gather_idx.scatter_(1, safe_dest, safe_src)
+
+    x_exp = x.unsqueeze(0).expand(batch_size, -1, -1)
+    gather_exp = gather_idx.unsqueeze(-1).expand(-1, -1, hidden_size)
+    x_prime = torch.gather(x_exp, 1, gather_exp)
+
+    gate_up_prime = torch.bmm(x_prime, W_gate_up.transpose(-1, -2))
+    gate, up = gate_up_prime.chunk(2, dim=-1)
+    h = act_fn(gate) * up
+    down_prime = torch.bmm(h, W_down.transpose(-1, -2))
+
+    valid_rows = T2Ei.to(torch.int32).sum(dim=1)
+    row_range = torch.arange(T, device=x.device, dtype=torch.int32).unsqueeze(0)
+    valid_mask = row_range < valid_rows.unsqueeze(1)
+    down_prime = torch.where(valid_mask.unsqueeze(-1), down_prime, torch.zeros_like(down_prime))
+
+    ungather_exp = gather_idx.unsqueeze(-1).expand(-1, -1, hidden_size)
+    delta = torch.zeros_like(down_prime)
+    delta.scatter_(1, ungather_exp, down_prime)
+    invalid_mask = ~T2Ei
+    delta = torch.where(invalid_mask.unsqueeze(-1), torch.zeros_like(delta), delta)
+
+    return delta
+
+
+class QEffExpertBlockedQwen3_5MoeSparseMoeBlock(QEffQwen3_5MoeSparseMoeBlock):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        B, S, H = hidden_states.shape
+        T = B * S
+        x = hidden_states.view(T, H)
+
+        shared_out = self.shared_expert(x)
+        shared_out = F.sigmoid(self.shared_expert_gate(x)) * shared_out
+
+        _, routing_weights, top_i = self.gate(x)
+        K = top_i.shape[-1]
+
+        full_routing = torch.zeros(T, self.experts.num_experts, dtype=routing_weights.dtype, device=x.device)
+        full_routing.scatter_(1, top_i, routing_weights)
+
+        num_experts = self.experts.num_experts
+        N = EXPERT_BLOCKING_NUM_NSP
+        local_experts = num_experts // N
 
         expert_out = torch.zeros_like(x)
-        for e in range(self.experts.num_experts):
-            expert_mask = (top_i == e).to(routing_weights.dtype)
-            w = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
-            gate_up = F.linear(x, self.experts.gate_up_proj[e])
-            gate, up = gate_up.chunk(2, dim=-1)
-            h = self.experts.act_fn(gate) * up
-            out = F.linear(h, self.experts.down_proj[e])
-            expert_out = expert_out + out * w
+        for slot in range(local_experts):
+            expert_ids = [slot * N + n for n in range(N)]
+            T2Ei = torch.stack([full_routing[:, eid] > 0 for eid in expert_ids], dim=0)
+            W_g = torch.stack([self.experts.gate_up_proj[eid] for eid in expert_ids], dim=0)
+            W_d = torch.stack([self.experts.down_proj[eid] for eid in expert_ids], dim=0)
+            weights_for_slot = torch.stack([full_routing[:, eid] for eid in expert_ids], dim=0)
+
+            delta = _gather_expert_forward_blocked(x, T2Ei, W_g, W_d, self.experts.act_fn, T)
+
+            weighted_delta = delta * weights_for_slot.unsqueeze(-1)
+            expert_out = expert_out + _reduce_nsp_tree(weighted_delta, N)
 
         return (expert_out + shared_out).view(B, S, H)
 

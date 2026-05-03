@@ -483,6 +483,7 @@ from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     QEffQwen3_5MoeGatedDeltaNetCustomRMSNormAIC,
     QEffQwen3_5MoeSparseMoeBlock,
     QEffQwen3_5MoeTextModel,
+    QEffExpertBlockedQwen3_5MoeSparseMoeBlock,
 )
 from QEfficient.transformers.models.qwen3_vl.modeling_qwen3_vl import (
     QEffQwen3VLForConditionalGeneration,
