@@ -670,6 +670,38 @@ class QEffQwen3_5MoeSparseMoeBlock(Qwen3_5MoeSparseMoeBlock):
 
 
 # ---------------------------------------------------------------------------
+# Prefill MoE: static loop (one F.linear per expert).
+# Unlike batched BMM, each expert weight is a separate constant — the compiler
+# CAN dynamically map them at subfunction boundaries with -sub-functions.
+# Use for prefill ONNX only. Decode uses the batched BMM above.
+# ---------------------------------------------------------------------------
+
+
+class QEffPrefillQwen3_5MoeSparseMoeBlock(Qwen3_5MoeSparseMoeBlock):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        B, S, H = hidden_states.shape
+        T = B * S
+        x = hidden_states.view(T, H)
+
+        shared_out = self.shared_expert(x)
+        shared_out = F.sigmoid(self.shared_expert_gate(x)) * shared_out
+
+        _, routing_weights, top_i = self.gate(x)
+
+        expert_out = torch.zeros_like(x)
+        for e in range(self.experts.num_experts):
+            expert_mask = (top_i == e).to(routing_weights.dtype)
+            w = (routing_weights * expert_mask).sum(dim=-1, keepdim=True)
+            gate_up = F.linear(x, self.experts.gate_up_proj[e])
+            gate, up = gate_up.chunk(2, dim=-1)
+            h = self.experts.act_fn(gate) * up
+            out = F.linear(h, self.experts.down_proj[e])
+            expert_out = expert_out + out * w
+
+        return (expert_out + shared_out).view(B, S, H)
+
+
+# ---------------------------------------------------------------------------
 # Expert blocking: scatter-gather dispatch with NSP tree reduction
 # Ported from upstream feat/qwen3_prefill_moe_new (qwen3_moe)
 # ---------------------------------------------------------------------------
