@@ -17,7 +17,10 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeAttention,
     Qwen3_5MoeDecoderLayer,
     Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeGatedDeltaNet,
+    Qwen3_5MoeModel,
+    Qwen3_5MoeModelOutputWithPast,
     Qwen3_5MoeRMSNorm,
     Qwen3_5MoeRMSNormGated,
     Qwen3_5MoeSparseMoeBlock,
@@ -28,6 +31,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     repeat_kv,
     rotate_half,
 )
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 
 from QEfficient.customop.rms_norm import CustomRMSNormFunc
 from QEfficient.transformers.cache_utils import QEffDynamicLayer
@@ -1002,3 +1006,290 @@ class QEffQwen3_5MoeForCausalLM(Qwen3_5MoeForCausalLM):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
         )
+
+
+# ---------------------------------------------------------------------------
+# VLM path — Qwen3_5MoeForConditionalGeneration
+# Ported from upstream PR #901 dense qwen3_5 VLM. Vision encoding is delegated
+# to HF's native Qwen3_5MoeVisionModel (invoked via self.get_image_features);
+# we override the multimodal Model.forward and the top-level
+# ForConditionalGeneration with the QEff get_* methods for ONNX export.
+# ---------------------------------------------------------------------------
+
+
+class QEffQwen3_5MoeModel(Qwen3_5MoeModel):
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        mm_token_type_ids: Optional[torch.IntTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+
+        if pixel_values is not None:
+            image_outputs: BaseModelOutputWithPooling = self.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True
+            )
+            image_embeds = image_outputs.pooler_output
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = self.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if position_ids is None:
+            position_ids = self.compute_3d_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
+        outputs = self.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+        return Qwen3_5MoeModelOutputWithPast(
+            **outputs,
+            rope_deltas=self.rope_deltas,
+        )
+
+
+class QEffQwen3_5MoeForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        mm_token_type_ids: Optional[torch.IntTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs,
+    ):
+        outputs = self.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            mm_token_type_ids=mm_token_type_ids,
+            **kwargs,
+        )
+
+        # Extract logit at argmax(position_ids[0]) — text position (last real token)
+        text_position_ids = position_ids[0] if position_ids.ndim == 3 else position_ids
+        logit_index = text_position_ids.to(torch.int32).argmax(1, keepdim=True)
+        hidden_states = outputs.last_hidden_state[
+            torch.arange(text_position_ids.shape[0]).view(-1, 1), logit_index
+        ]
+        logits = self.lm_head(hidden_states)
+
+        return logits, outputs.past_key_values[: len(past_key_values)] if past_key_values else logits
+
+    def get_specializations(
+        self,
+        batch_size: int,
+        prefill_seq_len: int,
+        ctx_len: int,
+        img_size: None,
+        kv_offload: bool = False,
+        continuous_batching: bool = False,
+        kv_cache_batch_size: Optional[int] = None,
+        full_batch_size: Optional[int] = None,
+        **compiler_options,
+    ):
+        compiler_options.pop("comp_ctx_lengths_prefill", None)
+        compiler_options.pop("comp_ctx_lengths_decode", None)
+
+        lang_prefill = {
+            "batch_size": 1 if continuous_batching else batch_size,
+            "seq_len": prefill_seq_len,
+            "ctx_len": ctx_len,
+        }
+        lang_decode = {
+            "batch_size": full_batch_size if continuous_batching else batch_size,
+            "seq_len": 1,
+            "ctx_len": ctx_len,
+        }
+        return [lang_prefill, lang_decode], compiler_options
+
+    def get_onnx_dynamic_axes(
+        self, comp_ctx_lengths: Optional[List[int]] = None, kv_offload: bool = False, continuous_batching: bool = False
+    ):
+        num_layers = self.config.text_config.num_hidden_layers
+
+        vision_dynamic_axes = {
+            "pixel_values": {0: "grid_height", 1: "grid_width"},
+            "image_grid_thw": {0: "batch_size", 2: "grid_h", 3: "grid_w"},
+        }
+        lang_dynamic_axes = {
+            "input_ids": {0: "batch_size", 1: "seq_len"},
+            "position_ids": {1: "batch_size", 2: "seq_len"},
+        }
+
+        for i in range(num_layers):
+            if self.config.text_config.layer_types[i] == "full_attention":
+                lang_dynamic_axes[f"past_key.{i}"] = {
+                    0: "full_batch_size" if continuous_batching else "batch_size",
+                    2: "ctx_len",
+                }
+                lang_dynamic_axes[f"past_value.{i}"] = {
+                    0: "full_batch_size" if continuous_batching else "batch_size",
+                    2: "ctx_len",
+                }
+
+        if continuous_batching:
+            lang_dynamic_axes["batch_index"] = {0: "batch_size"}
+        if comp_ctx_lengths is not None:
+            lang_dynamic_axes["comp_ctx_lengths"] = {0: "comp_ctx_lengths"}
+
+        if kv_offload:
+            return {"vision": vision_dynamic_axes, "lang": lang_dynamic_axes}
+        return lang_dynamic_axes
+
+    def get_dummy_inputs(
+        self,
+        comp_ctx_lengths: Optional[List[int]] = None,
+        kv_offload: bool = False,
+        continuous_batching: bool = False,
+        **kwargs,
+    ):
+        bs = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
+        fbs = constants.ONNX_EXPORT_EXAMPLE_FBS
+        seq_len = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
+        linear_bs = fbs if continuous_batching else bs
+
+        lang_inputs = {}
+        lang_inputs["input_ids"] = torch.zeros((bs, seq_len), dtype=torch.int64)
+        lang_inputs["position_ids"] = (
+            torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1).unsqueeze(0).repeat(4, 1, 1)
+        )
+
+        kv_cache_shape = get_padding_shape_from_config(
+            config=self.model.config.text_config,
+            batch_size=linear_bs,
+            seq_len=seq_len,
+        )
+
+        lang_inputs["past_key_values"] = [[] for _ in range(self.config.text_config.num_hidden_layers)]
+        for i in range(self.config.text_config.num_hidden_layers):
+            if self.config.text_config.layer_types[i] == "full_attention":
+                for _kv in ["key", "value"]:
+                    lang_inputs["past_key_values"][i].append(torch.zeros(kv_cache_shape, dtype=torch.float32))
+            else:
+                layer = self.model.language_model.layers[i].linear_attn
+                conv_shape = (linear_bs, layer.conv_dim, layer.conv_kernel_size)
+                rec_shape = (linear_bs, layer.num_v_heads, layer.head_k_dim, layer.head_v_dim)
+                lang_inputs["past_key_values"][i].append(torch.zeros(conv_shape, dtype=torch.float32))
+                lang_inputs["past_key_values"][i].append(torch.zeros(rec_shape, dtype=torch.float32))
+
+        if continuous_batching:
+            lang_inputs["batch_index"] = torch.arange(bs).view(bs, 1)
+        if comp_ctx_lengths is not None:
+            lang_inputs["comp_ctx_lengths"] = torch.randint(0, 100, (self.config.text_config.num_hidden_layers,), dtype=torch.int8)
+
+        if kv_offload:
+            return {"vision": {}, "lang": lang_inputs}
+        return lang_inputs
+
+    def get_output_names(self, kv_offload: bool = False):
+        vision_output_names = ["vision_embeds"]
+        lang_output_names = ["logits"]
+        for i in range(self.config.text_config.num_hidden_layers):
+            if self.config.text_config.layer_types[i] == "full_attention":
+                lang_output_names.append(f"past_key.{i}_RetainedState")
+                lang_output_names.append(f"past_value.{i}_RetainedState")
+            else:
+                lang_output_names.append(f"conv_state.{i}_RetainedState")
+                lang_output_names.append(f"recurrent_state.{i}_RetainedState")
+
+        if kv_offload:
+            return {"vision": vision_output_names, "lang": lang_output_names}
+        return lang_output_names
+
+    def get_inputs_info(self):
+        return [
+            IOInfo(name="input_ids", datatype=torch.int64, shape=("batch_size", "seq_len")),
+            IOInfo(name="attention_mask", datatype=torch.int64, shape=("batch_size", "seq_len")),
+        ]
+
+    def prepare_inputs_for_generation(self, inputs, prefill_seq_len=128, batch_size=1):
+        input_ids_length = inputs["input_ids"].shape[1]
+
+        # Text positions 1×bs×seq
+        text_pos = torch.arange(input_ids_length).view(1, 1, input_ids_length).expand(-1, batch_size, -1)
+
+        pos_ids, _rope_deltas = self.model.get_rope_index(
+            inputs["input_ids"],
+            None if "image_grid_thw" not in inputs else inputs["image_grid_thw"],
+            video_grid_thw=None,
+            second_per_grid_ts=None,
+            attention_mask=inputs.get("attention_mask"),
+        )
+        # Concatenate text row + 3D MRoPE rows → (4, bs, seq)
+        inputs["position_ids"] = torch.cat((text_pos, pos_ids), dim=0)
+
+        # Pad to chunk boundary
+        num_chunks = -(input_ids_length // -prefill_seq_len)
+        padded_len = num_chunks * prefill_seq_len
+        inputs["position_ids"] = F.pad(
+            inputs["position_ids"], pad=(0, padded_len - input_ids_length), mode="constant", value=-1
+        )
+
+        inputs.pop("image_grid_thw", None)
+        return inputs
+
+
+# ---------------------------------------------------------------------------
+# Encoder wrapper for standalone vision ONNX export
+# ---------------------------------------------------------------------------
+
+
+class QEffQwen3_5MoeEncoderWrapper(nn.Module):
+    """Standalone wrapper around the HF vision encoder for ONNX export.
+    Takes (pixel_values, image_grid_thw), returns flat [num_patches, out_hidden_size]."""
+
+    def __init__(self, vlm_model: Qwen3_5MoeForConditionalGeneration):
+        super().__init__()
+        self.model = vlm_model
+
+    def forward(self, pixel_values, image_grid_thw):
+        image_outputs = self.model.model.get_image_features(
+            pixel_values, image_grid_thw, return_dict=True
+        )
+        image_embeds = image_outputs.pooler_output
+        return torch.cat(image_embeds, dim=0) if isinstance(image_embeds, (list, tuple)) else image_embeds
