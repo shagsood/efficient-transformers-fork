@@ -2903,13 +2903,24 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         custom_io = {}
         target_dtype = getattr(self.model.config, "torch_dtype", torch.float32)
         kv_cache_dtype = "mxint8" if mxint8_kv_cache else CUSTOM_IO_DTYPE_MAP[target_dtype]
+
+        def _vision_io_dtype(name: str) -> str:
+            # pixel_values is always the compute dtype (it feeds the vision tower directly).
+            if "pixel_values" in name:
+                return CUSTOM_IO_DTYPE_MAP[target_dtype]
+            # Pin vision_embeds / deepstack_features to mxint8 so they stay distinct,
+            # un-foldable I/O buffers. If left fp16 when KV is fp16, the -convert-to-fp16
+            # pass folds the identity passthrough and drops the vision_embeds input.
+            if "vision_embeds" in name or "deepstack_features" in name:
+                return "mxint8"
+            return kv_cache_dtype
+
         for input_name in output_names:
             if input_name.endswith("_RetainedState"):
-                dtype = CUSTOM_IO_DTYPE_MAP[target_dtype] if "pixel_values" in input_name else kv_cache_dtype
                 _add_retained_state_custom_io(
                     custom_io,
                     input_name,
-                    dtype=dtype,
+                    dtype=_vision_io_dtype(input_name),
                     use_onnx_subfunctions=use_onnx_subfunctions,
                 )
 
