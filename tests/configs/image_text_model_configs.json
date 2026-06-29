@@ -765,6 +765,49 @@
       "deepstack_index": 8,
       "compile_prefill_seq_len": null,
       "mad_max_threshold": 0.002
+    },
+    {
+      "model_name": "google/diffusiongemma-26B-A4B-it",
+      "model_type": "diffusion_gemma",
+      "batch_size": 1,
+      "prompt_len": 32,
+      "ctx_len": 1024,
+      "img_size": 896,
+      "img_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/datasets/cat_style_layout.png",
+      "text_prompt": "Can you describe the image in detail?",
+      "num_layers": 2,
+      "img_url_list": [
+        "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/datasets/cat_style_layout.png"
+      ],
+      "text_prompt_list": [
+        "Can you describe the image in detail?"
+      ],
+      "full_batch_size": 1,
+      "additional_params": {
+        "vision_config": {
+          "hidden_size": 64,
+          "intermediate_size": 256,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "patch_size": 16,
+          "pooling_kernel_size": 3,
+          "default_output_length": 4
+        },
+        "text_config": {
+          "hidden_size": 128,
+          "intermediate_size": 512,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "head_dim": 64,
+          "global_head_dim": 128,
+          "num_global_key_value_heads": 1,
+          "num_experts": 4,
+          "top_k_experts": 2,
+          "moe_intermediate_size": 32,
+          "sliding_window": 512
+        }
+      }
     }
   ]
 }

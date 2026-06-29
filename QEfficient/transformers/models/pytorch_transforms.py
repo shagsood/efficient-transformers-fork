@@ -20,6 +20,18 @@ from transformers.models.codegen.modeling_codegen import (
 from transformers.models.deberta_v2.modeling_deberta_v2 import (
     DisentangledSelfAttention,
 )
+from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+    DiffusionGemmaDecoderModel,
+    DiffusionGemmaDecoderTextAttention,
+    DiffusionGemmaDecoderTextLayer,
+    DiffusionGemmaEncoderTextAttention,
+    DiffusionGemmaEncoderTextLayer,
+    DiffusionGemmaEncoderTextModel,
+    DiffusionGemmaForBlockDiffusion,
+    DiffusionGemmaRMSNorm,
+    DiffusionGemmaTextExperts,
+    DiffusionGemmaTextRouter,
+)
 from transformers.models.falcon.modeling_falcon import (
     FalconAttention,
     FalconDecoderLayer,
@@ -328,6 +340,18 @@ from QEfficient.transformers.models.deepseek_v3.modeling_deepseek import (
     QEffDeepseekV3Model,
     QEffDeepseekV3MoE,
     QEffPrefillOnlyDeepseekV3MoE,
+)
+from QEfficient.transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+    QEffDiffusionGemmaDecoderModel,
+    QEffDiffusionGemmaDecoderTextAttention,
+    QEffDiffusionGemmaDecoderTextLayer,
+    QEffDiffusionGemmaEncoderTextAttention,
+    QEffDiffusionGemmaEncoderTextLayer,
+    QEffDiffusionGemmaEncoderTextModel,
+    QEffDiffusionGemmaForBlockDiffusion,
+    QEffDiffusionGemmaRMSNorm,
+    QEffDiffusionGemmaTextExperts,
+    QEffDiffusionGemmaTextRouter,
 )
 from QEfficient.transformers.models.falcon.modeling_falcon import (
     QEffFalconAttention,
@@ -667,6 +691,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         Qwen3MoeRMSNorm: CustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
         Gemma4RMSNorm: QEffGemma4CustomRMSNormAIC,
+        DiffusionGemmaRMSNorm: QEffDiffusionGemmaRMSNorm,
         Olmo2RMSNorm: CustomRMSNormAIC,
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
         Qwen3VLTextRMSNorm: CustomRMSNormAIC,
@@ -791,6 +816,16 @@ class KVCacheTransform(ModuleMappingTransform):
         Gemma4TextRouter: QEffGemma4TextRouter,
         Gemma4VisionAttention: QEffGemma4VisionAttention,
         Gemma4ClippableLinear: QEffGemma4ClippableLinear,
+        # DiffusionGemma
+        DiffusionGemmaEncoderTextAttention: QEffDiffusionGemmaEncoderTextAttention,
+        DiffusionGemmaDecoderTextAttention: QEffDiffusionGemmaDecoderTextAttention,
+        DiffusionGemmaEncoderTextLayer: QEffDiffusionGemmaEncoderTextLayer,
+        DiffusionGemmaDecoderTextLayer: QEffDiffusionGemmaDecoderTextLayer,
+        DiffusionGemmaDecoderModel: QEffDiffusionGemmaDecoderModel,
+        DiffusionGemmaEncoderTextModel: QEffDiffusionGemmaEncoderTextModel,
+        DiffusionGemmaForBlockDiffusion: QEffDiffusionGemmaForBlockDiffusion,
+        DiffusionGemmaTextExperts: QEffDiffusionGemmaTextExperts,
+        DiffusionGemmaTextRouter: QEffDiffusionGemmaTextRouter,
         # GPT_OSS
         GptOssAttention: QEffGptOssAttention,
         GptOssDecoderLayer: QEffGptOssDecoderLayer,
