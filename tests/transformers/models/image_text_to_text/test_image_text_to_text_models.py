@@ -218,7 +218,8 @@ def check_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100(
         inputs = processor(images=image, text=prompt, return_tensors="pt")
         if "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(qeff_model.model.config.torch_dtype)
-        pytorch_hf_tokens = api_runner.run_vlm_hf_model_on_pytorch(model_hf, inputs)
+        if model_name not in ModelConfig.DIFFUSION_MODELS:
+            pytorch_hf_tokens = api_runner.run_vlm_hf_model_on_pytorch(model_hf, inputs)
         inputs = processor(images=image, text=prompt, return_tensors="pt")
         if hasattr(qeff_model.model.config, "model_type") and qeff_model.model.config.model_type in [
             "qwen2_5_vl",
@@ -234,16 +235,31 @@ def check_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100(
             inputs["pixel_values"] = inputs["pixel_values"].to(qeff_model.model.config.torch_dtype)
         compile_kwargs["img_size"] = img_size
 
-    # pytorch_kv_tokens = api_runner.run_vlm_kv_model_on_pytorch(qeff_model.model)
-    # assert (pytorch_kv_tokens == pytorch_hf_tokens).all(), (
-    #     "Tokens don't match for pytorch HF output and pytorch KV output"
-    # )
+    # CPU-side numerical parity (precision-independent): localizes a bug to the QEff
+    # transform (HF!=KV) or the ONNX export (KV!=ORT) before any hardware run. The
+    # generate()-based KV/ORT comparison only applies to autoregressive VLMs; diffusion
+    # models are non-AR (pytorch_hf_tokens is None) and are handled in the branch below.
+    if model_name not in ModelConfig.DIFFUSION_MODELS:
+        pytorch_kv_tokens = api_runner.run_vlm_kv_model_on_pytorch(qeff_model.model)
+        if pytorch_hf_tokens is not None:
+            assert (pytorch_kv_tokens == pytorch_hf_tokens).all(), (
+                "Tokens don't match for pytorch HF output and pytorch KV output"
+            )
 
-    _ = qeff_model.export()
-    # ort_tokens = api_runner.run_vlm_kv_model_on_ort(onnx_model_path)
-    # assert (pytorch_hf_tokens == ort_tokens).all(), "Tokens don't match for pytorch HF output and ORT output"
+        onnx_model_path = qeff_model.export()
+        ort_tokens = api_runner.run_vlm_kv_model_on_ort(onnx_model_path)
+        if pytorch_hf_tokens is not None:
+            assert (pytorch_hf_tokens == ort_tokens).all(), "Tokens don't match for pytorch HF output and ORT output"
+    else:
+        # Diffusion: export only here; the AR comparators above don't apply.
+        _ = qeff_model.export()
 
     qeff_model.compile(**compile_kwargs)
+    if model_name in ModelConfig.DIFFUSION_MODELS:
+        # Non-autoregressive: generate() does not apply, so this harness validates
+        # export+compile only. Skip (not return) so the result is visibly SKIPPED.
+        manual_cleanup(qeff_model.onnx_path)
+        pytest.skip("DiffusionGemma is non-autoregressive: this harness validates export+compile only.")
     streamer = TextStreamer(processor.tokenizer)
     print("QPC Outputs (QAIC):")
     exec_info = qeff_model.generate(inputs=inputs, generation_len=NEW_GENERATION_TOKENS, streamer=streamer)
@@ -317,6 +333,8 @@ def test_dummy_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100(model_name, kv_o
         pytest.skip("Test skipped for this model due to some issues.")
     if model_name in ModelConfig.DUAL_QPC_MODELS and not kv_offload:
         pytest.skip("These models require kv_offload=True for testing.")
+    if model_name in ModelConfig.DIFFUSION_MODELS and kv_offload:
+        pytest.skip("DiffusionGemma dual-QPC not yet validated; single-QPC only.")
 
     torch.manual_seed(42)
     hf_config = None

@@ -454,6 +454,7 @@ class ModelConfig:
         "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
         "Qwen/Qwen2.5-VL-3B-Instruct",
         "Qwen/Qwen3.5-0.8B",
+        "google/diffusiongemma-26B-A4B-it",
         # "Qwen/Qwen3.6-35B-A3B",
     }
 
@@ -478,6 +479,12 @@ class ModelConfig:
         "Qwen/Qwen2.5-VL-3B-Instruct",
         "Qwen/Qwen3.5-0.8B",
         "Qwen/Qwen3.6-35B-A3B",
+    }
+
+    # Non-autoregressive (diffusion) VLMs: the generate()-based harness validates
+    # export+compile only and is skipped for these models.
+    DIFFUSION_MODELS = {
+        "google/diffusiongemma-26B-A4B-it",
     }
 
     DUAL_QPC_MODELS = {
