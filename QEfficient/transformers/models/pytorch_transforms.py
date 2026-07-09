@@ -444,6 +444,7 @@ from QEfficient.transformers.models.hy_v3.modeling_hy_v3 import (
     QEffHYV3MoE,
     QEffHYV3RotaryEmbedding,
     QEffHYV3TopKRouter,
+    QEffPrefillChunkedHYV3MoE,
 )
 from QEfficient.transformers.models.internvl.modeling_internvl import (
     QEffInternDecoderWrapper,
@@ -960,6 +961,8 @@ class PrefillOnlyChunkedTransform(ModuleMappingTransform):
         QEffQwen3_5MoeSparseMoeBlock: QEffPrefillChunkedQwen3_5MoeSparseMoeBlock,
         # Gemma4_Moe
         QEffGemma4TextExperts: QEffPrefillChunckedGemma4TextExperts,
+        # HYV3 (Hy3)
+        QEffHYV3MoE: QEffPrefillChunkedHYV3MoE,
     }
 
 
@@ -981,6 +984,8 @@ class RevertPrefillKeepAttentionTransform(ModuleMappingTransform):
         QEffPrefillChunkedQwen3_5MoeSparseMoeBlock: QEffQwen3_5MoeSparseMoeBlock,
         # Gemma4_Moe
         QEffPrefillChunckedGemma4TextExperts: QEffGemma4TextExperts,
+        # HYV3 (Hy3)
+        QEffPrefillChunkedHYV3MoE: QEffHYV3MoE,
     }
 
 
