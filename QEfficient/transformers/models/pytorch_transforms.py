@@ -103,6 +103,16 @@ from transformers.models.granitemoe.modeling_granitemoe import (
     GraniteMoeRotaryEmbedding,
     GraniteMoeTopKGating,
 )
+from transformers.models.hy_v3.modeling_hy_v3 import (
+    HYV3Attention,
+    HYV3DecoderLayer,
+    HYV3ForCausalLM,
+    HYV3Model,
+    HYV3MoE,
+    HYV3RMSNorm,
+    HYV3RotaryEmbedding,
+    HYV3TopKRouter,
+)
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaDecoderLayer,
@@ -426,6 +436,15 @@ from QEfficient.transformers.models.grok_1.modeling_grok1 import (
     QEffGrok1MoeBlock,
     QEffGrok1MultiHeadAttention,
 )
+from QEfficient.transformers.models.hy_v3.modeling_hy_v3 import (
+    QEffHYV3Attention,
+    QEffHYV3DecoderLayer,
+    QEffHYV3ForCausalLM,
+    QEffHYV3Model,
+    QEffHYV3MoE,
+    QEffHYV3RotaryEmbedding,
+    QEffHYV3TopKRouter,
+)
 from QEfficient.transformers.models.internvl.modeling_internvl import (
     QEffInternDecoderWrapper,
     QEffInternVisionEmbeddings,
@@ -659,6 +678,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
         Qwen3VLTextRMSNorm: CustomRMSNormAIC,
         Glm4MoeRMSNorm: CustomRMSNormAIC,
+        HYV3RMSNorm: CustomRMSNormAIC,
         Wav2Vec2Encoder: QEffWav2Vec2Encoder,
         Wav2Vec2EncoderStableLayerNorm: QEffWav2Vec2EncoderStableLayerNorm,
         # BERT-family: replace _create_attention_masks (uses create_bidirectional_mask,
@@ -683,6 +703,14 @@ class KVCacheTransform(ModuleMappingTransform):
         Glm4MoeRotaryEmbedding: QEffGlm4MoeRotaryEmbedding,
         Glm4MoeMoE: QEffGlm4MoeMoE,
         Glm4MoeTopkRouter: QEffGlm4MoeTopkRouter,
+        # HYV3 (Hy3)
+        HYV3Model: QEffHYV3Model,
+        HYV3ForCausalLM: QEffHYV3ForCausalLM,
+        HYV3Attention: QEffHYV3Attention,
+        HYV3DecoderLayer: QEffHYV3DecoderLayer,
+        HYV3RotaryEmbedding: QEffHYV3RotaryEmbedding,
+        HYV3MoE: QEffHYV3MoE,
+        HYV3TopKRouter: QEffHYV3TopKRouter,
         # CodeGen
         CodeGenAttention: QEffCodeGenAttention,
         CodeGenBlock: QEffCodeGenBlock,
