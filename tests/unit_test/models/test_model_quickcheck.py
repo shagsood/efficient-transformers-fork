@@ -76,6 +76,7 @@ CAUSAL_RUNTIME_MODEL_IDS = {
     "granite": "hf-internal-testing/tiny-random-GraniteForCausalLM",
     "olmo2": "hf-internal-testing/tiny-random-Olmo2ForCausalLM",
     "gpt_oss": "tiny-random/gpt-oss-bf16",
+    "hy_v3": "tiny-random/hy-v3",
 }
 
 #   In PyTorch ≤2.3 (used with transformers v4.57.3), torch.onnx.export with
@@ -90,6 +91,9 @@ CAUSAL_MULTI_SUBFUNCTION_MODEL_TYPES = {
     "phi",
     "starcoder2",
     "gpt_oss",
+    # hy_v3: layer 0 is dense FFN, layers 1+ are sparse MoE (`mlp_layer_types`) — the shared
+    # QEffHYV3DecoderLayer class traces to two distinct ONNX function bodies (dense vs. MoE mlp).
+    "hy_v3",
     # "granitemoe" is intentionally not listed in CAUSAL_RUNTIME_MODEL_IDS yet.
 }
 
