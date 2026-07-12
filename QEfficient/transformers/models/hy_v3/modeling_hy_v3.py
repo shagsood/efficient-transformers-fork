@@ -450,16 +450,20 @@ class QEffPrefillChunkedHYV3MoE(QEffHYV3MoE):
         routing_weights.scatter_(1, top_k_index, top_k_weights)
 
         local_experts = num_experts // num_nsp
-        rw = (
-            routing_weights.transpose(0, 1)
-            .contiguous()
-            .view(local_experts, num_nsp, num_tokens)
-            .transpose(0, 1)
-            .contiguous()
-        )
-        W_g = self.all_gate_proj.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1).contiguous()
-        W_u = self.all_up_proj.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1).contiguous()
-        W_d = self.all_down_proj.view(local_experts, num_nsp, -1, hidden_dim).transpose(0, 1).contiguous()
+        # RAM-safe reshape: build strided VIEWS of the routing weights and the
+        # fused expert weights, no `.contiguous()`. During ONNX export a
+        # `.contiguous()` after a transpose materializes a full copy of the
+        # operand — done once per MoE layer × 3 fused-weight buffers, that
+        # peak-RAM cost tripped LSF TERM_MEMLIMIT at 1.998 TB on the first
+        # RAM-fixed grid compile (job 4861874, 2026-07-12). Every downstream
+        # op here (matmul in `_cumsum_scatter_gather_update_expert_blocked`,
+        # scalar `> 0` comparison, per-slot dim-1 indexing) accepts a strided
+        # operand — verified bit-identical against the old `.contiguous()`
+        # build on tiny-random/hy-v3.
+        rw = routing_weights.transpose(0, 1).view(local_experts, num_nsp, num_tokens).transpose(0, 1)
+        W_g = self.all_gate_proj.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1)
+        W_u = self.all_up_proj.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1)
+        W_d = self.all_down_proj.view(local_experts, num_nsp, -1, hidden_dim).transpose(0, 1)
         expert_out = hidden_states.new_zeros((num_nsp, num_tokens, hidden_dim))
         routing_weights_unsqueezed = rw.unsqueeze(-1)
 
