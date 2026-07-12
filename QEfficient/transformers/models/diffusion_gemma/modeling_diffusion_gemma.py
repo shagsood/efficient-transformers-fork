@@ -1386,6 +1386,15 @@ class QEffDiffusionGemmaForBlockDiffusion(DiffusionGemmaForBlockDiffusion):
     def get_qeff_language_decoder(self) -> QEffDiffusionGemmaUnifiedWrapper:
         return QEffDiffusionGemmaUnifiedWrapper(self)
 
+    def get_qeff_unified_wrapper(self) -> QEffDiffusionGemmaUnifiedWrapper:
+        """Wan2.2 unified path: single-QPC with in-graph torch.where dispatch.
+
+        See docs/superpowers/specs/2026-07-10-diffusion-gemma-single-qpc-design.md
+        for the design; get_qeff_encoder_prefill / get_qeff_canvas_decode remain
+        the dual-QPC path.
+        """
+        return QEffDiffusionGemmaUnifiedWrapper(self)
+
     def get_qeff_encoder_prefill(self) -> QEffDiffusionGemmaEncoderPrefillWrapper:
         """Disaggregated dual-QPC: standalone encoder-prefill QPC."""
         return QEffDiffusionGemmaEncoderPrefillWrapper(self)
