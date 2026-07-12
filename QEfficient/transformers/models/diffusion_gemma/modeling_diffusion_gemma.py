@@ -927,32 +927,57 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         canvas_len = decoder_input_ids.shape[1]
         is_encode = canvas_len == torch.tensor(1, dtype=torch.int64, device=decoder_input_ids.device)
 
+        orig_kv = [(layer.keys.clone(), layer.values.clone()) for layer in past_key_values.layers]
+
         # ---- Encoder path ----
         # Wan2.2 pattern: both branches execute; torch.where(is_encode) at output-level
-        # selects. Encoder KV writes happen unconditionally to retained-state buffers;
-        # the compiler folds the unused branch per specialization. No KV clone/restore
-        # needed — that dance was the workaround for the abandoned value-derived
-        # predicate. See docs/superpowers/specs/2026-07-10-diffusion-gemma-single-qpc-design.md
+        # selects. But the encoder's KV *write* cannot be gated the same way the output
+        # is gated: CtxScatterFunc (QEfficient/customop/ctx_scatter_gather.py:42-48) does
+        # plain fancy indexing, where position_ids=-1 means "last slot", not "skip". An
+        # is_encode-masked position_ids=-1 trick was tried and falsified — it silently
+        # corrupts past_key.{ctx_len-1} on every decode step instead of no-op'ing. So we
+        # gate by selecting between two fully-computed KV tensors after the encoder call
+        # runs unconditionally — clone the pre-call KV, run the encoder, then torch.where
+        # per layer between the post-call KV and the clone. Same "select between two
+        # fully-computed tensors" pattern already used and trusted at the output-level
+        # gate below, not an exploit of scatter-target-address semantics. See
+        # docs/superpowers/specs/2026-07-10-diffusion-gemma-single-qpc-design.md edit #2.
         #
-        # When is_encode=0, mask encoder position_ids to -1 so CtxScatterFunc
-        # inside _NoGatherCacheLayer.update becomes a no-op. Compiler folds the
-        # whole encoder-KV-write path away on Decode spec, keeping the decoder-read
-        # path live for the same past_* retained-state buffers.
-        encoder_position_ids = torch.where(
-            is_encode.bool().view(1, 1),
-            position_ids,
-            torch.full_like(position_ids, -1),
-        )
+        # Force ALL cache layers non-sliding + substitute _NoGatherCacheLayer before the
+        # encoder call. The sliding-window rolling gather produces INT32_MAX gather
+        # indices under bulk single-pass prefill with padding (the D5 root cause —
+        # GatherND invalid index 2147483647). Non-sliding + no-gather falls through to
+        # plain CtxScatter+CtxGather, which handles padding correctly. Safe to share with
+        # the decoder branch: QEffDiffusionGemmaDecoderTextAttention.forward reads
+        # past_key_values.layers[self.layer_idx].keys/.values as plain attributes and
+        # never calls .update() or reads .is_sliding, so the substitution (which only
+        # overrides .update()) is transparent to it.
+        if past_key_values is not None:
+            for layer in past_key_values.layers:
+                layer.is_sliding = False
+
+        if past_key_values is not None:
+            for i, layer in enumerate(past_key_values.layers):
+                new_layer = _NoGatherCacheLayer(is_sliding=False)
+                new_layer.keys = layer.keys
+                new_layer.values = layer.values
+                if layer.keys is not None:
+                    new_layer._mark_initialized(layer.keys)
+                past_key_values.layers[i] = new_layer
 
         inputs_embeds, next_image_idx = self.model._inject_vision_embeds(input_ids, vision_embeds, image_idx)
         enc_outputs = lang_model(
             inputs_embeds=inputs_embeds,
             attention_mask=None,
-            position_ids=encoder_position_ids,
+            position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=True,
             mm_token_type_ids=mm_token_type_ids,
         )
+        enc_kv = [
+            (past_key_values.layers[i].keys, past_key_values.layers[i].values)
+            for i in range(self.text_config.num_hidden_layers)
+        ]
 
         hidden_states = enc_outputs.last_hidden_state
         # INT32 logit gather index
@@ -965,6 +990,12 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
             enc_logits = enc_logits * self.text_config.final_logit_softcapping
         enc_logits = enc_logits.float()
         enc_canvas_logits = enc_logits.expand(-1, canvas_len, -1)
+
+        # Gate KV so decoder reads: encoder-updated KV on Prefill, original KV on Decode.
+        is_f4 = is_encode.view(1, 1, 1, 1)
+        for _i, (_ok, _ov) in enumerate(orig_kv):
+            past_key_values.layers[_i].keys = torch.where(is_f4, enc_kv[_i][0], _ok)
+            past_key_values.layers[_i].values = torch.where(is_f4, enc_kv[_i][1], _ov)
 
         # ---- Decoder path ----
         dec_outputs = self.model.model.decoder(
