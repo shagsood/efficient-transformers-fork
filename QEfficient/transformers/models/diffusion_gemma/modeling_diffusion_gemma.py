@@ -867,7 +867,7 @@ class QEffDiffusionGemmaVisionEncoderWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class QEffDiffusionGemmaLangWrapper(nn.Module):
+class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
     """
     Wrapper that drives the encoder text model (prefill) and the diffusion
     decoder (canvas denoising step) for QPC export.
@@ -891,8 +891,14 @@ class QEffDiffusionGemmaLangWrapper(nn.Module):
         self.config = model.config
         self.text_config = model.config.text_config
 
-    def get_submodules_for_export(self) -> Type[nn.Module]:
-        return {QEffDiffusionGemmaEncoderTextLayer}
+    def get_submodules_for_export(self):
+        """Return repeated block classes for ONNX subfunction extraction.
+
+        Wan2.2 pattern (transformer_wan.py:328): the compiler shares subfunctions
+        across the two repeated block classes, cutting compile time on the
+        30-layer encoder + 30-layer decoder graph.
+        """
+        return {QEffDiffusionGemmaEncoderTextLayer, QEffDiffusionGemmaDecoderTextLayer}
 
     def forward(
         self,
@@ -921,22 +927,32 @@ class QEffDiffusionGemmaLangWrapper(nn.Module):
         canvas_len = decoder_input_ids.shape[1]
         is_encode = canvas_len == torch.tensor(1, dtype=torch.int64, device=decoder_input_ids.device)
 
-        orig_kv = [(layer.keys.clone(), layer.values.clone()) for layer in past_key_values.layers]
-
         # ---- Encoder path ----
+        # Wan2.2 pattern: both branches execute; torch.where(is_encode) at output-level
+        # selects. Encoder KV writes happen unconditionally to retained-state buffers;
+        # the compiler folds the unused branch per specialization. No KV clone/restore
+        # needed — that dance was the workaround for the abandoned value-derived
+        # predicate. See docs/superpowers/specs/2026-07-10-diffusion-gemma-single-qpc-design.md
+        #
+        # When is_encode=0, mask encoder position_ids to -1 so CtxScatterFunc
+        # inside _NoGatherCacheLayer.update becomes a no-op. Compiler folds the
+        # whole encoder-KV-write path away on Decode spec, keeping the decoder-read
+        # path live for the same past_* retained-state buffers.
+        encoder_position_ids = torch.where(
+            is_encode.bool().view(1, 1),
+            position_ids,
+            torch.full_like(position_ids, -1),
+        )
+
         inputs_embeds, next_image_idx = self.model._inject_vision_embeds(input_ids, vision_embeds, image_idx)
         enc_outputs = lang_model(
             inputs_embeds=inputs_embeds,
             attention_mask=None,
-            position_ids=position_ids,
+            position_ids=encoder_position_ids,
             past_key_values=past_key_values,
             use_cache=True,
             mm_token_type_ids=mm_token_type_ids,
         )
-        enc_kv = [
-            (past_key_values.layers[i].keys, past_key_values.layers[i].values)
-            for i in range(self.text_config.num_hidden_layers)
-        ]
 
         hidden_states = enc_outputs.last_hidden_state
         # INT32 logit gather index
@@ -949,12 +965,6 @@ class QEffDiffusionGemmaLangWrapper(nn.Module):
             enc_logits = enc_logits * self.text_config.final_logit_softcapping
         enc_logits = enc_logits.float()
         enc_canvas_logits = enc_logits.expand(-1, canvas_len, -1)
-
-        # Gate KV so decoder reads: encoder-updated KV on Prefill, original KV on Decode.
-        is_f4 = is_encode.view(1, 1, 1, 1)
-        for _i, (_ok, _ov) in enumerate(orig_kv):
-            past_key_values.layers[_i].keys = torch.where(is_f4, enc_kv[_i][0], _ok)
-            past_key_values.layers[_i].values = torch.where(is_f4, enc_kv[_i][1], _ov)
 
         # ---- Decoder path ----
         dec_outputs = self.model.model.decoder(
@@ -1342,8 +1352,8 @@ class QEffDiffusionGemmaForBlockDiffusion(DiffusionGemmaForBlockDiffusion):
     def get_qeff_vision_encoder(self) -> QEffDiffusionGemmaVisionEncoderWrapper:
         return QEffDiffusionGemmaVisionEncoderWrapper(self)
 
-    def get_qeff_language_decoder(self) -> QEffDiffusionGemmaLangWrapper:
-        return QEffDiffusionGemmaLangWrapper(self)
+    def get_qeff_language_decoder(self) -> QEffDiffusionGemmaUnifiedWrapper:
+        return QEffDiffusionGemmaUnifiedWrapper(self)
 
     def get_qeff_encoder_prefill(self) -> QEffDiffusionGemmaEncoderPrefillWrapper:
         """Disaggregated dual-QPC: standalone encoder-prefill QPC."""
