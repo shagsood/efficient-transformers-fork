@@ -359,10 +359,26 @@ class QEffHYV3MoE(HYV3MoE):
     """
 
     def __qeff_init__(self):
-        gate_proj, up_proj = self.experts.gate_up_proj.chunk(2, dim=1)
-        self.all_gate_proj = torch.nn.Parameter(gate_proj.transpose(1, 2).contiguous())
-        self.all_up_proj = torch.nn.Parameter(up_proj.transpose(1, 2).contiguous())
-        self.all_down_proj = torch.nn.Parameter(self.experts.down_proj.transpose(1, 2).contiguous())
+        # RAM-safe aliasing: hold VIEWS over the fused HF parameters instead
+        # of allocating full-size copies. `.contiguous()` here would materialize
+        # a second copy of every expert weight — for a 192-expert MoE that's
+        # roughly the model's entire weight footprint again, and killed the
+        # tencent/Hy3 grid compile (LSF OOM at 2.0 TB vs 1.9 TB requested).
+        # Mirrors upstream PR #1121 which applied the same pattern to
+        # qwen3_moe / qwen3_5_moe / qwen3_vl_moe. Values are semantically
+        # unchanged — every downstream site (index-select in `moe()`, `.view()`
+        # reshape in `_forward_expert_blocked()`) already handles the
+        # non-contiguous stride of a transposed slice.
+        gate_up_proj = self.experts.gate_up_proj.detach()
+        down_proj = self.experts.down_proj.detach()
+        expert_dim = gate_up_proj.shape[1] // 2
+        self.all_gate_proj = torch.nn.Parameter(
+            gate_up_proj[:, :expert_dim, :].transpose(1, 2), requires_grad=False
+        )
+        self.all_up_proj = torch.nn.Parameter(
+            gate_up_proj[:, expert_dim:, :].transpose(1, 2), requires_grad=False
+        )
+        self.all_down_proj = torch.nn.Parameter(down_proj.transpose(1, 2), requires_grad=False)
         self.act_fn = self.experts.act_fn
 
     def moe(
