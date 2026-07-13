@@ -100,8 +100,14 @@ class QEffDynamicLayer(CacheLayerMixin):
             self.device = reference_states.device
             self.is_initialized = True
 
-    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
-        return self.get_seq_length() + cache_position.shape[0], 0
+    def get_mask_sizes(self, cache_position, layer_idx: int = 0) -> tuple[int, int]:
+        # Accept both the old (cache_position: torch.Tensor) and new
+        # (query_length: int, layer_idx: int) HF signatures. transformers 5.12.1
+        # calls with query_length as int; earlier versions passed cache_position
+        # as tensor. The DGemma UnifiedWrapper's Gate 1 CPU-eager test tripped
+        # AttributeError('int' object has no attribute 'shape') here on 5.12.1.
+        query_length = cache_position if isinstance(cache_position, int) else cache_position.shape[0]
+        return self.get_seq_length() + query_length, 0
 
     def get_seq_length(self) -> int:
         return self.keys.shape[-2] if self.keys is not None else 0
@@ -1023,8 +1029,11 @@ class QEffSlidingWindowCache:
         """Returns seen token length (logical sequence length)."""
         return self.seen_tokens
 
-    def get_mask_sizes(self, cache_position: torch.Tensor, layer_idx: int) -> Tuple[int, int]:
-        query_length = cache_position.shape[0]
+    def get_mask_sizes(self, cache_position, layer_idx: int) -> Tuple[int, int]:
+        # Accept both old (cache_position: torch.Tensor) and new
+        # (query_length: int) HF signatures — transformers 5.12.1 changed
+        # this call from a tensor to a plain int.
+        query_length = cache_position if isinstance(cache_position, int) else cache_position.shape[0]
         layer_types = getattr(self.config, "layer_types", None)
         is_sliding_layer = bool(
             layer_types is not None and layer_idx < len(layer_types) and layer_types[layer_idx] == "sliding_attention"
