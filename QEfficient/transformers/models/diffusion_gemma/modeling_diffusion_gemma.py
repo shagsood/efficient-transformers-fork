@@ -464,7 +464,13 @@ class QEffDiffusionGemmaDecoderTextAttention(DiffusionGemmaDecoderTextAttention)
 
         attn_weights = torch.matmul(query_states, key_states_for_attn.transpose(2, 3)) * self.scaling
         if attention_mask is not None:
-            # attention_mask is 0 (unmasked) for fully-bidirectional decoder
+            # Mask sized for the widest layer's KV (ctx_len + canvas). For sliding layers
+            # attn_weights has sliding_window + canvas — slice the mask TAIL. Always trace
+            # the slice unconditionally (a Python `if shape != shape` check evaluates
+            # statically at trace and drops the slice from the ONNX graph, the bug we hit
+            # at v6). Use negative indexing so torch.onnx.export produces a proper Slice
+            # op whose end tracks attn_weights.shape[-1] dynamically at compile time.
+            attention_mask = attention_mask[..., -attn_weights.shape[-1] :]
             attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -758,13 +764,30 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
                 dtype=torch.long,
             ).unsqueeze(0)
 
-        # Build bidirectional decoder mask: canvas attends to real encoder KV +
-        # all canvas, NOT to padded/empty encoder cache slots (HF parity).
-        encoder_kv_length = 0
-        if past_key_values is not None and len(past_key_values.layers) > 0:
-            layer = past_key_values.layers[0]
-            if layer.keys is not None:
-                encoder_kv_length = layer.keys.shape[-2]
+        # Build bidirectional decoder mask. When encoder_attention_mask is supplied
+        # (dual-QPC production path), the caller's mask width == ctx_len; the per-layer
+        # tail-slice inside QEffDiffusionGemmaDecoderTextAttention.forward truncates it
+        # to sliding_window for sliding_attention layers.
+        # When encoder_attention_mask is None, fall back to the legacy all-attend mask
+        # sized from a FULL_ATTENTION layer's KV (ctx_len) — if we picked a sliding
+        # layer instead, the mask would be too NARROW to slice down to sliding-window
+        # width via [..., -attn.shape[-1]:] and the compiler produces a negative-start
+        # Slice op at the full layer.
+        encoder_kv_key = None
+        if past_key_values is not None:
+            full_idx = None
+            for idx, lt in enumerate(self.text_config.layer_types):
+                if lt == "full_attention" and idx < len(past_key_values.layers):
+                    full_idx = idx
+                    break
+            if full_idx is not None:
+                encoder_kv_key = past_key_values.layers[full_idx].keys
+            if encoder_kv_key is None:
+                for layer_i in past_key_values.layers:
+                    if layer_i.keys is not None:
+                        encoder_kv_key = layer_i.keys
+                        break
+        encoder_kv_length = encoder_kv_key.shape[-2] if encoder_kv_key is not None else 0
         decoder_mask = _build_diffusion_decoder_additive_mask(
             canvas_length=canvas_length,
             encoder_kv_length=encoder_kv_length,
@@ -773,7 +796,6 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
             device=inputs_embeds.device,
             encoder_attention_mask=encoder_attention_mask,
         )
-        # Build per-layer-type mask dict (decoder always uses full_attention=None, sliding_attention=sliced)
         mask_mapping = {"full_attention": decoder_mask, "sliding_attention": decoder_mask}
 
         hidden_states = inputs_embeds
