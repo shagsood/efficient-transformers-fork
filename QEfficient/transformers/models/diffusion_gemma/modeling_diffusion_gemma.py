@@ -464,13 +464,12 @@ class QEffDiffusionGemmaDecoderTextAttention(DiffusionGemmaDecoderTextAttention)
 
         attn_weights = torch.matmul(query_states, key_states_for_attn.transpose(2, 3)) * self.scaling
         if attention_mask is not None:
-            # Mask sized for the widest layer's KV (ctx_len + canvas). For sliding layers
-            # attn_weights has sliding_window + canvas — slice the mask TAIL. Always trace
-            # the slice unconditionally (a Python `if shape != shape` check evaluates
-            # statically at trace and drops the slice from the ONNX graph, the bug we hit
-            # at v6). Use negative indexing so torch.onnx.export produces a proper Slice
-            # op whose end tracks attn_weights.shape[-1] dynamically at compile time.
-            attention_mask = attention_mask[..., -attn_weights.shape[-1] :]
+            # attention_mask is expected to be sized to match attn_weights on dim -1
+            # already — the decoder model (QEffDiffusionGemmaDecoderModel.forward)
+            # builds per-layer-type masks so each layer receives one at the right
+            # KV width. Attention layer no longer slices — slicing here traced as
+            # `aicdynamicrawslice` and blew VA (49 buffers × 250 MB on the
+            # unified single-QPC graph on tiny config; scales much worse on real).
             attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -768,35 +767,48 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
         # (dual-QPC production path), the caller's mask width == ctx_len; the per-layer
         # tail-slice inside QEffDiffusionGemmaDecoderTextAttention.forward truncates it
         # to sliding_window for sliding_attention layers.
-        # When encoder_attention_mask is None, fall back to the legacy all-attend mask
-        # sized from a FULL_ATTENTION layer's KV (ctx_len) — if we picked a sliding
-        # layer instead, the mask would be too NARROW to slice down to sliding-window
-        # width via [..., -attn.shape[-1]:] and the compiler produces a negative-start
-        # Slice op at the full layer.
-        encoder_kv_key = None
-        if past_key_values is not None:
-            full_idx = None
-            for idx, lt in enumerate(self.text_config.layer_types):
-                if lt == "full_attention" and idx < len(past_key_values.layers):
-                    full_idx = idx
-                    break
-            if full_idx is not None:
-                encoder_kv_key = past_key_values.layers[full_idx].keys
-            if encoder_kv_key is None:
-                for layer_i in past_key_values.layers:
-                    if layer_i.keys is not None:
-                        encoder_kv_key = layer_i.keys
-                        break
-        encoder_kv_length = encoder_kv_key.shape[-2] if encoder_kv_key is not None else 0
-        decoder_mask = _build_diffusion_decoder_additive_mask(
-            canvas_length=canvas_length,
-            encoder_kv_length=encoder_kv_length,
-            dtype=inputs_embeds.dtype,
-            batch_size=inputs_embeds.shape[0],
-            device=inputs_embeds.device,
-            encoder_attention_mask=encoder_attention_mask,
-        )
-        mask_mapping = {"full_attention": decoder_mask, "sliding_attention": decoder_mask}
+        # Build TWO decoder masks (one per layer_type) each sized to that type's own
+        # KV width. Per-layer-type KV widths differ (sliding_attention: sliding_window;
+        # full_attention: ctx_len). We derive each type's mask width from a
+        # REPRESENTATIVE layer of that type's key tensor via `torch.ones_like` on a
+        # projection — this makes the mask's KV axis a live shape-op in ONNX (Shape/
+        # Gather on the key tensor), which qaic-compile resolves to sliding_window vs
+        # ctx_len correctly per specialization.
+        #
+        # Note: we IGNORE any caller-provided encoder_attention_mask here because
+        # slicing it per-type via `encoder_attention_mask[..., :type_kv_len]` at
+        # runtime traces as `aicdynamicrawslice`, which the qaic compiler can't map
+        # to on-chip memory at unified-graph scale (~12 GB × 49 buffers on tiny).
+        # The runner CAN still shape its input mask correctly; if `mm_token_type_ids`
+        # / prompt-tail masking is needed, wire it via `encoder_attention_mask` for
+        # dual-QPC-only paths where mask width == full ctx_len from the start.
+        mask_mapping = {}
+        for layer_type in self.unique_layer_types:
+            rep_layer_key = None
+            if past_key_values is not None:
+                for idx, lt in enumerate(self.text_config.layer_types):
+                    if lt == layer_type and idx < len(past_key_values.layers):
+                        candidate = past_key_values.layers[idx].keys
+                        if candidate is not None:
+                            rep_layer_key = candidate
+                            break
+
+            if rep_layer_key is not None:
+                # ones_like on a [B, 1, KV, 1] slice reshaped to [B, KV] — KV axis
+                # tracks rep_layer_key's dynamic dim -2 (sliding_window or ctx_len).
+                kv_proj = rep_layer_key[:, 0:1, :, 0:1].reshape(rep_layer_key.shape[0], -1)
+                per_type_mask = torch.ones_like(kv_proj, dtype=torch.int64)
+            else:
+                per_type_mask = None
+
+            mask_mapping[layer_type] = _build_diffusion_decoder_additive_mask(
+                canvas_length=canvas_length,
+                encoder_kv_length=rep_layer_key.shape[-2] if rep_layer_key is not None else 0,
+                dtype=inputs_embeds.dtype,
+                batch_size=inputs_embeds.shape[0],
+                device=inputs_embeds.device,
+                encoder_attention_mask=per_type_mask,
+            )
 
         hidden_states = inputs_embeds
         position_embeddings = {}
@@ -890,20 +902,37 @@ class QEffDiffusionGemmaVisionEncoderWrapper(nn.Module):
 
 
 class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
-    """
-    Wrapper that drives the encoder text model (prefill) and the diffusion
-    decoder (canvas denoising step) for QPC export.
+    """Single-QPC dispatch wrapper — exact port of Wan2.2's
+    QEffWanUnifiedWrapper pattern (transformer_wan.py:307,378).
 
-    In single-QPC mode this wrapper is used for both encoder prefill and
-    decoder canvas-denoise within the same compiled graph.
+    Holds two INDEPENDENT child wrappers as sibling submodules:
 
-    forward() signature:
-      Encoder prefill:
-        input_ids + position_ids + mm_token_type_ids + vision_embeds + image_idx
-        + past_key_values → logits [batch, 1, vocab], past_key_values
-      Decoder canvas-denoise:
-        decoder_input_ids + decoder_position_ids + past_key_values
-        → canvas_logits [batch, canvas_length, vocab], past_key_values (unchanged)
+      self.encoder_prefill  → QEffDiffusionGemmaEncoderPrefillWrapper
+      self.canvas_decode    → QEffDiffusionGemmaCanvasDecodeWrapper
+
+    forward() runs BOTH branches unconditionally on every call and selects the
+    output with a single torch.where on a shape-derived predicate — matching
+    the Wan approach where both `transformer_high` and `transformer_low` run
+    every step and the merge is a bare `torch.where(is_high_noise, ...)`.
+
+    What this pattern gives us:
+      • qaic-compile's per-specialization folding drops the unused branch
+        cleanly per spec (Prefill drops decoder; Decode drops encoder).
+      • No shared state between branches — each child owns its own KV
+        handling, mask construction, sliding-window fixes, and lm_head.
+      • No retained-state cross-spec sharing bet: the runner still host-copies
+        encoder past_*_RetainedState → decoder past_*.{i} between diffusion
+        steps, exactly like dual-QPC's run_disaggregated does today. The
+        single-QPC "win" is deployment shape (one QPC, one session, one
+        bindings dump), not automatic KV persistence.
+
+    An earlier version of this wrapper tried to fuse encoder-writes-KV and
+    decoder-reads-KV into one graph via clone/torch.where gates and a
+    _NoGatherCacheLayer substitution at this level. That approach diverged
+    from Wan2.2 (which is stateless per step) and blew qaic-compile's VA on
+    real dims — see docs/superpowers/specs/2026-07-10-diffusion-gemma-single
+    -qpc-design.md for the history. All that complexity has been pushed back
+    down into the two child wrappers where it always lived.
     """
 
     # This wrapper drives a non-autoregressive diffusion decoder (encoder prefill +
@@ -917,16 +946,17 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
     def __init__(self, model: "QEffDiffusionGemmaForBlockDiffusion"):
         super().__init__()
         self.model = model
-        self.lm_head = model.lm_head
         self.config = model.config
         self.text_config = model.config.text_config
+        # Sibling child wrappers — exact Wan pattern: self.transformer_high +
+        # self.transformer_low, but named for our arch.
+        self.encoder_prefill = QEffDiffusionGemmaEncoderPrefillWrapper(model)
+        self.canvas_decode = QEffDiffusionGemmaCanvasDecodeWrapper(model)
 
     def get_submodules_for_export(self):
-        """Return repeated block classes for ONNX subfunction extraction.
-
-        Wan2.2 pattern (transformer_wan.py:328): the compiler shares subfunctions
-        across the two repeated block classes, cutting compile time on the
-        30-layer encoder + 30-layer decoder graph.
+        """Union of both child wrappers' repeated block classes for ONNX
+        subfunction extraction (transformer_wan.py get_submodules_for_export
+        contract).
         """
         return {QEffDiffusionGemmaEncoderTextLayer, QEffDiffusionGemmaDecoderTextLayer}
 
@@ -941,126 +971,81 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         decoder_input_ids: Optional[torch.LongTensor] = None,
         decoder_position_ids: Optional[torch.LongTensor] = None,
         self_conditioning_logits: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
+        """Run both children; select via torch.where on a shape-derived predicate.
+
+        The predicate is `decoder_input_ids.shape[1] == 1` — canvas_len==1 means
+        Prefill spec, canvas_len>1 means Decode spec. This mirrors Wan2.2's
+        `tsp.shape[0] == torch.tensor(1)` idiom exactly: shape-derived so
+        qaic-compile can constant-fold it per specialization.
+        """
         del batch_index, kwargs
 
-        # convert legacy cache
-        if past_key_values is not None and not isinstance(past_key_values, QEffGemma4DynamicCache):
-            past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.text_config, past_key_values)
-
-        encoder_model = self.model.model.encoder
-        lang_model = encoder_model.language_model
-
-        # Dispatch sentinel: is_encode=1 → encoder prefill; is_encode=0 → decoder step.
-        canvas_len = decoder_input_ids.shape[1]
+        canvas_len = decoder_input_ids.shape[1] if decoder_input_ids is not None else 1
         is_encode = canvas_len == torch.tensor(1, dtype=torch.int64, device=decoder_input_ids.device)
 
-        orig_kv = [(layer.keys.clone(), layer.values.clone()) for layer in past_key_values.layers]
-
-        # ---- Encoder path ----
-        # Wan2.2 pattern: both branches execute; torch.where(is_encode) at output-level
-        # selects. But the encoder's KV *write* cannot be gated the same way the output
-        # is gated: CtxScatterFunc (QEfficient/customop/ctx_scatter_gather.py:42-48) does
-        # plain fancy indexing, where position_ids=-1 means "last slot", not "skip". An
-        # is_encode-masked position_ids=-1 trick was tried and falsified — it silently
-        # corrupts past_key.{ctx_len-1} on every decode step instead of no-op'ing. So we
-        # gate by selecting between two fully-computed KV tensors after the encoder call
-        # runs unconditionally — clone the pre-call KV, run the encoder, then torch.where
-        # per layer between the post-call KV and the clone. Same "select between two
-        # fully-computed tensors" pattern already used and trusted at the output-level
-        # gate below, not an exploit of scatter-target-address semantics. See
-        # docs/superpowers/specs/2026-07-10-diffusion-gemma-single-qpc-design.md edit #2.
-        #
-        # Force ALL cache layers non-sliding + substitute _NoGatherCacheLayer before the
-        # encoder call. The sliding-window rolling gather produces INT32_MAX gather
-        # indices under bulk single-pass prefill with padding (the D5 root cause —
-        # GatherND invalid index 2147483647). Non-sliding + no-gather falls through to
-        # plain CtxScatter+CtxGather, which handles padding correctly. Safe to share with
-        # the decoder branch: QEffDiffusionGemmaDecoderTextAttention.forward reads
-        # past_key_values.layers[self.layer_idx].keys/.values as plain attributes and
-        # never calls .update() or reads .is_sliding, so the substitution (which only
-        # overrides .update()) is transparent to it.
-        if past_key_values is not None:
-            for layer in past_key_values.layers:
-                layer.is_sliding = False
-
-        if past_key_values is not None:
-            for i, layer in enumerate(past_key_values.layers):
-                new_layer = _NoGatherCacheLayer(is_sliding=False)
-                new_layer.keys = layer.keys
-                new_layer.values = layer.values
-                if layer.keys is not None:
-                    new_layer._mark_initialized(layer.keys)
-                past_key_values.layers[i] = new_layer
-
-        inputs_embeds, next_image_idx = self.model._inject_vision_embeds(input_ids, vision_embeds, image_idx)
-        enc_outputs = lang_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=None,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=True,
-            mm_token_type_ids=mm_token_type_ids,
-        )
-        enc_kv = [
-            (past_key_values.layers[i].keys, past_key_values.layers[i].values)
-            for i in range(self.text_config.num_hidden_layers)
-        ]
-
-        hidden_states = enc_outputs.last_hidden_state
-        # INT32 logit gather index
-        logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
-        enc_hidden = hidden_states[torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
-        enc_logits = self.lm_head(enc_hidden)
-        if self.text_config.final_logit_softcapping is not None:
-            enc_logits = enc_logits / self.text_config.final_logit_softcapping
-            enc_logits = torch.tanh(enc_logits)
-            enc_logits = enc_logits * self.text_config.final_logit_softcapping
-        enc_logits = enc_logits.float()
-        enc_canvas_logits = enc_logits.expand(-1, canvas_len, -1)
-
-        # Gate KV so decoder reads: encoder-updated KV on Prefill, original KV on Decode.
-        is_f4 = is_encode.view(1, 1, 1, 1)
-        for _i, (_ok, _ov) in enumerate(orig_kv):
-            past_key_values.layers[_i].keys = torch.where(is_f4, enc_kv[_i][0], _ok)
-            past_key_values.layers[_i].values = torch.where(is_f4, enc_kv[_i][1], _ov)
-
-        # ---- Decoder path ----
-        dec_outputs = self.model.model.decoder(
+        # ---- Branch B: canvas decode (runs FIRST so it reads the input past_kv
+        # before the encoder branch mutates it via .update() calls) ----
+        # Reads past_key_values as pure input; returns (canvas_logits,) tuple.
+        dec_out = self.canvas_decode(
             decoder_input_ids=decoder_input_ids,
-            past_key_values=past_key_values,
-            self_conditioning_logits=self_conditioning_logits,
             decoder_position_ids=decoder_position_ids,
+            self_conditioning_logits=self_conditioning_logits,
+            past_key_values=past_key_values,
+            encoder_attention_mask=encoder_attention_mask,
         )
-        dec_logits = self.lm_head(dec_outputs.last_hidden_state)
-        if self.text_config.final_logit_softcapping is not None:
-            dec_logits = dec_logits / self.text_config.final_logit_softcapping
-            dec_logits = torch.tanh(dec_logits)
-            dec_logits = dec_logits * self.text_config.final_logit_softcapping
-        dec_logits = dec_logits.float()
+        dec_logits = dec_out[0] if isinstance(dec_out, tuple) else dec_out
 
-        # ---- Gate outputs ----
+        # ---- Branch A: encoder prefill (always executes; writes KV) ----
+        # Owns its own KV writes, mask handling, _NoGatherCacheLayer substitution.
+        # Returns (enc_logits [B,1,vocab], next_image_idx, pkv_list).
+        enc_logits, next_image_idx, enc_pkv = self.encoder_prefill(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            vision_embeds=vision_embeds,
+            image_idx=image_idx,
+            mm_token_type_ids=mm_token_type_ids,
+            past_key_values=past_key_values,
+        )
+
+        # ---- Single output-level gate (Wan2.2's `torch.where(is_high_noise, ...)`) ----
+        enc_canvas_logits = enc_logits.expand(-1, canvas_len, -1)
         is_f1 = is_encode.view(1, 1, 1)
         canvas_logits = torch.where(is_f1, enc_canvas_logits, dec_logits)
 
         is_f_idx = is_encode.view(1, 1)
         gated_image_idx = torch.where(is_f_idx, next_image_idx, image_idx)
 
-        gated_pkv = [
-            (past_key_values.layers[_i].keys, past_key_values.layers[_i].values)
-            for _i in range(self.text_config.num_hidden_layers)
-        ]
+        # KV outputs: pass the encoder-branch KV through as retained-state.
+        # (On the Decode spec the compiler folds the encoder branch out entirely
+        # and this reduces to "past_key_values.layers[i].keys" passthrough.)
+        return canvas_logits, gated_image_idx, enc_pkv
 
-        return canvas_logits, vision_embeds, gated_image_idx, gated_pkv
+    # -- Export contract methods (unchanged — a two-spec QPC with union of
+    # both children's IO. The runner is responsible for host-carrying the
+    # encoder's past_*_RetainedState into subsequent decode calls' past_*.{i}
+    # inputs, same as dual-QPC.) --
 
-    # -- export metadata (two specializations sharing one graph) --
-    # Prefill:  seq_len=prefill_seq_len, canvas_len=1  (is_encode=True  via shape)
-    # Decode:   seq_len=1,               canvas_len=canvas_length (is_encode=False)
-    # Retained-state KV: past_*.{i} inputs paired with past_*.{i}_RetainedState outputs
-    # so qaic-compile keeps a single on-device allocation across both specs — the
-    # design's central untested bet, verified at Gate 3 (bindings dump).
+    def get_dummy_inputs(self, **kwargs):
+        # Union of encoder_prefill.get_dummy_inputs() and canvas_decode.get_dummy_inputs()
+        enc_di = self.encoder_prefill.get_dummy_inputs()
+        dec_di = self.canvas_decode.get_dummy_inputs()
+        merged = {**enc_di}
+        # canvas_decode's dummy inputs use canvas_len=canvas_length; for a unified
+        # trace we want the wrapper's forward to trace canvas_len=1 (Prefill-shaped)
+        # since both branches evaluate regardless of is_encode value. Override the
+        # decoder-side keys with canvas_len=1 versions.
+        bs = enc_di["input_ids"].shape[0]
+        vocab = self.text_config.vocab_size
+        merged["decoder_input_ids"] = torch.zeros((bs, 1), dtype=torch.int64)
+        merged["decoder_position_ids"] = torch.zeros((bs, 1), dtype=torch.int64)
+        merged["self_conditioning_logits"] = torch.zeros((bs, 1, vocab), dtype=torch.float32)
+        # encoder_attention_mask is optional (canvas_decode builds a fallback when None).
+        # Leave it out of the export dummy to keep the decoder's fallback path traced.
+        return merged
 
     def get_specializations(
         self,
@@ -1070,6 +1055,9 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         canvas_length: Optional[int] = None,
         **compiler_options,
     ):
+        # Union: Prefill spec sized from encoder_prefill; Decode spec sized from canvas_decode.
+        # Both carry vision_batch_size/vision_tokens for the encoder branch's inputs which
+        # are still fed on the Decode spec (both branches evaluate — compiler folds).
         prefill_seq_len = prefill_seq_len or 32
         ctx_len = ctx_len or constants.INTERN_CTX_LEN
         canvas_length = canvas_length or getattr(self.config, "canvas_length", 256)
@@ -1100,6 +1088,7 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         return specs, compiler_options
 
     def get_onnx_dynamic_axes(self, **kwargs):
+        # Union of both children's dynamic axes.
         text_cfg = self.config.text_config
         axes = {
             "input_ids": {0: "batch_size", 1: "seq_len"},
@@ -1117,49 +1106,16 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         return axes
 
     def get_output_names(self, **kwargs):
+        # Encoder branch writes KV as retained-state outputs (its own
+        # EncoderPrefillWrapper naming is `past_*_out`; on the unified graph we
+        # bind them as retained-state so qaic-compile keeps one on-device
+        # allocation across the two specializations of the same QPC).
         text_cfg = self.config.text_config
-        # Two-spec QPC: encoder branch WRITES the retained-state KV; decoder branch
-        # READS it from the same on-device buffer inside the same graph. Both specs
-        # trace with the KV as a real in-graph consumer, so past_*_RetainedState is
-        # NOT dead-elimed (contrast with the single-spec EncoderPrefillWrapper, which
-        # must emit regular past_*_out for that reason — see the note at its
-        # get_output_names). Names match the wrapper's forward return tuple:
-        # (canvas_logits, vision_embeds, gated_image_idx, gated_pkv).
-        names = ["canvas_logits", "vision_embeds_RetainedState", "image_idx_output"]
+        names = ["canvas_logits", "image_idx_output"]
         for i in range(text_cfg.num_hidden_layers):
             for kv in ("key", "value"):
                 names.append(f"past_{kv}.{i}_RetainedState")
         return names
-
-    def get_dummy_inputs(self, **kwargs):
-        bs = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
-        text_cfg = self.config.text_config
-        mm_tokens_per_image = self.model._get_mm_tokens_per_image()
-        seq_len = max(constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN, mm_tokens_per_image + 32)
-
-        input_ids = torch.zeros((bs, seq_len), dtype=torch.int64)
-        mm_token_type_ids = torch.zeros((bs, seq_len), dtype=torch.int64)
-        text_prefix_len = min(5, seq_len)
-        image_start = text_prefix_len
-        image_end = min(image_start + mm_tokens_per_image, seq_len)
-        input_ids[:, image_start:image_end] = self.config.image_token_id
-        mm_token_type_ids[:, image_start:image_end] = 1
-
-        # Trace with canvas_len=1 (Prefill-shaped): torch.where inside forward()
-        # evaluates both branches regardless of is_encode's value, so the resulting
-        # ONNX graph is spec-invariant. Using canvas_len=1 avoids allocating a
-        # [bs, 256, vocab] self_conditioning_logits dummy at trace time.
-        return {
-            "input_ids": input_ids,
-            "position_ids": torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1),
-            "vision_embeds": torch.zeros((bs, mm_tokens_per_image, text_cfg.hidden_size), dtype=torch.float32),
-            "image_idx": torch.zeros((1, 1), dtype=torch.int64),
-            "mm_token_type_ids": mm_token_type_ids,
-            "decoder_input_ids": torch.zeros((bs, 1), dtype=torch.int64),
-            "decoder_position_ids": torch.zeros((bs, 1), dtype=torch.int64),
-            "self_conditioning_logits": torch.zeros((bs, 1, text_cfg.vocab_size), dtype=torch.float32),
-            "past_key_values": self.model.get_dummy_pkv_cache(config=text_cfg, batch_size=bs, seq_len=seq_len),
-        }
 
 
 # ---------------------------------------------------------------------------
