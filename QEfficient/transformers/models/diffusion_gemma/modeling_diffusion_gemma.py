@@ -884,6 +884,14 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         → canvas_logits [batch, canvas_length, vocab], past_key_values (unchanged)
     """
 
+    # This wrapper drives a non-autoregressive diffusion decoder (encoder prefill +
+    # multi-step canvas denoise), not a standard next-token decode loop. It must
+    # never be driven through the generic autoregressive
+    # QEFFAutoModelForImageTextToText(kv_offload=True).generate() contract — see
+    # the guard in QEffCausalLMForTextImageToTextModel.__init__ (modeling_auto.py).
+    # Use runners/diffusion_gemma_run.py instead.
+    supports_autoregressive_generate = False
+
     def __init__(self, model: "QEffDiffusionGemmaForBlockDiffusion"):
         super().__init__()
         self.model = model

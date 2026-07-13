@@ -1277,10 +1277,25 @@ class QEffCausalLMForTextImageToTextModel(QEFFBaseModel):
             - **num_kv_blocks** (int): Number of K/V blocks for BlockedKV attention implementation.
         **kwargs :
             Additional keyword arguments passed to the base class constructor.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``model.get_qeff_language_decoder()`` returns a wrapper that opts out
+            of the generic autoregressive ``.generate()`` contract (e.g. DiffusionGemma's
+            non-autoregressive unified wrapper) via
+            ``supports_autoregressive_generate = False``.
         """
         _configure_proxy_for_model(self, kwargs.pop("enable_proxy", False))
         super().__init__(model, **kwargs)
         self.model = model.get_qeff_language_decoder()
+        if getattr(self.model, "supports_autoregressive_generate", True) is False:
+            raise NotImplementedError(
+                f"{type(self.model).__name__} does not support the generic autoregressive "
+                "QEFFAutoModelForImageTextToText(kv_offload=True).generate() path. This model "
+                "is non-autoregressive and must be driven via its dedicated runner script "
+                "(e.g. runners/diffusion_gemma_run.py), not through generate()."
+            )
         self.model.qaic_config = qaic_config
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
         self.continuous_batching = False
