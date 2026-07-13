@@ -359,27 +359,36 @@ class QEffHYV3MoE(HYV3MoE):
     """
 
     def __qeff_init__(self):
-        # RAM-safe aliasing: hold VIEWS over the fused HF parameters instead
-        # of allocating full-size copies. `.contiguous()` here would materialize
-        # a second copy of every expert weight — for a 192-expert MoE that's
-        # roughly the model's entire weight footprint again, and killed the
-        # tencent/Hy3 grid compile (LSF OOM at 2.0 TB vs 1.9 TB requested).
-        # Mirrors upstream PR #1121 which applied the same pattern to
-        # qwen3_moe / qwen3_5_moe / qwen3_vl_moe. Values are semantically
-        # unchanged — every downstream site (index-select in `moe()`, `.view()`
-        # reshape in `_forward_expert_blocked()`) already handles the
-        # non-contiguous stride of a transposed slice.
-        gate_up_proj = self.experts.gate_up_proj.detach()
-        down_proj = self.experts.down_proj.detach()
-        expert_dim = gate_up_proj.shape[1] // 2
-        self.all_gate_proj = torch.nn.Parameter(
-            gate_up_proj[:, :expert_dim, :].transpose(1, 2), requires_grad=False
-        )
-        self.all_up_proj = torch.nn.Parameter(
-            gate_up_proj[:, expert_dim:, :].transpose(1, 2), requires_grad=False
-        )
-        self.all_down_proj = torch.nn.Parameter(down_proj.transpose(1, 2), requires_grad=False)
+        # Cache plain-attribute references only — do NOT register new
+        # `nn.Parameter`s over the fused HF weights. Registering a Parameter
+        # promotes the alias into the model's state_dict, and at
+        # `torch.jit._get_trace_graph` time each Parameter is materialized as
+        # its own tensor in the traced graph. For a 192-expert / 79-layer MoE
+        # (tencent/Hy3, 293B) that's 79 × 3 × ~4.8 GB = ~1.15 TB of transient
+        # trace-time materialization on top of the ~275 GB fused-weight
+        # resident — exactly what OOMed grid jobs 4582747 / 4861874 / 4866404 /
+        # 4960374 at ~2.0 TB against the san-qp200 2.05 TB host cap. Instead
+        # follow the qwen3_moe reference pattern: keep the fused source
+        # unchanged, split/transpose lazily inside `_split_expert_weights`.
+        self.gate_up_proj_w = self.experts.gate_up_proj  # [E, 2I, H] fused HF layout
+        self.down_proj_w = self.experts.down_proj  # [E, H, I] fused HF layout
+        self.expert_dim = self.gate_up_proj_w.shape[1] // 2
         self.act_fn = self.experts.act_fn
+
+    def _split_expert_weights(self):
+        """Return `(gate_proj_w, up_proj_w, down_proj_w)` — strided views over
+        the fused HF weights in `[E, H, I]` layout suitable for BMM(x, W).
+
+        All three returned tensors share storage with `self.experts.gate_up_proj`
+        / `self.experts.down_proj` — zero materialized copies. Called once per
+        forward instead of held as persistent Parameters (see `__qeff_init__`
+        for why).
+        """
+        d = self.expert_dim
+        gate_proj_w = self.gate_up_proj_w[:, :d, :].transpose(1, 2)  # [E, H, I]
+        up_proj_w = self.gate_up_proj_w[:, d:, :].transpose(1, 2)  # [E, H, I]
+        down_proj_w = self.down_proj_w.transpose(1, 2)  # [E, I, H]
+        return gate_proj_w, up_proj_w, down_proj_w
 
     def moe(
         self,
@@ -390,9 +399,10 @@ class QEffHYV3MoE(HYV3MoE):
         num_tokens = hidden_states.shape[0]
         hidden_dim = self.gate.hidden_dim
 
-        gate_proj = self.all_gate_proj[top_k_index.flatten()]
-        up_proj = self.all_up_proj[top_k_index.flatten()]
-        down_proj = self.all_down_proj[top_k_index.flatten()]
+        gate_proj_w, up_proj_w, down_proj_w = self._split_expert_weights()
+        gate_proj = gate_proj_w[top_k_index.flatten()]
+        up_proj = up_proj_w[top_k_index.flatten()]
+        down_proj = down_proj_w[top_k_index.flatten()]
 
         expert_in = hidden_states.unsqueeze(1).expand(-1, self.top_k, -1).contiguous().view(-1, 1, hidden_dim)
         gate_out = torch.bmm(expert_in, gate_proj)
@@ -461,20 +471,19 @@ class QEffPrefillChunkedHYV3MoE(QEffHYV3MoE):
         routing_weights.scatter_(1, top_k_index, top_k_weights)
 
         local_experts = num_experts // num_nsp
-        # RAM-safe reshape: build strided VIEWS of the routing weights and the
-        # fused expert weights, no `.contiguous()`. During ONNX export a
-        # `.contiguous()` after a transpose materializes a full copy of the
-        # operand — done once per MoE layer × 3 fused-weight buffers, that
-        # peak-RAM cost tripped LSF TERM_MEMLIMIT at 1.998 TB on the first
-        # RAM-fixed grid compile (job 4861874, 2026-07-12). Every downstream
-        # op here (matmul in `_cumsum_scatter_gather_update_expert_blocked`,
-        # scalar `> 0` comparison, per-slot dim-1 indexing) accepts a strided
-        # operand — verified bit-identical against the old `.contiguous()`
-        # build on tiny-random/hy-v3.
+        # Strided-view reshape, no `.contiguous()` — see `__qeff_init__` on
+        # QEffHYV3MoE for why avoiding `nn.Parameter` aliases (and any
+        # `.contiguous()` copies of the fused weights) is critical for the
+        # huge-tier grid compile. `torch.matmul` inside
+        # `_cumsum_scatter_gather_update_expert_blocked` accepts strided
+        # operands; the per-slot dim-1 indexing (`W_g[:, slot]`) on a strided
+        # 4-D view returns a strided sub-view — bit-identical to the same
+        # slot's sub-view of a contiguous build (verified on tiny-random).
+        gate_proj_w, up_proj_w, down_proj_w = self._split_expert_weights()
         rw = routing_weights.transpose(0, 1).view(local_experts, num_nsp, num_tokens).transpose(0, 1)
-        W_g = self.all_gate_proj.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1)
-        W_u = self.all_up_proj.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1)
-        W_d = self.all_down_proj.view(local_experts, num_nsp, -1, hidden_dim).transpose(0, 1)
+        W_g = gate_proj_w.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1)
+        W_u = up_proj_w.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1)
+        W_d = down_proj_w.view(local_experts, num_nsp, -1, hidden_dim).transpose(0, 1)
         expert_out = hidden_states.new_zeros((num_nsp, num_tokens, hidden_dim))
         routing_weights_unsqueezed = rw.unsqueeze(-1)
 
