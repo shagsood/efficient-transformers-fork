@@ -402,8 +402,19 @@ class QEffHYV3MoE(HYV3MoE):
 
         experts_out = expert_output.view(num_tokens, self.top_k, hidden_dim)
         experts_out = experts_out * top_k_weights.unsqueeze(-1)
-        # Replace .sum(dim=1) with einsum (M1) — breaks under use_onnx_subfunctions=True
-        final_hidden_states = torch.einsum("abc->ac", experts_out)
+        # Sum the top_k contributions along dim=1. This was originally
+        # `torch.einsum("abc->ac", experts_out)` — a workaround for a
+        # subfunction-time break with `.sum(dim=1)` on an earlier SDK — but the
+        # einsum lowers to an ONNX ReduceSum with a dynamic axes tensor, and
+        # SDK 1.22.1.12's `qaic-compile` rejects that:
+        #   [Operator-'ReduceSum_2308'] : ReduceSum: Non-constant axes tensor not supported
+        # (fired on gridsdca job 4866404, 2026-07-12, prefill compile). Slice-
+        # and-add across a known-constant top_k count lowers to a chain of
+        # constant-shape Adds — no ReduceSum, no dynamic axes, and works cleanly
+        # both with and without `use_onnx_subfunctions=True`.
+        final_hidden_states = experts_out[:, 0]
+        for k in range(1, self.top_k):
+            final_hidden_states = final_hidden_states + experts_out[:, k]
 
         return final_hidden_states.type(hidden_states.dtype)
 
