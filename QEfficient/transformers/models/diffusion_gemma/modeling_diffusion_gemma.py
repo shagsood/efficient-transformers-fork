@@ -1033,6 +1033,112 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
 
         return canvas_logits, vision_embeds, gated_image_idx, gated_pkv
 
+    # -- export metadata (two specializations sharing one graph) --
+    # Prefill:  seq_len=prefill_seq_len, canvas_len=1  (is_encode=True  via shape)
+    # Decode:   seq_len=1,               canvas_len=canvas_length (is_encode=False)
+    # Retained-state KV: past_*.{i} inputs paired with past_*.{i}_RetainedState outputs
+    # so qaic-compile keeps a single on-device allocation across both specs — the
+    # design's central untested bet, verified at Gate 3 (bindings dump).
+
+    def get_specializations(
+        self,
+        batch_size: int,
+        prefill_seq_len: int,
+        ctx_len: int,
+        canvas_length: Optional[int] = None,
+        **compiler_options,
+    ):
+        prefill_seq_len = prefill_seq_len or 32
+        ctx_len = ctx_len or constants.INTERN_CTX_LEN
+        canvas_length = canvas_length or getattr(self.config, "canvas_length", 256)
+        text_cfg = self.config.text_config
+        mm_tokens_per_image = self.model._get_mm_tokens_per_image()
+        specs = [
+            {
+                "_graph_name": "Prefill",
+                "batch_size": batch_size,
+                "seq_len": prefill_seq_len,
+                "canvas_len": 1,
+                "ctx_len": ctx_len,
+                "sliding_window": text_cfg.sliding_window,
+                "vision_batch_size": batch_size,
+                "vision_tokens": mm_tokens_per_image,
+            },
+            {
+                "_graph_name": "Decode",
+                "batch_size": batch_size,
+                "seq_len": 1,
+                "canvas_len": canvas_length,
+                "ctx_len": ctx_len,
+                "sliding_window": text_cfg.sliding_window,
+                "vision_batch_size": batch_size,
+                "vision_tokens": mm_tokens_per_image,
+            },
+        ]
+        return specs, compiler_options
+
+    def get_onnx_dynamic_axes(self, **kwargs):
+        text_cfg = self.config.text_config
+        axes = {
+            "input_ids": {0: "batch_size", 1: "seq_len"},
+            "position_ids": {0: "batch_size", 1: "seq_len"},
+            "vision_embeds": {0: "vision_batch_size", 1: "vision_tokens"},
+            "mm_token_type_ids": {0: "batch_size", 1: "seq_len"},
+            "decoder_input_ids": {0: "batch_size", 1: "canvas_len"},
+            "decoder_position_ids": {0: "batch_size", 1: "canvas_len"},
+            "self_conditioning_logits": {0: "batch_size", 1: "canvas_len"},
+        }
+        for i, layer_type in enumerate(text_cfg.layer_types):
+            ctx_axis = {0: "batch_size", 2: "sliding_window" if layer_type == "sliding_attention" else "ctx_len"}
+            for kv in ("key", "value"):
+                axes[f"past_{kv}.{i}"] = ctx_axis
+        return axes
+
+    def get_output_names(self, **kwargs):
+        text_cfg = self.config.text_config
+        # Two-spec QPC: encoder branch WRITES the retained-state KV; decoder branch
+        # READS it from the same on-device buffer inside the same graph. Both specs
+        # trace with the KV as a real in-graph consumer, so past_*_RetainedState is
+        # NOT dead-elimed (contrast with the single-spec EncoderPrefillWrapper, which
+        # must emit regular past_*_out for that reason — see the note at its
+        # get_output_names). Names match the wrapper's forward return tuple:
+        # (canvas_logits, vision_embeds, gated_image_idx, gated_pkv).
+        names = ["canvas_logits", "vision_embeds_RetainedState", "image_idx_output"]
+        for i in range(text_cfg.num_hidden_layers):
+            for kv in ("key", "value"):
+                names.append(f"past_{kv}.{i}_RetainedState")
+        return names
+
+    def get_dummy_inputs(self, **kwargs):
+        bs = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
+        text_cfg = self.config.text_config
+        mm_tokens_per_image = self.model._get_mm_tokens_per_image()
+        seq_len = max(constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN, mm_tokens_per_image + 32)
+
+        input_ids = torch.zeros((bs, seq_len), dtype=torch.int64)
+        mm_token_type_ids = torch.zeros((bs, seq_len), dtype=torch.int64)
+        text_prefix_len = min(5, seq_len)
+        image_start = text_prefix_len
+        image_end = min(image_start + mm_tokens_per_image, seq_len)
+        input_ids[:, image_start:image_end] = self.config.image_token_id
+        mm_token_type_ids[:, image_start:image_end] = 1
+
+        # Trace with canvas_len=1 (Prefill-shaped): torch.where inside forward()
+        # evaluates both branches regardless of is_encode's value, so the resulting
+        # ONNX graph is spec-invariant. Using canvas_len=1 avoids allocating a
+        # [bs, 256, vocab] self_conditioning_logits dummy at trace time.
+        return {
+            "input_ids": input_ids,
+            "position_ids": torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(bs, 1),
+            "vision_embeds": torch.zeros((bs, mm_tokens_per_image, text_cfg.hidden_size), dtype=torch.float32),
+            "image_idx": torch.zeros((1, 1), dtype=torch.int64),
+            "mm_token_type_ids": mm_token_type_ids,
+            "decoder_input_ids": torch.zeros((bs, 1), dtype=torch.int64),
+            "decoder_position_ids": torch.zeros((bs, 1), dtype=torch.int64),
+            "self_conditioning_logits": torch.zeros((bs, 1, text_cfg.vocab_size), dtype=torch.float32),
+            "past_key_values": self.model.get_dummy_pkv_cache(config=text_cfg, batch_size=bs, seq_len=seq_len),
+        }
+
 
 # ---------------------------------------------------------------------------
 # Disaggregated dual-QPC wrappers
