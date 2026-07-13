@@ -344,8 +344,20 @@ class QEffHYV3TopKRouter(HYV3TopKRouter):
         _, top_k_index = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)
         top_k_weights = routing_weights.gather(1, top_k_index)
 
-        # Replace .sum() with einsum to fix the ReduceSum issue in subfunction (M1/M5)
-        denominator = torch.einsum("ab->a", top_k_weights).unsqueeze(-1) + 1e-20
+        # Sum top_k_weights along the top_k dim for renormalization. This was
+        # originally `torch.einsum("ab->a", top_k_weights)` — a workaround for
+        # a subfunction-time break with `.sum(dim=1)` on an earlier SDK — but
+        # SDK 1.22.1.12's `qaic-compile` rejects the resulting dynamic-axes
+        # ReduceSum:
+        #   [Operator-'ReduceSum_382'] : ReduceSum: Non-constant axes tensor not supported
+        # (fired on gridsdca job 4970559, 2026-07-13, prefill compile). Unroll
+        # across the known-constant top_k count — lowers to a chain of
+        # constant-shape Adds, no ReduceSum. Same pattern applied to the top_k
+        # sum in `QEffHYV3MoE.moe()` (see the block there for the full rationale).
+        denominator = top_k_weights[:, 0]
+        for k in range(1, self.top_k):
+            denominator = denominator + top_k_weights[:, k]
+        denominator = denominator.unsqueeze(-1) + 1e-20
         top_k_weights = top_k_weights / denominator
         top_k_weights = top_k_weights * self.router_scaling_factor
 
