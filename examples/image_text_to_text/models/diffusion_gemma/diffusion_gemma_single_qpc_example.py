@@ -5,14 +5,19 @@
 #
 # -----------------------------------------------------------------------------
 
-"""DiffusionGemma end-to-end example on Cloud AI 100.
+"""DiffusionGemma single-QPC (unified) example on Cloud AI 100.
 
-DiffusionGemma is a non-autoregressive block-diffusion VLM: the encoder does a
-one-shot prefill over the prompt (+ vision), then the decoder iterates a fixed
-canvas of `canvas_length` tokens over N diffusion steps, denoising the canvas
-via an entropy-bound sampler. `QEFFAutoModelForImageTextToText.generate()` does
-not apply; this example drives the two exported QPCs (encoder-prefill and
-canvas-decode) via `QAICInferenceSession` directly.
+The unified wrapper packs encoder-prefill and canvas-decode into one QPC with
+two specializations (Prefill: seq_len=<prefill>, canvas_len=1; Decode: seq_len=1,
+canvas_len=<canvas>). Both branches trace and the compiler is expected to fold
+the unused one per specialization. The runner drives one QAICInferenceSession
+and host-copies past_*_RetainedState (Prefill output) into past_*.{i} (Decode
+input) between diffusion steps, same contract as the dual-QPC path.
+
+Status: this graph currently exceeds the AI 100 per-core VA budget at
+TS<=16 (SDK 1.22.x) and TS>=24 exceeds the multi-device connection cap.
+See the dual-QPC example (diffusion_gemma_example.py) for a working end-to-end
+run. Kept here as a reference for the single-QPC pipeline shape.
 """
 
 import time
@@ -37,8 +42,8 @@ ctx_len = 1024
 canvas_length = 256
 diffusion_steps = 24
 num_cores = 16
-num_devices = 4
-device_ids = [0, 1, 2, 3]
+num_devices = 16
+device_ids = list(range(num_devices))
 image_url = (
     "https://huggingface.co/datasets/huggingface/documentation-images"
     "/resolve/main/transformers/tasks/car.jpg"
@@ -47,30 +52,14 @@ prompt_text = "Describe this image in detail."
 
 
 # ---------------------------------------------------------------------------
-# Compile helpers — wire the two QEff wrappers into standalone QPCs.
+# Compile helper for the unified single-QPC wrapper.
 # ---------------------------------------------------------------------------
 
 
-class _EncoderPrefillQPC(QEffCausalLMForTextImageToTextModel):
+class _UnifiedQPC(QEffCausalLMForTextImageToTextModel):
     def __init__(self, model):
         QEFFBaseModel.__init__(self, model)
-        self.model = model.get_qeff_encoder_prefill()
-        self.model.qaic_config = None
-        self.hash_params["qeff_auto_class"] = self.__class__.__name__
-        self.continuous_batching = False
-
-    @property
-    def get_model_config(self):
-        return self.model.model.config.__dict__
-
-    def export(self, inputs, output_names, dynamic_axes, **kwargs):
-        return self._export(inputs, output_names=output_names, dynamic_axes=dynamic_axes)
-
-
-class _CanvasDecodeQPC(QEffCausalLMForTextImageToTextModel):
-    def __init__(self, model):
-        QEFFBaseModel.__init__(self, model)
-        self.model = model.get_qeff_canvas_decode()
+        self.model = model.get_qeff_unified_wrapper()
         self.model.qaic_config = None
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
         self.continuous_batching = False
@@ -84,7 +73,7 @@ class _CanvasDecodeQPC(QEffCausalLMForTextImageToTextModel):
 
 
 # ---------------------------------------------------------------------------
-# Load HF model, wrap, compile both QPCs.
+# Load HF model, wrap, compile one unified QPC (two specializations).
 # ---------------------------------------------------------------------------
 
 config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
@@ -93,54 +82,33 @@ processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 hf_model = AutoModelForImageTextToText.from_pretrained(
     model_id, config=config, torch_dtype=torch.float32, attn_implementation="eager"
 )
-# Bootstrap the QEff-patched top-level model class.
 qeff_model = QEffDiffusionGemmaForBlockDiffusion.__new__(QEffDiffusionGemmaForBlockDiffusion)
 qeff_model.__dict__.update(hf_model.__dict__)
 
-print(f"Compiling encoder-prefill QPC ({num_devices} devices, {num_cores} cores)...")
+print(f"Compiling unified single-QPC ({num_devices} devices, {num_cores} cores)...")
 t0 = time.time()
-enc = _EncoderPrefillQPC(qeff_model)
-enc_inputs = enc.model.get_dummy_inputs()
-enc.export(enc_inputs, enc.model.get_output_names(), enc.model.get_onnx_dynamic_axes())
-enc_spec, _ = enc.model.get_specializations(
+uni = _UnifiedQPC(qeff_model)
+uni.export(uni.model.get_dummy_inputs(), uni.model.get_output_names(), uni.model.get_onnx_dynamic_axes())
+uni_spec, _ = uni.model.get_specializations(
     batch_size=1, prefill_seq_len=prefill_seq_len, ctx_len=ctx_len, canvas_length=canvas_length,
 )
 text_cfg = qeff_model.config.text_config
-enc_custom_io = {"vision_embeds": "float16"}
+uni_custom_io = {"vision_embeds": "float16"}
 for i in range(text_cfg.num_hidden_layers):
     for kv in ("key", "value"):
-        enc_custom_io[f"past_{kv}.{i}"] = "float16"
-        enc_custom_io[f"past_{kv}.{i}_out"] = "float16"
-enc_qpc = enc._compile(
-    onnx_path=enc.onnx_path, compile_dir=None, specializations=enc_spec,
+        uni_custom_io[f"past_{kv}.{i}"] = "float16"
+        uni_custom_io[f"past_{kv}.{i}_RetainedState"] = "float16"
+uni_qpc = uni._compile(
+    onnx_path=uni.onnx_path, compile_dir=None, specializations=uni_spec,
     convert_to_fp16=True, mxfp6_matmul=True, mdp_ts_num_devices=num_devices,
-    aic_num_cores=num_cores, custom_io=enc_custom_io, aic_enable_depth_first=True,
-)
-print(f"  encoder QPC: {enc_qpc}  ({time.time() - t0:.0f}s)")
-
-print("Compiling canvas-decode QPC...")
-t0 = time.time()
-dec = _CanvasDecodeQPC(qeff_model)
-dec_inputs = dec.model.get_dummy_inputs()
-dec.export(dec_inputs, dec.model.get_output_names(), dec.model.get_onnx_dynamic_axes())
-dec_spec, _ = dec.model.get_specializations(
-    batch_size=1, prefill_seq_len=prefill_seq_len, ctx_len=ctx_len, canvas_length=canvas_length,
-)
-dec_custom_io = {}
-for i in range(text_cfg.num_hidden_layers):
-    for kv in ("key", "value"):
-        dec_custom_io[f"past_{kv}.{i}"] = "float16"
-dec_qpc = dec._compile(
-    onnx_path=dec.onnx_path, compile_dir=None, specializations=dec_spec,
-    convert_to_fp16=True, mxfp6_matmul=True, mdp_ts_num_devices=num_devices,
-    aic_num_cores=num_cores, custom_io=dec_custom_io, retained_state=True,
+    aic_num_cores=num_cores, custom_io=uni_custom_io, retained_state=True,
     aic_enable_depth_first=True,
 )
-print(f"  canvas-decode QPC: {dec_qpc}  ({time.time() - t0:.0f}s)")
+print(f"  unified QPC: {uni_qpc}  ({time.time() - t0:.0f}s)")
 
 
 # ---------------------------------------------------------------------------
-# Vision encoding on CPU.
+# CPU vision encoding.
 # ---------------------------------------------------------------------------
 
 image = Image.open(BytesIO(requests.get(image_url).content)).convert("RGB")
@@ -177,7 +145,7 @@ with torch.no_grad():
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: encoder prefill (writes KV cache).
+# Prepare prompt inputs (padded to prefill_seq_len for single-pass prefill).
 # ---------------------------------------------------------------------------
 
 input_ids = vision_inputs["input_ids"].numpy().astype(np.int64)
@@ -186,55 +154,73 @@ position_ids = np.arange(seq_len, dtype=np.int64).reshape(1, -1)
 mm_type_ids = vision_inputs.get("mm_token_type_ids")
 mm_type_ids = mm_type_ids.numpy().astype(np.int64) if mm_type_ids is not None else np.zeros_like(input_ids)
 
-# Pad to prefill_seq_len (single-pass prefill; runner asserts n_chunks == 1).
 if seq_len > prefill_seq_len:
-    raise ValueError(f"Prompt has {seq_len} tokens > prefill_seq_len={prefill_seq_len}; recompile with larger prefill_seq_len.")
+    raise ValueError(
+        f"Prompt has {seq_len} tokens > prefill_seq_len={prefill_seq_len}; "
+        f"recompile with larger prefill_seq_len."
+    )
 pad = prefill_seq_len - seq_len
 input_ids = np.pad(input_ids, ((0, 0), (0, pad)))
 position_ids = np.pad(position_ids, ((0, 0), (0, pad)))
 mm_type_ids = np.pad(mm_type_ids, ((0, 0), (0, pad)))
 
-enc_session = QAICInferenceSession(str(enc_qpc), device_ids)
-ve_dims = next(tuple(b.dims) for b in enc_session.bindings if b.name == "vision_embeds")
+
+# ---------------------------------------------------------------------------
+# Open one QAICInferenceSession. Prefill call (canvas_len=1) writes KV into
+# retained-state buffers; Decode calls (canvas_len=canvas_length) read them.
+# ---------------------------------------------------------------------------
+
+session = QAICInferenceSession(str(uni_qpc), device_ids)
+ve_dims = next(tuple(b.dims) for b in session.bindings if b.name == "vision_embeds")
 ve = np.zeros(ve_dims, dtype=np.float16)
 ve[:, :vision_embeds.shape[1], :] = vision_embeds.astype(np.float16)
+vocab_size = text_cfg.vocab_size
 
 t0 = time.perf_counter()
-enc_out = enc_session.run({
+prefill_out = session.run({
     "input_ids": input_ids,
     "position_ids": position_ids,
     "vision_embeds": ve,
     "image_idx": np.array([[0]], dtype=np.int64),
     "mm_token_type_ids": mm_type_ids,
+    "decoder_input_ids": np.zeros((1, 1), dtype=np.int64),
+    "decoder_position_ids": np.zeros((1, 1), dtype=np.int64),
+    "self_conditioning_logits": np.zeros((1, 1, vocab_size), dtype=np.float32),
 })
 ttft = time.perf_counter() - t0
-kv_host = {n[:-len("_out")]: v for n, v in enc_out.items() if n.startswith("past_") and n.endswith("_out")}
-enc_session.deactivate()
-print(f"\nTTFT: {ttft:.2f}s ({len(kv_host)} KV buffers captured)")
+kv_host = {n[:-len("_RetainedState")]: v
+           for n, v in prefill_out.items()
+           if n.startswith("past_") and n.endswith("_RetainedState")}
+print(f"\nTTFT: {ttft:.2f}s ({len(kv_host)} KV buffers)")
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: canvas denoise (entropy-bound sampler on host).
+# Canvas denoise loop.
 # ---------------------------------------------------------------------------
 
-vocab_size = text_cfg.vocab_size
 canvas = np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
 new_canvas = canvas.copy()
 canvas_pos = np.arange(seq_len, seq_len + canvas_length, dtype=np.int64).reshape(1, -1)
 accepted_mask = np.zeros((1, canvas_length), dtype=bool)
 sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
-enc_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
-enc_attn_mask[:, :seq_len] = 1
-
-dec_session = QAICInferenceSession(str(dec_qpc), device_ids)
-const_feed = {"decoder_position_ids": canvas_pos, "encoder_attention_mask": enc_attn_mask, **kv_host}
-dec_session.set_buffers({k: v for k, v in const_feed.items() if k in dec_session.input_names})
 
 entropy_bound, t_max, t_min = 0.1, 0.8, 0.4
 t0 = time.perf_counter()
 for step in range(diffusion_steps):
     temperature = t_min + (t_max - t_min) * (diffusion_steps - 1 - step) / max(1, diffusion_steps - 1)
-    out = dec_session.run({"decoder_input_ids": canvas, "self_conditioning_logits": sc})
+    feed = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "vision_embeds": ve,
+        "image_idx": np.array([[0]], dtype=np.int64),
+        "mm_token_type_ids": mm_type_ids,
+        "decoder_input_ids": canvas,
+        "decoder_position_ids": canvas_pos,
+        "self_conditioning_logits": sc,
+        **kv_host,
+    }
+    feed = {k: v for k, v in feed.items() if k in session.input_names}
+    out = session.run(feed)
     canvas_logits = out["canvas_logits"].astype(np.float32)
     sc = canvas_logits
     lt = canvas_logits / temperature
@@ -255,7 +241,7 @@ for step in range(diffusion_steps):
     if accepted_mask.sum() >= canvas_length:
         break
 canvas_time = time.perf_counter() - t0
-dec_session.deactivate()
+session.deactivate()
 
 output_text = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
 
