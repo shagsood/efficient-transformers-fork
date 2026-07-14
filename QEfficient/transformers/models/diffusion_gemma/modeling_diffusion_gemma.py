@@ -5,45 +5,6 @@
 #
 # -----------------------------------------------------------------------------
 
-"""QEff modeling for DiffusionGemma (google/diffusiongemma-26B-A4B-it).
-
-Architecture summary
---------------------
-DiffusionGemma is an encoder-decoder diffusion-LM VLM:
-
-  Encoder:  DiffusionGemmaEncoderModel
-              ├─ vision_tower  (Gemma4 ViT, gemma4_vision)
-              ├─ embed_vision  (DiffusionGemmaMultimodalEmbedder)
-              └─ language_model (DiffusionGemmaEncoderTextModel)
-                   └─ N × DiffusionGemmaEncoderTextLayer
-                        └─ DiffusionGemmaEncoderTextAttention  (causal + KV-cache update)
-
-  Decoder:  DiffusionGemmaDecoderModel
-               └─ N × DiffusionGemmaDecoderTextLayer
-                    └─ DiffusionGemmaDecoderTextAttention  (bidirectional, reads
-                       encoder KV-cache read-only; no cache update in decoder)
-
-QEff export strategy (single-QPC)
-----------------------------------
-We export the full model as a SINGLE QPC that handles:
-  Prefill  — input_ids (text+image tokens) → fills the HybridCache (QEffGemma4DynamicCache)
-  Canvas decode — decoder_input_ids (canvas of `canvas_length` tokens) →
-                  logits over the canvas (one full bidirectional forward pass per diffusion step)
-
-The encoder prefill and the decoder diffusion step are driven by separate
-specialisations in get_specializations().
-
-Export-safety choices applied (for image injection + fp16 compile)
-------------------------------------------------------------------
-  - Finite mask value (never -inf inside torch.where; -inf*0 = NaN under fp16)
-  - INT32 logit gather index
-  - torch.where for image injection (no boolean indexing / masked_scatter)
-  - Vision projector clamped to fp16 range
-  - Negative-gather clamp: indices.clamp(min=0) before gather
-  - QEffGemma4DynamicCache wraps the cache at model entry
-  - Explicit _create_causal_mask, not an SDPA-shaped attention_mask
-"""
-
 import os
 from typing import List, Optional, Type
 
@@ -464,12 +425,7 @@ class QEffDiffusionGemmaDecoderTextAttention(DiffusionGemmaDecoderTextAttention)
 
         attn_weights = torch.matmul(query_states, key_states_for_attn.transpose(2, 3)) * self.scaling
         if attention_mask is not None:
-            # attention_mask is expected to be sized to match attn_weights on dim -1
-            # already — the decoder model (QEffDiffusionGemmaDecoderModel.forward)
-            # builds per-layer-type masks so each layer receives one at the right
-            # KV width. Attention layer no longer slices — slicing here traced as
-            # `aicdynamicrawslice` and blew VA (49 buffers × 250 MB on the
-            # unified single-QPC graph on tiny config; scales much worse on real).
+            # Mask is pre-sized per layer_type by QEffDiffusionGemmaDecoderModel.forward.
             attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -763,25 +719,18 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
                 dtype=torch.long,
             ).unsqueeze(0)
 
-        # Build bidirectional decoder mask. When encoder_attention_mask is supplied
-        # (dual-QPC production path), the caller's mask width == ctx_len; the per-layer
-        # tail-slice inside QEffDiffusionGemmaDecoderTextAttention.forward truncates it
-        # to sliding_window for sliding_attention layers.
-        # Build TWO decoder masks (one per layer_type) each sized to that type's own
-        # KV width. Per-layer-type KV widths differ (sliding_attention: sliding_window;
-        # full_attention: ctx_len). We derive each type's mask width from a
-        # REPRESENTATIVE layer of that type's key tensor via `torch.ones_like` on a
-        # projection — this makes the mask's KV axis a live shape-op in ONNX (Shape/
-        # Gather on the key tensor), which qaic-compile resolves to sliding_window vs
-        # ctx_len correctly per specialization.
+        # Build one decoder mask per layer_type. sliding_attention layers have KV
+        # width = sliding_window; full_attention layers have KV width = ctx_len.
+        # A single-width mask can't cover both because `attn_weights + mask`
+        # broadcasts on dim -1 (kv_length). We derive each type's mask width from
+        # a representative layer of that type's key tensor via `torch.ones_like` on
+        # a projection — this makes the KV axis a live shape-op in ONNX (Shape /
+        # Gather on the key tensor), which the compiler resolves to sliding_window
+        # vs ctx_len correctly per specialization.
         #
-        # Note: we IGNORE any caller-provided encoder_attention_mask here because
-        # slicing it per-type via `encoder_attention_mask[..., :type_kv_len]` at
-        # runtime traces as `aicdynamicrawslice`, which the qaic compiler can't map
-        # to on-chip memory at unified-graph scale (~12 GB × 49 buffers on tiny).
-        # The runner CAN still shape its input mask correctly; if `mm_token_type_ids`
-        # / prompt-tail masking is needed, wire it via `encoder_attention_mask` for
-        # dual-QPC-only paths where mask width == full ctx_len from the start.
+        # Caller-supplied encoder_attention_mask is ignored: slicing it per-type at
+        # runtime traces as `aicdynamicrawslice`, which is not on-chip mappable at
+        # unified-graph scale.
         mask_mapping = {}
         for layer_type in self.unique_layer_types:
             rep_layer_key = None
@@ -902,45 +851,10 @@ class QEffDiffusionGemmaVisionEncoderWrapper(nn.Module):
 
 
 class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
-    """Single-QPC dispatch wrapper — exact port of Wan2.2's
-    QEffWanUnifiedWrapper pattern (transformer_wan.py:307,378).
+    """Single-QPC wrapper: runs encoder-prefill and canvas-decode child wrappers
+    and dispatches between their outputs on a shape-derived predicate."""
 
-    Holds two INDEPENDENT child wrappers as sibling submodules:
-
-      self.encoder_prefill  → QEffDiffusionGemmaEncoderPrefillWrapper
-      self.canvas_decode    → QEffDiffusionGemmaCanvasDecodeWrapper
-
-    forward() runs BOTH branches unconditionally on every call and selects the
-    output with a single torch.where on a shape-derived predicate — matching
-    the Wan approach where both `transformer_high` and `transformer_low` run
-    every step and the merge is a bare `torch.where(is_high_noise, ...)`.
-
-    What this pattern gives us:
-      • qaic-compile's per-specialization folding drops the unused branch
-        cleanly per spec (Prefill drops decoder; Decode drops encoder).
-      • No shared state between branches — each child owns its own KV
-        handling, mask construction, sliding-window fixes, and lm_head.
-      • No retained-state cross-spec sharing bet: the runner still host-copies
-        encoder past_*_RetainedState → decoder past_*.{i} between diffusion
-        steps, exactly like dual-QPC's run_disaggregated does today. The
-        single-QPC "win" is deployment shape (one QPC, one session, one
-        bindings dump), not automatic KV persistence.
-
-    An earlier version of this wrapper tried to fuse encoder-writes-KV and
-    decoder-reads-KV into one graph via clone/torch.where gates and a
-    _NoGatherCacheLayer substitution at this level. That approach diverged
-    from Wan2.2 (which is stateless per step) and blew qaic-compile's VA on
-    real dims — see docs/superpowers/specs/2026-07-10-diffusion-gemma-single
-    -qpc-design.md for the history. All that complexity has been pushed back
-    down into the two child wrappers where it always lived.
-    """
-
-    # This wrapper drives a non-autoregressive diffusion decoder (encoder prefill +
-    # multi-step canvas denoise), not a standard next-token decode loop. It must
-    # never be driven through the generic autoregressive
-    # QEFFAutoModelForImageTextToText(kv_offload=True).generate() contract — see
-    # the guard in QEffCausalLMForTextImageToTextModel.__init__ (modeling_auto.py).
-    # Use runners/diffusion_gemma_run.py instead.
+    # Non-autoregressive: driven directly via QAICInferenceSession, not generate().
     supports_autoregressive_generate = False
 
     def __init__(self, model: "QEffDiffusionGemmaForBlockDiffusion"):
@@ -948,16 +862,10 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         self.model = model
         self.config = model.config
         self.text_config = model.config.text_config
-        # Sibling child wrappers — exact Wan pattern: self.transformer_high +
-        # self.transformer_low, but named for our arch.
         self.encoder_prefill = QEffDiffusionGemmaEncoderPrefillWrapper(model)
         self.canvas_decode = QEffDiffusionGemmaCanvasDecodeWrapper(model)
 
     def get_submodules_for_export(self):
-        """Union of both child wrappers' repeated block classes for ONNX
-        subfunction extraction (transformer_wan.py get_submodules_for_export
-        contract).
-        """
         return {QEffDiffusionGemmaEncoderTextLayer, QEffDiffusionGemmaDecoderTextLayer}
 
     def forward(
@@ -975,21 +883,12 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         batch_index: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
-        """Run both children; select via torch.where on a shape-derived predicate.
-
-        The predicate is `decoder_input_ids.shape[1] == 1` — canvas_len==1 means
-        Prefill spec, canvas_len>1 means Decode spec. This mirrors Wan2.2's
-        `tsp.shape[0] == torch.tensor(1)` idiom exactly: shape-derived so
-        qaic-compile can constant-fold it per specialization.
-        """
         del batch_index, kwargs
 
         canvas_len = decoder_input_ids.shape[1] if decoder_input_ids is not None else 1
         is_encode = canvas_len == torch.tensor(1, dtype=torch.int64, device=decoder_input_ids.device)
 
-        # ---- Branch B: canvas decode (runs FIRST so it reads the input past_kv
-        # before the encoder branch mutates it via .update() calls) ----
-        # Reads past_key_values as pure input; returns (canvas_logits,) tuple.
+        # Canvas decode runs first so it reads the input KV before encoder-prefill mutates it.
         dec_out = self.canvas_decode(
             decoder_input_ids=decoder_input_ids,
             decoder_position_ids=decoder_position_ids,
@@ -999,9 +898,6 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         )
         dec_logits = dec_out[0] if isinstance(dec_out, tuple) else dec_out
 
-        # ---- Branch A: encoder prefill (always executes; writes KV) ----
-        # Owns its own KV writes, mask handling, _NoGatherCacheLayer substitution.
-        # Returns (enc_logits [B,1,vocab], next_image_idx, pkv_list).
         enc_logits, next_image_idx, enc_pkv = self.encoder_prefill(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -1011,33 +907,18 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
             past_key_values=past_key_values,
         )
 
-        # ---- Single output-level gate (Wan2.2's `torch.where(is_high_noise, ...)`) ----
         enc_canvas_logits = enc_logits.expand(-1, canvas_len, -1)
-        is_f1 = is_encode.view(1, 1, 1)
-        canvas_logits = torch.where(is_f1, enc_canvas_logits, dec_logits)
+        canvas_logits = torch.where(is_encode.view(1, 1, 1), enc_canvas_logits, dec_logits)
+        gated_image_idx = torch.where(is_encode.view(1, 1), next_image_idx, image_idx)
 
-        is_f_idx = is_encode.view(1, 1)
-        gated_image_idx = torch.where(is_f_idx, next_image_idx, image_idx)
-
-        # KV outputs: pass the encoder-branch KV through as retained-state.
-        # (On the Decode spec the compiler folds the encoder branch out entirely
-        # and this reduces to "past_key_values.layers[i].keys" passthrough.)
         return canvas_logits, gated_image_idx, enc_pkv
 
-    # -- Export contract methods (unchanged — a two-spec QPC with union of
-    # both children's IO. The runner is responsible for host-carrying the
-    # encoder's past_*_RetainedState into subsequent decode calls' past_*.{i}
-    # inputs, same as dual-QPC.) --
-
     def get_dummy_inputs(self, **kwargs):
-        # Union of encoder_prefill.get_dummy_inputs() and canvas_decode.get_dummy_inputs()
+        # Start from encoder-prefill dummies and override decoder-side keys with
+        # canvas_len=1 (Prefill-shaped) so the wrapper traces both branches on the
+        # same shape.
         enc_di = self.encoder_prefill.get_dummy_inputs()
-        dec_di = self.canvas_decode.get_dummy_inputs()
         merged = {**enc_di}
-        # canvas_decode's dummy inputs use canvas_len=canvas_length; for a unified
-        # trace we want the wrapper's forward to trace canvas_len=1 (Prefill-shaped)
-        # since both branches evaluate regardless of is_encode value. Override the
-        # decoder-side keys with canvas_len=1 versions.
         bs = enc_di["input_ids"].shape[0]
         vocab = self.text_config.vocab_size
         merged["decoder_input_ids"] = torch.zeros((bs, 1), dtype=torch.int64)
@@ -1121,14 +1002,11 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
 # ---------------------------------------------------------------------------
 # Disaggregated dual-QPC wrappers
 # ---------------------------------------------------------------------------
-# A single is_encode-gated graph garbles on hardware: the torch.where(is_encode)
-# gate + clone→encoder-scatter→restore KV dance does not survive qaic-compile's
-# per-specialization folding (coherent on CPU eager, not when compiled). Instead we
-# export two genuinely separate single-graph QPCs with no is_encode gate:
-#   1. Encoder-prefill QPC: input_ids+vision → writes KV → past_*_RetainedState
-#   2. Canvas-decode QPC:   canvas + encoder KV (read-only input) → canvas_logits
-# The runner host-copies past_*.{i}_RetainedState (encoder) → past_*.{i} (decode)
-# every diffusion step (the examples/disagg_serving/* pattern).
+# Two independent single-graph QPCs:
+#   1. Encoder-prefill: input_ids + vision -> writes KV -> past_*_RetainedState
+#   2. Canvas-decode:   canvas + encoder KV (read-only input) -> canvas_logits
+# The runner host-copies past_*.{i}_RetainedState from encoder to past_*.{i} on
+# the decoder each diffusion step (examples/disagg_serving/* pattern).
 
 
 class QEffDiffusionGemmaEncoderPrefillWrapper(nn.Module):
@@ -1479,12 +1357,7 @@ class QEffDiffusionGemmaForBlockDiffusion(DiffusionGemmaForBlockDiffusion):
         return QEffDiffusionGemmaUnifiedWrapper(self)
 
     def get_qeff_unified_wrapper(self) -> QEffDiffusionGemmaUnifiedWrapper:
-        """Wan2.2 unified path: single-QPC with in-graph torch.where dispatch.
-
-        See docs/superpowers/specs/2026-07-10-diffusion-gemma-single-qpc-design.md
-        for the design; get_qeff_encoder_prefill / get_qeff_canvas_decode remain
-        the dual-QPC path.
-        """
+        """Single-QPC unified wrapper (encoder-prefill + canvas-decode in one QPC)."""
         return QEffDiffusionGemmaUnifiedWrapper(self)
 
     def get_qeff_encoder_prefill(self) -> QEffDiffusionGemmaEncoderPrefillWrapper:
