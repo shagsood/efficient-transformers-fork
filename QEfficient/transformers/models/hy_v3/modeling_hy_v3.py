@@ -192,7 +192,21 @@ def _cumsum_scatter_gather_update_expert_blocked(
     packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
 
     matched_idx = _build_matched_idx_from_cumsum(T2Ei)
-    valid_rows = T2Ei.to(torch.int32).sum(dim=1, keepdim=True)
+    # Sum T2Ei along the seq_len axis. Replace `.sum(dim=1, keepdim=True)`
+    # with a matmul against a ones-vector — output is equivalent, but
+    # lowers to a constant-shape MatMul instead of an ONNX ReduceSum with
+    # a dynamic axes tensor (which SDK 1.22.1.12's qaic-compile rejects:
+    # `[Operator-'ReduceSum_XXXX'] : ReduceSum: Non-constant axes tensor
+    # not supported`; fired on gridsdca job 4992668, 2026-07-13, prefill
+    # compile). Unrolling isn't viable here because seq_len is 128+ for
+    # prefill and variable across chunks. The matmul is done in fp16
+    # because qaic-compile does not support int32 matmul (the QAIC
+    # backend emits "Unsupported node ... MatMul, LHS: index32<...>,
+    # RHS: index32<...>"). Cast back to int32 after the sum so the
+    # downstream `row_range < chunk_valid_rows` comparison still works.
+    T2Ei_fp = T2Ei.to(torch.float16)
+    ones_col = torch.ones((seq_len, 1), dtype=torch.float16, device=x.device)
+    valid_rows = (T2Ei_fp @ ones_col).to(torch.int32)  # [batch_size, 1]
     row_range = torch.arange(packed_chunk_size, dtype=torch.int32, device=x.device).unsqueeze(0)
     x_expanded = x.unsqueeze(0).expand(batch_size, -1, -1)
 
@@ -512,7 +526,16 @@ class QEffPrefillChunkedHYV3MoE(QEffHYV3MoE):
                 packed_chunk_size=self.expert_blocking_packed_chunk_size,
             )
 
-        return expert_out.sum(dim=0)
+        # Sum expert_out along the num_nsp axis. `.sum(dim=0)` lowers to
+        # ONNX ReduceSum with a dynamic axes tensor which qaic-compile
+        # rejects — same class as the other two ReduceSum sites fixed
+        # in this file. num_nsp is `self.expert_blocking_num_nsp`,
+        # a Python-int attribute set at model init, so unrolling across
+        # it lowers to a chain of constant-shape Adds.
+        final = expert_out[0]
+        for i in range(1, num_nsp):
+            final = final + expert_out[i]
+        return final
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = hidden_states.shape
