@@ -159,13 +159,25 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
-def _build_matched_idx_from_cumsum(T2Ei: torch.Tensor) -> torch.Tensor:
-    """Build a packed-row to original-token index table for active expert rows."""
+def _build_matched_idx_from_cumsum(T2Ei: torch.Tensor):
+    """Build a packed-row to original-token index table for active expert rows.
+
+    Returns:
+        matched_idx: [batch_size, seq_len] int32 — packed-row → original-token map.
+        valid_rows:  [batch_size, 1] int32     — count of active rows per batch,
+                                                 taken from the last column of the
+                                                 cumsum this function already builds.
+                                                 (Returned alongside so callers don't
+                                                 need a separate `.sum(dim=1)` which
+                                                 lowers to a dynamic-axes ONNX
+                                                 ReduceSum that qaic-compile rejects.)
+    """
     batch_size, seq_len = T2Ei.shape
     int32_max = torch.iinfo(torch.int32).max
     int32_max_scalar = torch.tensor(int32_max, dtype=torch.int32, device=T2Ei.device)
     token_idx = torch.arange(seq_len, dtype=torch.int32, device=T2Ei.device).unsqueeze(0).expand(batch_size, -1)
     valid_prefix = torch.cumsum(T2Ei.to(torch.int32), dim=1)
+    valid_rows = valid_prefix[:, -1:]  # [batch_size, 1] — total active-row count per batch
     valid_dest = valid_prefix - 1
     scatter_pos = torch.where(T2Ei, valid_dest, int32_max_scalar)
     matched_idx = torch.full_like(token_idx, int32_max)
@@ -174,7 +186,7 @@ def _build_matched_idx_from_cumsum(T2Ei: torch.Tensor) -> torch.Tensor:
         scatter_pos,
         token_idx.unsqueeze(-1),
     ).squeeze(-1)
-    return matched_idx
+    return matched_idx, valid_rows
 
 
 def _cumsum_scatter_gather_update_expert_blocked(
@@ -191,22 +203,21 @@ def _cumsum_scatter_gather_update_expert_blocked(
     batch_size, seq_len = T2Ei.shape
     packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
 
-    matched_idx = _build_matched_idx_from_cumsum(T2Ei)
-    # Sum T2Ei along the seq_len axis. Replace `.sum(dim=1, keepdim=True)`
-    # with a matmul against a ones-vector — output is equivalent, but
-    # lowers to a constant-shape MatMul instead of an ONNX ReduceSum with
-    # a dynamic axes tensor (which SDK 1.22.1.12's qaic-compile rejects:
-    # `[Operator-'ReduceSum_XXXX'] : ReduceSum: Non-constant axes tensor
-    # not supported`; fired on gridsdca job 4992668, 2026-07-13, prefill
-    # compile). Unrolling isn't viable here because seq_len is 128+ for
-    # prefill and variable across chunks. The matmul is done in fp16
-    # because qaic-compile does not support int32 matmul (the QAIC
-    # backend emits "Unsupported node ... MatMul, LHS: index32<...>,
-    # RHS: index32<...>"). Cast back to int32 after the sum so the
-    # downstream `row_range < chunk_valid_rows` comparison still works.
-    T2Ei_fp = T2Ei.to(torch.float16)
-    ones_col = torch.ones((seq_len, 1), dtype=torch.float16, device=x.device)
-    valid_rows = (T2Ei_fp @ ones_col).to(torch.int32)  # [batch_size, 1]
+    # `_build_matched_idx_from_cumsum` already computes
+    # `valid_prefix = T2Ei.to(int32).cumsum(dim=1)` and its last column IS
+    # the per-batch count of active rows. Reuse it — this replaces the
+    # earlier `.sum(dim=1)` (which lowered to an ONNX ReduceSum with
+    # dynamic axes and was rejected by qaic-compile as
+    # `ReduceSum_XXXX: Non-constant axes tensor not supported` on
+    # gridsdca job 4992668) and also avoids the fp16-ones-vector matmul
+    # I first tried (which failed at compile with QAIC backend assertion
+    # `Unexpected DDR output buffer ... kind: StaticConstantDDR` on
+    # gridsdca job 5284955 — the constant ones-vector caused the QAIC
+    # backend to lift the MatMul output to constant-DDR memory kind,
+    # which downstream torch.clamp/torch.where can't consume). Slicing
+    # the last column of the cumsum reuses an op that's already in the
+    # graph and lowers to a plain `Slice`, which QAIC handles cleanly.
+    matched_idx, valid_rows = _build_matched_idx_from_cumsum(T2Ei)
     row_range = torch.arange(packed_chunk_size, dtype=torch.int32, device=x.device).unsqueeze(0)
     x_expanded = x.unsqueeze(0).expand(batch_size, -1, -1)
 
