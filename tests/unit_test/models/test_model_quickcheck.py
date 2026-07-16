@@ -956,6 +956,60 @@ def test_causal_lm_cpu_runtime_parity_with_api_runner(model_type, model_id, tmp_
 
 
 @pytest.mark.llm_model
+@pytest.mark.on_qaic
+@pytest.mark.parametrize(
+    ("model_type", "model_id"),
+    sorted(CAUSAL_RUNTIME_MODEL_IDS.items()),
+    ids=sorted(CAUSAL_RUNTIME_MODEL_IDS),
+)
+def test_causal_lm_hardware_parity_with_api_runner(model_type, model_id, tmp_path):
+    """Extends test_causal_lm_cpu_runtime_parity_with_api_runner with the QPC edge:
+    HF PyTorch == QEff PyTorch == ORT == Cloud AI 100. This is the on-hardware stage
+    validate-tiny needs and the canonical harness (Rule 13) previously lacked."""
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    if hasattr(tokenizer, "model_input_names"):
+        tokenizer.model_input_names = ["input_ids", "attention_mask"]
+    prompt = ["hello world"]
+    prompt_len = 8
+    ctx_len = 12
+
+    model_hf = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        **MODEL_KWARGS,
+        low_cpu_mem_usage=False,
+        trust_remote_code=True,
+        torch_dtype=torch.float32,
+    )
+    model_hf.eval()
+
+    api_runner = ApiRunner(
+        batch_size=1,
+        tokenizer=tokenizer,
+        config=model_hf.config,
+        prompt=prompt,
+        prompt_len=prompt_len,
+        ctx_len=ctx_len,
+        full_batch_size=None,
+    )
+
+    hf_tokens = api_runner.run_hf_model_on_pytorch(model_hf)
+    qeff_model = QEFFAutoModelForCausalLM(model_hf)
+    kv_tokens = api_runner.run_kv_model_on_pytorch(qeff_model.model)
+    onnx_path = _exported_onnx_path(qeff_model.export(tmp_path))
+    ort_tokens = api_runner.run_kv_model_on_ort(str(onnx_path))
+
+    assert np.array_equal(hf_tokens, kv_tokens.squeeze(0))
+    assert np.array_equal(kv_tokens, ort_tokens)
+
+    qpc_path = qeff_model.compile(prefill_seq_len=prompt_len, ctx_len=ctx_len, num_cores=16)
+    qpc_tokens = api_runner.run_kv_model_on_cloud_ai_100(qpc_path)
+    gen_len = ort_tokens.shape[-1]
+    qpc_tokens = qpc_tokens[:, :gen_len]
+
+    assert np.array_equal(ort_tokens, qpc_tokens)
+
+
+@pytest.mark.llm_model
 def test_vlm_text_side_runtime_parity_and_full_export(tmp_path):
     tokenizer = AutoTokenizer.from_pretrained(VLM_TEXT_RUNTIME_MODEL_ID, trust_remote_code=True)
     config = AutoConfig.from_pretrained(VLM_TEXT_RUNTIME_MODEL_ID, trust_remote_code=True)
