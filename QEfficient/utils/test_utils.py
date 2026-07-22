@@ -455,6 +455,7 @@ class ModelConfig:
         "Qwen/Qwen2.5-VL-3B-Instruct",
         "Qwen/Qwen3.5-0.8B",
         # "Qwen/Qwen3.6-35B-A3B",
+        "PaddlePaddle/PaddleOCR-VL",
     }
 
     INTERNVL_MODELS = {
@@ -490,6 +491,7 @@ class ModelConfig:
         "Qwen/Qwen3-VL-Reranker-8B",
         "Qwen/Qwen3.5-0.8B",
         "Qwen/Qwen3.6-35B-A3B",
+        "PaddlePaddle/PaddleOCR-VL",
     }
 
     EXTERNAL_MODELS = {
