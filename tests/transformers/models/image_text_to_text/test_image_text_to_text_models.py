@@ -225,14 +225,14 @@ def check_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100(
             inputs["pixel_values"] = inputs["pixel_values"].to(qeff_model.model.config.torch_dtype)
         pytorch_hf_tokens = api_runner.run_vlm_hf_model_on_pytorch(model_hf, inputs)
         inputs = processor(images=image, text=prompt, return_tensors="pt")
-        if hasattr(qeff_model.model.config, "model_type") and qeff_model.model.config.model_type in [
-            "qwen2_5_vl",
-            "qwen3_vl",
-            "qwen3_vl_moe",
-            "qwen3_5",
-            "qwen3_5_moe",
-            "paddleocr_vl",
-        ]:
+        # M-RoPE VLMs consume 4D position_ids (4, batch, seq_len); the stock generate()
+        # path only builds 2D. Detect the capability from the config (text config carries
+        # `mrope_section` in its rope parameters) rather than maintaining a per-model-type
+        # allowlist — every M-RoPE VLM (qwen2_5_vl, qwen3_vl(_moe), qwen3_5(_moe),
+        # paddleocr_vl, …) needs this, and a name list silently mis-handles the next one.
+        text_config = qeff_model.model.config.get_text_config()
+        rope_params = getattr(text_config, "rope_parameters", None) or getattr(text_config, "rope_scaling", None) or {}
+        if isinstance(rope_params, dict) and "mrope_section" in rope_params:
             inputs = qeff_model.model.prepare_inputs_for_generation(
                 inputs=inputs, prefill_seq_len=prompt_len, batch_size=batch_size
             )
