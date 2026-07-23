@@ -466,6 +466,7 @@ class ModelConfig:
         "Qwen/Qwen2.5-VL-3B-Instruct",
         "Qwen/Qwen3.5-0.8B",
         # "Qwen/Qwen3.6-35B-A3B",
+        "PaddlePaddle/PaddleOCR-VL",
     }
 
     INTERNVL_MODELS = {
@@ -501,6 +502,16 @@ class ModelConfig:
         "Qwen/Qwen3.5-35B-A3B",
         "tiny-random/gemma-4-dense",
         "tiny-random/gemma-4-moe",
+        # PaddleOCR-VL: listed here so the pytest harness exercises the tiny-model on
+        # kv_offload=True and skips kv_offload=False — NOT because dual-QPC is the
+        # deployment path. The harness drives inference via the stock generate(), whose
+        # 2D position_ids are incompatible with this model's 4D M-RoPE input, so the
+        # single-QPC harness path can't run. The real, validated deployment path IS
+        # single-QPC (kv_offload=False): it keeps pixel_values bound and matches HF
+        # exactly at fp16 and mxfp6+mxint8_kv — see
+        # examples/image_text_to_text/models/paddleocr_vl/paddleocr_vl.py, which builds
+        # the 4D M-RoPE position_ids and drives the QPC session directly.
+        "PaddlePaddle/PaddleOCR-VL",
     }
 
     REPEAT_KV_TEST_MODELS = {

@@ -172,6 +172,18 @@ from transformers.models.olmo2.modeling_olmo2 import (
     Olmo2Model,
     Olmo2RMSNorm,
 )
+from transformers.models.paddleocr_vl.modeling_paddleocr_vl import (
+    PaddleOCRAttention,
+    PaddleOCRDecoderLayer,
+    PaddleOCRProjector,
+    PaddleOCRRMSNorm,
+    PaddleOCRTextModel,
+    PaddleOCRVisionAttention,
+    PaddleOCRVisionEmbeddings,
+    PaddleOCRVisionEncoder,
+    PaddleOCRVisionTransformer,
+    PaddleOCRVLForConditionalGeneration,
+)
 from transformers.models.phi.modeling_phi import PhiAttention, PhiDecoderLayer, PhiForCausalLM, PhiModel
 from transformers.models.phi3.modeling_phi3 import (
     Phi3Attention,
@@ -520,6 +532,17 @@ from QEfficient.transformers.models.olmo2.modeling_olmo2 import (
     QEffOlmo2ForCausalLM,
     QEffOlmo2Model,
 )
+from QEfficient.transformers.models.paddleocr_vl.modeling_paddleocr_vl import (
+    QEffPaddleOCRAttention,
+    QEffPaddleOCRDecoderLayer,
+    QEffPaddleOCRProjector,
+    QEffPaddleOCRTextModel,
+    QEffPaddleOCRVisionAttention,
+    QEffPaddleOCRVisionEmbeddings,
+    QEffPaddleOCRVisionEncoder,
+    QEffPaddleOCRVisionTransformer,
+    QEffPaddleOCRVLForConditionalGeneration,
+)
 from QEfficient.transformers.models.phi.modeling_phi import (
     QEffPhiAttention,
     QEffPhiDecoderLayer,
@@ -684,6 +707,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
         Qwen3VLTextRMSNorm: CustomRMSNormAIC,
         Glm4MoeRMSNorm: CustomRMSNormAIC,
+        PaddleOCRRMSNorm: CustomRMSNormAIC,
         Wav2Vec2Encoder: QEffWav2Vec2Encoder,
         Wav2Vec2EncoderStableLayerNorm: QEffWav2Vec2EncoderStableLayerNorm,
         # BERT-family: replace _create_attention_masks (uses create_bidirectional_mask,
@@ -908,6 +932,16 @@ class KVCacheTransform(ModuleMappingTransform):
         Qwen2_5_VLVisionAttention: QEffQwen2_5_VLVisionAttention,
         Qwen2_5_VLVisionBlock: QEffQwen2_5_VLVisionBlock,
         Qwen2_5_VLTextModel: QEffQwen2_5_VLTextModel,
+        # PaddleOCR-VL
+        PaddleOCRVLForConditionalGeneration: QEffPaddleOCRVLForConditionalGeneration,
+        PaddleOCRTextModel: QEffPaddleOCRTextModel,
+        PaddleOCRAttention: QEffPaddleOCRAttention,
+        PaddleOCRDecoderLayer: QEffPaddleOCRDecoderLayer,
+        PaddleOCRVisionTransformer: QEffPaddleOCRVisionTransformer,
+        PaddleOCRVisionEncoder: QEffPaddleOCRVisionEncoder,
+        PaddleOCRVisionEmbeddings: QEffPaddleOCRVisionEmbeddings,
+        PaddleOCRVisionAttention: QEffPaddleOCRVisionAttention,
+        PaddleOCRProjector: QEffPaddleOCRProjector,
         # Starcoder2
         Starcoder2Attention: QEffStarcoder2Attention,
         Starcoder2DecoderLayer: QEFFStarcoder2DecoderLayer,
