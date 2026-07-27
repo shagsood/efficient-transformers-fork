@@ -24,7 +24,7 @@ is numerically identical for the reference's inputs while remaining export-safe 
 in-place mutation of a traced tensor, no data-dependent shapes).
 """
 
-from typing import Optional, Type
+from typing import List, Optional, Type
 
 import torch
 import torch.nn as nn
@@ -153,8 +153,12 @@ class QEffDeepseekVLV2ForConditionalGeneration(PreTrainedModel):
         continuous_batching: bool = False,
         kv_cache_batch_size: Optional[int] = None,
         full_batch_size: Optional[int] = None,
+        comp_ctx_lengths_prefill: Optional[List[int]] = None,
+        comp_ctx_lengths_decode: Optional[List[int]] = None,
         **compiler_options,
     ):
+        if comp_ctx_lengths_prefill or comp_ctx_lengths_decode:
+            raise NotImplementedError("comp_ctx_lengths (CCL) is not supported for deepseek_vl_v2.")
         prefill_seq_len = prefill_seq_len or constants.DEEPSEEK_VL_V2_PREFILL_SEQ_LEN
         ctx_len = ctx_len or constants.DEEPSEEK_VL_V2_CTX_LEN
         if img_size is None:
@@ -199,7 +203,14 @@ class QEffDeepseekVLV2ForConditionalGeneration(PreTrainedModel):
         lang[1].pop("vision_size")
         return lang, compiler_options
 
-    def get_onnx_dynamic_axes(self, kv_offload: bool = False, continuous_batching: bool = False):
+    def get_onnx_dynamic_axes(
+        self,
+        comp_ctx_lengths: Optional[List[int]] = None,
+        kv_offload: bool = False,
+        continuous_batching: bool = False,
+    ):
+        if comp_ctx_lengths is not None:
+            raise NotImplementedError("comp_ctx_lengths (CCL) is not supported for deepseek_vl_v2.")
         vision_dynamic_axes = {"pixel_values": {0: "batch_size", 2: "img_size", 3: "img_size"}}
         lang_dynamic_axes = {
             "input_ids": {0: "batch_size", 1: "seq_len"},
@@ -232,7 +243,15 @@ class QEffDeepseekVLV2ForConditionalGeneration(PreTrainedModel):
         lang_output_names.insert(2, "image_idx_output")
         return lang_output_names
 
-    def get_dummy_inputs(self, kv_offload: bool = False, continuous_batching: bool = False, **kwargs):
+    def get_dummy_inputs(
+        self,
+        kv_offload: bool = False,
+        continuous_batching: bool = False,
+        comp_ctx_lengths: Optional[List[int]] = None,
+        **kwargs,
+    ):
+        if comp_ctx_lengths is not None:
+            raise NotImplementedError("comp_ctx_lengths (CCL) is not supported for deepseek_vl_v2.")
         prefill_seq_len = int(kwargs.get("prefill_seq_len") or constants.DEEPSEEK_VL_V2_PREFILL_SEQ_LEN)
         img_size = getattr(self.config, "image_size", constants.DEEPSEEK_VL_V2_IMG_SIZE)
         bs = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE

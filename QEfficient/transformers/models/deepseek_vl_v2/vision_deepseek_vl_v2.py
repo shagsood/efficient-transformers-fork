@@ -49,13 +49,33 @@ import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 
+from QEfficient.customop.rms_norm import CustomRMSNormAIC
+
 # ---------------------------------------------------------------------------
 # SAM ViT-B backbone
 # ---------------------------------------------------------------------------
 
 
 class QEffSamLayerNorm2d(nn.Module):
-    """Channel-first LayerNorm used by the SAM conv neck."""
+    """Channel-first LayerNorm used by the SAM conv neck, computed overflow-free.
+
+    The reduction is scaled by the per-position max before squaring. Written the textbook way
+    (``(x - u).pow(2).mean(1)``) the squares overflow fp16 on real document images: this norm's
+    input reaches absmax ~450 on a scanned page, and 450**2 = 2.0e5 exceeds the fp16 ceiling of
+    65504, so the variance becomes ``inf``, ``1/sqrt(inf)`` is 0, and 409 of 1024 spatial
+    positions collapse to zero (cosine 0.949 against fp32). Random-noise inputs never expose it --
+    they only reach absmax ~70, whose square is comfortably in range -- which is why a
+    ``torch.randn`` parity harness reports a clean edge while a real page does not.
+
+    An in-module ``.to(torch.float32)`` would NOT help: ``-convert-to-fp16`` rewrites the whole
+    graph, so an upcast that PyTorch honours on CPU is erased on device. Factoring out the scale
+    is real arithmetic, so it survives the rewrite. Dividing numerator and denominator by the same
+    positive constant leaves the quotient unchanged; the only deviation is that ``eps`` ends up
+    scaled by ``scale**2``, and because ``max(centered**2) == scale**2`` bounds the variance below
+    by ``scale**2 / num_channels``, that deviation is at most
+    ``sqrt(1 + eps * num_channels) - 1`` ~= 1.3e-4 -- an order of magnitude under fp16 resolution,
+    and independent of the input magnitude.
+    """
 
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()
@@ -64,9 +84,11 @@ class QEffSamLayerNorm2d(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
+        centered = x - x.mean(1, keepdim=True)
+        scale = centered.abs().amax(1, keepdim=True).clamp(min=self.eps)
+        normalized = centered / scale
+        variance = normalized.pow(2).mean(1, keepdim=True)
+        x = normalized * torch.rsqrt(variance + self.eps)
         return self.weight[:, None, None] * x + self.bias[:, None, None]
 
 
@@ -275,18 +297,15 @@ class QEffSamImageEncoderViT(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class QEffQwen2EncoderRMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
+class QEffQwen2EncoderRMSNorm(CustomRMSNormAIC):
+    """RMSNorm mapped to the compiler-known custom op.
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return (self.weight * hidden_states).to(input_dtype)
+    A hand-written ``x.to(float32).pow(2).mean(-1)`` cannot be used here: ``-convert-to-fp16``
+    rewrites the whole graph, so the fp32 upcast is a no-op on device. This encoder's residual
+    stream reaches absmax ~584 (Qwen2 massive activations), and 584**2 = 3.4e5 overflows the fp16
+    ceiling of 65504 -- variance becomes inf, rsqrt(inf) is 0, and 388 of 512 rows collapse to
+    zero. The fused custom op accumulates the reduction internally instead.
+    """
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -456,6 +475,14 @@ class QEffQwen2Decoder2Encoder(nn.Module):
         self.model = QEffQwen2DecoderAsEncoderInner(hidden_size=hidden_dimension, **kwargs)
         self.query_768 = nn.Embedding(144, hidden_dimension)
         self.query_1024 = nn.Embedding(256, hidden_dimension)
+        # The mask depends only on `n_query`, so materialize both reachable variants as
+        # buffers. Building it inside forward() would trace `torch.triu` into the graph as a
+        # Trilu node, which qaic-compile rejects ("Diagonal must be scalar") — the diagonal
+        # exports as a rank-0 Constant. A buffer is also strictly cheaper: no per-call work.
+        for n_query in (144, 256):
+            self.register_buffer(
+                f"image_query_mask_{n_query}", build_image_query_mask(n_query, torch.float32), persistent=False
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.flatten(2).transpose(1, 2)
@@ -463,7 +490,7 @@ class QEffQwen2Decoder2Encoder(nn.Module):
         param_img = self.query_768.weight if n_query == 144 else self.query_1024.weight
         batch_query_imgs = param_img.unsqueeze(0).expand(bs, -1, -1)
         x_combined = torch.cat([x, batch_query_imgs], dim=1)
-        attention_mask = build_image_query_mask(n_query, x_combined.dtype).to(x_combined.device)
+        attention_mask = getattr(self, f"image_query_mask_{n_query}").to(x_combined.dtype)
         y = self.model(x_combined, attention_mask)
         return y[:, n_query:, :]
 
