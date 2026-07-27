@@ -168,6 +168,16 @@ INTERN_IMG_CONTEXT_TOKEN = 151667
 # Specific to InternVL3_5 series, same token won't work for InternVL2_5 series
 INTERN_3_5_IMG_CONTEXT_TOKEN = 151671
 
+# DeepSeek-OCR-2 (deepseek_vl_v2) constants
+# Global-view-only OCR path: a 1024x1024 view yields (1024/16)/4 = 16 -> 16*16 = 256
+# vision embeddings, plus one learned view-separator row.
+DEEPSEEK_VL_V2_IMG_SIZE = 1024
+DEEPSEEK_VL_V2_NUM_CHANNELS = 3
+DEEPSEEK_VL_V2_FEATURE_SIZE = 257
+DEEPSEEK_VL_V2_CTX_LEN = 1024
+DEEPSEEK_VL_V2_PREFILL_SEQ_LEN = 512
+DEEPSEEK_VL_V2_IMAGE_TOKEN_ID = 128815
+
 # Granite Vision Constants
 # Fixing the feature size with reference to ibm-granite/granite-vision-3.2-2b
 GRANITEVISION_FEATURE_SIZE = 5239

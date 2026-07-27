@@ -332,6 +332,13 @@ from QEfficient.transformers.models.deepseek_v3.modeling_deepseek import (
     QEffDeepseekV3MoE,
     QEffPrefillOnlyDeepseekV3MoE,
 )
+from QEfficient.transformers.models.deepseek_vl_v2.modeling_deepseek_vl_v2 import (
+    QEffDeepseekVLV2MoE,
+    QEffDeepseekVLV2Model,
+)
+from QEfficient.transformers.models.deepseek_vl_v2.vlm_deepseek_vl_v2 import (
+    QEffDeepseekVLV2ForConditionalGeneration,
+)
 from QEfficient.transformers.models.falcon.modeling_falcon import (
     QEffFalconAttention,
     QEffFalconDecoderLayer,
@@ -1321,6 +1328,14 @@ class KVCacheExternalModuleMapperTransform(ExternalModuleMapperTransform):
             "get_dummy_pkv_cache": QEffDeepseekV3ForCausalLM.get_dummy_pkv_cache,
         },
         "DeepseekV3Model": {"forward": QEffDeepseekV3Model.forward, "__qeff_init__": QEffDeepseekV3Model.__qeff_init__},
+        # DeepSeek-OCR-2 (deepseek_vl_v2). The modeling here is self-contained, so these
+        # entries exist to fire __qeff_init__ (rotary caches + fused MoE weights), which
+        # the framework only invokes for mapped modules.
+        "QEffDeepseekVLV2ForConditionalGeneration": {
+            "__qeff_init__": QEffDeepseekVLV2ForConditionalGeneration.__qeff_init__,
+        },
+        "QEffDeepseekVLV2Model": {"__qeff_init__": QEffDeepseekVLV2Model.__qeff_init__},
+        "QEffDeepseekVLV2MoE": {"__qeff_init__": QEffDeepseekVLV2MoE.__qeff_init__},
         "DeepseekV3DecoderLayer": {
             "forward": QEffDeepseekV3DecoderLayer.forward,
         },

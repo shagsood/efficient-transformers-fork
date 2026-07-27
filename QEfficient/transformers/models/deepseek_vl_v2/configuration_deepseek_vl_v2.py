@@ -63,6 +63,8 @@ class DeepseekVLV2Config(PretrainedConfig):
         attention_bias=False,
         attention_dropout=0.0,
         use_mla=False,
+        image_size=1024,
+        image_token_id=128815,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -98,6 +100,11 @@ class DeepseekVLV2Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.use_mla = use_mla
 
+        # Vision tower: the OCR path uses a single 1024x1024 global view, and image
+        # placeholder tokens carry this id in the prompt.
+        self.image_size = image_size
+        self.image_token_id = image_token_id
+
         # plain MHA: single per-head dim derived from hidden_size / heads
         self.head_dim = self.hidden_size // self.num_attention_heads
 
@@ -108,3 +115,19 @@ class DeepseekVLV2Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    @classmethod
+    def from_ocr2_config(cls, config_dict: dict) -> "DeepseekVLV2Config":
+        """Build from the published ``config.json``, which splits decoder fields between
+        the top level and a nested ``language_config`` block."""
+        merged = {k: v for k, v in config_dict.items() if not isinstance(v, (dict, list))}
+        merged.update(
+            {k: v for k, v in config_dict.get("language_config", {}).items() if not isinstance(v, (dict, list))}
+        )
+        vision_cfg = config_dict.get("vision_config", {})
+        if "image_size" in vision_cfg:
+            merged["image_size"] = vision_cfg["image_size"]
+        merged.pop("torch_dtype", None)
+        merged.pop("model_type", None)
+        accepted = cls.__init__.__code__.co_varnames
+        return cls(**{k: v for k, v in merged.items() if k in accepted})
