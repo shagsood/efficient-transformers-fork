@@ -38,12 +38,15 @@ qeff_model = QEFFAutoModelForImageTextToText.from_pretrained(
 )
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
+# ``num_devices=1``: with tensor slicing enabled the compiler drops the ``vision_embeds``
+# input from the language QPC, so the decoder never sees the image and transcribes nothing
+# from it. This configuration is token-exact against the fp32 CPU reference.
 qeff_model.compile(
     img_size=constants.DEEPSEEK_VL_V2_IMG_SIZE,
     prefill_seq_len=512,
     ctx_len=1024,
     num_cores=16,
-    num_devices=4,
+    num_devices=1,
     batch_size=1,
     mxfp6_matmul=True,
     mxint8_kv_cache=True,
