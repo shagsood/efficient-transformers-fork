@@ -732,3 +732,88 @@ class ApiRunnerMolmo(ApiRunnerVlm):
             print("Completion:", repr(py_output))
             generated_ids.append(offset_output)
         return generated_ids
+
+
+class ApiRunnerDeepseekVLV2(ApiRunnerVlm):
+    """
+    ApiRunner for deepseek_vl_v2 (DeepSeek-OCR-2) models:
+    ---------
+
+    1. HuggingFace ``PyTorch`` model
+    2. Transformed KV Pytorch Model
+    3. ``ONNX`` model on ONNXRT
+    4. ``ONNX`` model on Cloud AI 100
+
+    ``QEffDeepseekVLV2ForConditionalGeneration`` has no ``.generate()`` (it is not a
+    ``GenerationMixin``), so unlike the other VLM runners this hand-rolls a greedy decode
+    loop directly against ``language_model``, mirroring the reference validation used for
+    the on-device parity check (fresh zero KV cache each step, no compiled cache growth).
+    """
+
+    def __init__(
+        self,
+        batch_size,
+        processor,
+        config,
+        image,
+        prompt,
+        prompt_len,
+        ctx_len,
+        max_gen_len,
+        n_layer,
+        dtype=torch.float32,
+    ):
+        self.processor = processor
+        self.ctx_len = ctx_len
+        self.prompt_len = prompt_len
+        self.batch_size = batch_size
+        self.config = config
+        self.gen_len = max_gen_len
+        self.dtype = dtype
+
+    @torch.no_grad()
+    def run_vlm_hf_model_on_pytorch(self, model, inputs):
+        if not hasattr(model.language_model.model, "sin_cached"):
+            model.__qeff_init__()
+
+        image_token_id = self.config.image_token_id
+        eos_token_id = self.config.eos_token_id
+        eos_token_ids = {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id)
+
+        vision_embeds = model.get_image_features(inputs["pixel_values"])
+        cur_ids = inputs["input_ids"][0].tolist()
+        generated = []
+        for _ in range(self.gen_len):
+            seq_len = len(cur_ids)
+            kv_dtype = next(model.language_model.parameters()).dtype
+            past_key_values = [
+                [
+                    torch.zeros((1, self.config.num_key_value_heads, seq_len, self.config.head_dim), dtype=kv_dtype),
+                    torch.zeros((1, self.config.num_key_value_heads, seq_len, self.config.head_dim), dtype=kv_dtype),
+                ]
+                for _ in range(self.config.num_hidden_layers)
+            ]
+            cur_input_ids = torch.tensor([cur_ids], dtype=torch.int64)
+            inputs_embeds = model.language_model.model.embed_tokens(cur_input_ids)
+            image_mask = cur_input_ids == image_token_id
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[0][image_mask[0]] = vision_embeds.reshape(-1, vision_embeds.shape[-1])[
+                : int(image_mask.sum())
+            ].to(inputs_embeds.dtype)
+            outputs = model.language_model(
+                inputs_embeds=inputs_embeds,
+                position_ids=torch.arange(seq_len)[None],
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            next_token = int(outputs.logits[:, -1, :].argmax(-1))
+            generated.append(next_token)
+            cur_ids.append(next_token)
+            if next_token in eos_token_ids:
+                break
+
+        generated_ids = torch.tensor(generated, dtype=torch.int64)
+        py_output = self.processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        print("Original HF Model Outputs (Torch CPU):")
+        print("Completion:", repr(py_output))
+        return generated_ids

@@ -148,8 +148,8 @@ def build_rel_pos_index(q_size: int, k_size: int) -> torch.Tensor:
     1024px for both the windowed (14) and global (64) extents, so no interpolation of
     the table is required and these indices are constant.
     """
-    q_coords = torch.arange(q_size)[:, None] * max(k_size / q_size, 1.0)
-    k_coords = torch.arange(k_size)[None, :] * max(q_size / k_size, 1.0)
+    q_coords = torch.arange(q_size, device="cpu")[:, None] * max(k_size / q_size, 1.0)
+    k_coords = torch.arange(k_size, device="cpu")[None, :] * max(q_size / k_size, 1.0)
     relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
     return relative_coords.long()
 
@@ -175,8 +175,6 @@ class QEffSamAttention(nn.Module):
         if self.use_rel_pos:
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * input_size[0] - 1, self.head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * input_size[1] - 1, self.head_dim))
-            self.register_buffer("rel_idx_h", build_rel_pos_index(input_size[0], input_size[0]), persistent=False)
-            self.register_buffer("rel_idx_w", build_rel_pos_index(input_size[1], input_size[1]), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, h, w, _ = x.shape
@@ -185,8 +183,12 @@ class QEffSamAttention(nn.Module):
 
         attn_bias = None
         if self.use_rel_pos:
-            rh = self.rel_pos_h[self.rel_idx_h]  # (h, h, head_dim)
-            rw = self.rel_pos_w[self.rel_idx_w]  # (w, w, head_dim)
+            # Indices are recomputed here rather than cached as a registered buffer: this is a
+            # non-persistent int64 constant, and HF's from_pretrained fast-init materializes
+            # every buffer (including persistent=False ones) via an uninitialized to_empty(),
+            # which corrupts anything not restored from the checkpoint's state_dict.
+            rh = self.rel_pos_h[build_rel_pos_index(h, h)]  # (h, h, head_dim)
+            rw = self.rel_pos_w[build_rel_pos_index(w, w)]  # (w, w, head_dim)
             r_q = q.reshape(b * self.num_heads, h, w, self.head_dim)
             rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, rh).unsqueeze(-1)
             rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, rw).unsqueeze(-2)
@@ -479,6 +481,15 @@ class QEffQwen2Decoder2Encoder(nn.Module):
         # buffers. Building it inside forward() would trace `torch.triu` into the graph as a
         # Trilu node, which qaic-compile rejects ("Diagonal must be scalar") — the diagonal
         # exports as a rank-0 Constant. A buffer is also strictly cheaper: no per-call work.
+        for n_query in (144, 256):
+            self.register_buffer(
+                f"image_query_mask_{n_query}", build_image_query_mask(n_query, torch.float32), persistent=False
+            )
+
+    def __qeff_init__(self):
+        # HF's `from_pretrained` does not correctly restore `persistent=False` buffers
+        # computed at `__init__` time, so these masks come back corrupted after loading.
+        # Rebuild them explicitly, same as the RoPE cos/sin cache elsewhere in this model.
         for n_query in (144, 256):
             self.register_buffer(
                 f"image_query_mask_{n_query}", build_image_query_mask(n_query, torch.float32), persistent=False

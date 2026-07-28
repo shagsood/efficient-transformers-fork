@@ -284,6 +284,8 @@ def check_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100_CB(
 def test_full_image_text_to_text_pytorch_vs_ai100_continuous_batching(model_name, kv_offload, manual_cleanup):
     if model_name in ModelConfig.SKIPPED_MODELS:
         pytest.skip("Test skipped for this model due to some issues.")
+    if model_name in ModelConfig.DEEPSEEK_VL_V2_MODELS:
+        pytest.skip("Continuous batching is not supported for deepseek_vl_v2.")
     if model_name in ModelConfig.DUAL_QPC_MODELS and not kv_offload:
         pytest.skip("These models require kv_offload=True for testing.")
 
@@ -304,6 +306,8 @@ def test_full_image_text_to_text_pytorch_vs_ai100_continuous_batching(model_name
 def test_few_image_text_to_text_pytorch_vs_ai100_continuous_batching(model_name, kv_offload, manual_cleanup):
     if model_name in ModelConfig.SKIPPED_MODELS:
         pytest.skip("Test skipped for this model due to some issues.")
+    if model_name in ModelConfig.DEEPSEEK_VL_V2_MODELS:
+        pytest.skip("Continuous batching is not supported for deepseek_vl_v2.")
     if model_name in ModelConfig.DUAL_QPC_MODELS and not kv_offload:
         pytest.skip("These models require kv_offload=True for testing.")
 
@@ -324,6 +328,8 @@ def test_few_image_text_to_text_pytorch_vs_ai100_continuous_batching(model_name,
 def test_dummy_image_text_to_text_pytorch_vs_ai100_continuous_batching(model_name, kv_offload, manual_cleanup):
     if model_name in ModelConfig.SKIPPED_MODELS:
         pytest.skip("Test skipped for this model due to some issues.")
+    if model_name in ModelConfig.DEEPSEEK_VL_V2_MODELS:
+        pytest.skip("Continuous batching is not supported for deepseek_vl_v2.")
     if model_name in ModelConfig.DUAL_QPC_MODELS and not kv_offload:
         pytest.skip("These models require kv_offload=True for testing.")
 

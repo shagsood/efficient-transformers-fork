@@ -9,6 +9,7 @@ import copy
 import json
 import os
 from io import BytesIO
+from types import SimpleNamespace
 from typing import List, Optional
 
 import pytest
@@ -16,6 +17,7 @@ import requests
 import torch
 from PIL import Image
 from requests.adapters import HTTPAdapter
+from torchvision import transforms
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -27,8 +29,8 @@ from urllib3.util.retry import Retry
 
 from QEfficient import QEFFAutoModelForCausalLM, QEFFAutoModelForImageTextToText
 from QEfficient.utils._utils import create_json
-from QEfficient.utils.constants import QnnConstants
-from QEfficient.utils.run_utils import ApiRunnerInternVL, ApiRunnerMolmo, ApiRunnerVlm
+from QEfficient.utils.constants import DEEPSEEK_VL_V2_FEATURE_SIZE, QnnConstants
+from QEfficient.utils.run_utils import ApiRunnerDeepseekVLV2, ApiRunnerInternVL, ApiRunnerMolmo, ApiRunnerVlm
 from QEfficient.utils.test_utils import (
     InternProcessor,
     ModelConfig,
@@ -233,6 +235,37 @@ def check_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100(
         inputs["pixel_values"] = inputs.pop("images")
         compile_kwargs["img_size"] = img_size
 
+    elif model_name in ModelConfig.DEEPSEEK_VL_V2_MODELS:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        processor = SimpleNamespace(tokenizer=tokenizer)
+        img = _session.get(img_url, stream=True)
+        image = Image.open(BytesIO(img.content)).convert("RGB")
+        transform = transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+        prompt = "<image>" * DEEPSEEK_VL_V2_FEATURE_SIZE + "\n" + query
+        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs["pixel_values"] = transform(image).unsqueeze(0).to(model_hf.dtype)
+        api_runner = ApiRunnerDeepseekVLV2(
+            batch_size,
+            processor,
+            config,
+            image,
+            query,
+            prompt_len,
+            ctx_len,
+            max_gen_len,
+            num_hidden_layers,
+        )
+        pytorch_hf_tokens = api_runner.run_vlm_hf_model_on_pytorch(model_hf, inputs)
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.float32)
+        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+        compile_kwargs["img_size"] = img_size
+
     else:
         processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True, padding=True)
         image = Image.open(_session.get(img_url, stream=True).raw)
@@ -334,6 +367,8 @@ def test_full_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100(model_name, kv_of
         pytest.skip("Test skipped for this model due to some issues.")
     if model_name in ["tiny-random/gemma-4-dense", "tiny-random/gemma-4-moe"]:
         pytest.skip("These tests are currently failing due to token mismatch. They need to be fixed and re-enabled.")
+    if model_name in ModelConfig.FULL_MODEL_TESTS_TO_SKIP:
+        pytest.skip("Test skipped for this model in the num_devices=4 full-layers variant.")
     if model_name in ModelConfig.DUAL_QPC_MODELS and not kv_offload:
         pytest.skip("These models require kv_offload=True for testing.")
 

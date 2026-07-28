@@ -108,6 +108,13 @@ class DeepseekVLV2Config(PretrainedConfig):
         # plain MHA: single per-head dim derived from hidden_size / heads
         self.head_dim = self.hidden_size // self.num_attention_heads
 
+        # Drop unused nested checkpoint metadata (``vision_config``, ``projector_config``,
+        # ``language_config``, ...): this config is flat and never reads them, but leaving
+        # them as raw-dict attributes collides with generic dtype-normalization code
+        # elsewhere that expects an attribute named e.g. ``vision_config`` to be a
+        # sub-config object, not a dict (see QEFFBaseModel._normalize_torch_dtype).
+        kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, (dict, list))}
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

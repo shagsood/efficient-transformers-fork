@@ -97,9 +97,11 @@ class QEffDeepseekVLV2ForConditionalGeneration(PreTrainedModel):
         self.view_seperator = nn.Parameter(torch.zeros(config.hidden_size))
         self.language_model = QEffDeepseekVLV2ForCausalLM(config)
         self.image_token_id = getattr(config, "image_token_id", constants.DEEPSEEK_VL_V2_IMAGE_TOKEN_ID)
+        self.post_init()
 
     def __qeff_init__(self):
         self.language_model.__qeff_init__()
+        self.qwen2_model.__qeff_init__()
 
     # -- vision ------------------------------------------------------------
 

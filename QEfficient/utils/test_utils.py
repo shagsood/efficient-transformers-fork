@@ -476,6 +476,10 @@ class ModelConfig:
     MOLMO_MODELS = {
         "allenai/Molmo-7B-D-0924",
     }
+
+    DEEPSEEK_VL_V2_MODELS = {
+        "deepseek-ai/DeepSeek-OCR-2",
+    }
     # FIXME: Debug issue wrt Qwen 3.5, 3.6
     SKIPPED_MODELS = {
         "meta-llama/Llama-4-Scout-17B-16E-Instruct",
@@ -501,6 +505,7 @@ class ModelConfig:
         "Qwen/Qwen3.5-35B-A3B",
         "tiny-random/gemma-4-dense",
         "tiny-random/gemma-4-moe",
+        "deepseek-ai/DeepSeek-OCR-2",
     }
 
     REPEAT_KV_TEST_MODELS = {
@@ -587,4 +592,7 @@ class ModelConfig:
 
     FULL_MODEL_TESTS_TO_SKIP = {
         "hpcai-tech/grok-1",
+        # num_devices=4 (tensor-slicing) drops the `vision_embeds` input from the language
+        # QPC on the current SDK (1.22.1.20) — see .wiki/models/deepseek_vl_v2.md.
+        "deepseek-ai/DeepSeek-OCR-2",
     }

@@ -689,8 +689,19 @@
           "num_hidden_layers": 1,
           "patch_size": 16
         },
-      "vision_soft_tokens_per_image": 280 
+      "vision_soft_tokens_per_image": 280
       }
+    },
+    {
+      "model_name": "deepseek-ai/DeepSeek-OCR-2",
+      "model_type": "deepseek_vl_v2",
+      "batch_size": 1,
+      "prompt_len": 262,
+      "ctx_len": 1024,
+      "img_size": 1024,
+      "img_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/docvqa_example.jpg",
+      "text_prompt": "Free OCR.",
+      "num_layers": 2
     }
   ],
   "image_text_subfunction_models": [
