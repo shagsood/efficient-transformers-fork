@@ -17,8 +17,10 @@ The runtime tensor ``is_encode`` selects behavior:
   * is_encode=1: encoder-prefill writes retained KV.
   * is_encode=0: canvas-decode reads retained KV and denoises the canvas.
 
-The encoder runs once. Decoder outputs are not fed back to the encoder; only the
-canvas/self-conditioning state changes across denoising iterations.
+For one output canvas, the encoder runs once. Decoder outputs are not fed back
+to the encoder during denoising; only the canvas/self-conditioning state changes
+across denoising iterations. Multi-canvas continuation requires a separate
+commit pass after the accepted canvas is final.
 """
 
 import os
@@ -166,6 +168,38 @@ def _clean_diffusion_text(text):
     return text.strip(" \n\t\r\"'")
 
 
+def _vision_embeds_cpu(text_model, vision_inputs):
+    """Run the vision tower on a fresh CPU HF model; export may offload the compile model."""
+    hf_vision = AutoModelForImageTextToText.from_pretrained(
+        model_id, torch_dtype=torch.float32, attn_implementation="eager", device_map="cpu", low_cpu_mem_usage=True
+    )
+    with torch.no_grad():
+        encoder = hf_vision.model.encoder
+        pixel_values = vision_inputs["pixel_values"]
+        image_position_ids = vision_inputs["image_position_ids"]
+        padding_positions = (image_position_ids == -1).all(dim=-1)
+        h = encoder.vision_tower.patch_embedder(pixel_values, image_position_ids, padding_positions)
+        attn_mask = ((~(~padding_positions)).unsqueeze(1).unsqueeze(2).to(h.dtype) * torch.finfo(h.dtype).min)
+        attn_mask = attn_mask.expand(-1, 1, h.shape[1], -1)
+        pos_emb = encoder.vision_tower.encoder.rotary_emb(h, image_position_ids)
+        for layer in encoder.vision_tower.encoder.layers[: encoder.vision_tower.encoder.config.num_hidden_layers]:
+            h = layer(h, attention_mask=attn_mask, position_embeddings=pos_emb, position_ids=image_position_ids)
+        out_len = encoder.vision_tower.config.default_output_length
+        h, _ = encoder.vision_tower.pooler(
+            hidden_states=h,
+            pixel_position_ids=image_position_ids,
+            padding_positions=padding_positions,
+            output_length=out_len,
+        )
+        if encoder.vision_tower.config.standardize:
+            h = (h - encoder.vision_tower.std_bias) * encoder.vision_tower.std_scale
+        vision_embeds = encoder.embed_vision(inputs_embeds=h).clamp(-60000.0, 60000.0)
+        mm_tokens = text_model._get_mm_tokens_per_image()
+        vision_embeds = vision_embeds[:, :mm_tokens, :].float().numpy()
+    del hf_vision
+    return vision_embeds
+
+
 # ---------------------------------------------------------------------------
 # Load HF model, wrap, compile one unified QPC (one specialization).
 # ---------------------------------------------------------------------------
@@ -224,27 +258,7 @@ else:
         tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
     )
 
-    with torch.no_grad():
-        encoder = hf_model.model.encoder
-        pixel_values = vision_inputs["pixel_values"]
-        image_position_ids = vision_inputs["image_position_ids"]
-        padding_positions = (image_position_ids == -1).all(dim=-1)
-        h = encoder.vision_tower.patch_embedder(pixel_values, image_position_ids, padding_positions)
-        attn_mask = ((~(~padding_positions)).unsqueeze(1).unsqueeze(2).to(h.dtype) * torch.finfo(h.dtype).min)
-        attn_mask = attn_mask.expand(-1, 1, h.shape[1], -1)
-        pos_emb = encoder.vision_tower.encoder.rotary_emb(h, image_position_ids)
-        for layer in encoder.vision_tower.encoder.layers[:encoder.vision_tower.encoder.config.num_hidden_layers]:
-            h = layer(h, attention_mask=attn_mask, position_embeddings=pos_emb, position_ids=image_position_ids)
-        out_len = encoder.vision_tower.config.default_output_length
-        h, _ = encoder.vision_tower.pooler(
-            hidden_states=h, pixel_position_ids=image_position_ids,
-            padding_positions=padding_positions, output_length=out_len,
-        )
-        if encoder.vision_tower.config.standardize:
-            h = (h - encoder.vision_tower.std_bias) * encoder.vision_tower.std_scale
-        vision_embeds = encoder.embed_vision(inputs_embeds=h).clamp(-60000.0, 60000.0)
-        mm_tokens = hf_model.config.mm_tokens_per_image
-        vision_embeds = vision_embeds[:, :mm_tokens, :].float().numpy()
+    vision_embeds = _vision_embeds_cpu(qeff_model, vision_inputs)
 
 
 # ---------------------------------------------------------------------------
