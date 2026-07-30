@@ -18,9 +18,11 @@ encoder past_*_out into decoder past_*.{i} inputs between diffusion steps.
 For the single-QPC (unified) variant, see diffusion_gemma_single_qpc_example.py.
 """
 
+import os
 import time
 from io import BytesIO
 
+import onnx
 import numpy as np
 import requests
 import torch
@@ -38,10 +40,10 @@ model_id = "google/diffusiongemma-26B-A4B-it"
 prefill_seq_len = 512
 ctx_len = 1024
 canvas_length = 256
-diffusion_steps = 24
+diffusion_steps = 48
 num_cores = 16
 num_devices = 4
-device_ids = [0, 1, 2, 3]
+device_ids = [int(x) for x in os.environ.get("DG", "4,5,6,7").split(",")]
 image_url = (
     "https://huggingface.co/datasets/huggingface/documentation-images"
     "/resolve/main/transformers/tasks/car.jpg"
@@ -86,6 +88,117 @@ class _CanvasDecodeQPC(QEffCausalLMForTextImageToTextModel):
         return self._export(inputs, output_names=output_names, dynamic_axes=dynamic_axes)
 
 
+FP32_ENCODER_ACCUM_OPS = {"CustomRMSNorm", "Clip", "Softmax", "Add", "Sub", "Mul", "Div", "Tanh", "Pow", "ReduceMean"}
+
+
+def _write_encoder_accum_npi(onnx_path):
+    """Keep the residual/norm/attention-score accumulation path in fp32."""
+    graph = onnx.load(onnx_path, load_external_data=False).graph
+    tensors, seen = [], set()
+
+    def add_output(name):
+        if name and name not in seen:
+            seen.add(name)
+            tensors.append(name)
+
+    for node in graph.node:
+        if node.op_type in FP32_ENCODER_ACCUM_OPS:
+            for out_name in node.output:
+                if "MatMul" not in out_name and "Einsum" not in out_name:
+                    add_output(out_name)
+    for node in graph.node:
+        if node.op_type == "MatMul" and (node.name.endswith("/self_attn/MatMul") or node.name.endswith("/self_attn/MatMul_1")):
+            for out_name in node.output:
+                add_output(out_name)
+
+    path = os.path.join(os.path.dirname(onnx_path), "npi_fp32_accum.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("FP32NodeInstanceNames: [")
+        handle.write(", ".join(f"'{name}'" for name in sorted(tensors)))
+        handle.write("]\n")
+    print(f"  encoder fp32 accumulation island: {len(tensors)} tensors -> {path}")
+    return path
+
+
+def _write_decode_accum_npi(onnx_path):
+    """Keep the validated logit-feedback path in fp32 without fp32 vocab matmuls."""
+    graph = onnx.load(onnx_path, load_external_data=False).graph
+    producers = {out_name: node for node in graph.node for out_name in node.output}
+    keep_nodes = []
+
+    for node in graph.node:
+        if (
+            "/decoder/self_conditioning/" in node.name
+            or node.name == "/decoder/MatMul"
+            or node.name == "/decoder/norm/CustomRMSNorm"
+        ):
+            keep_nodes.append(node)
+
+    seen_names = set()
+
+    def backtrace(tensor_name, depth=0):
+        if tensor_name in seen_names or depth > 8:
+            return
+        seen_names.add(tensor_name)
+        node = producers.get(tensor_name)
+        if node is None or node.name == "/decoder/norm/CustomRMSNorm":
+            return
+        keep_nodes.append(node)
+        for input_name in node.input:
+            if input_name in producers:
+                backtrace(input_name, depth + 1)
+
+    backtrace(graph.output[0].name)
+
+    vocab_matmul_outputs = {"/decoder/MatMul_output_0", "/lm_head/MatMul_output_0"}
+    tensors, seen_tensors = [], set()
+    for node in keep_nodes:
+        for out_name in node.output:
+            if out_name and out_name not in seen_tensors and out_name not in vocab_matmul_outputs:
+                seen_tensors.add(out_name)
+                tensors.append(out_name)
+
+    path = os.path.join(os.path.dirname(onnx_path), "npi_fp32_feedback.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("FP32NodeInstanceNames: [")
+        handle.write(", ".join(f"'{name}'" for name in sorted(tensors)))
+        handle.write("]\n")
+    print(f"  decode fp32 accumulation island: {len(tensors)} tensors -> {path}")
+    return path
+
+
+def _vision_embeds_cpu(processor, text_model, vision_inputs):
+    """Run the vision tower on a fresh CPU HF model; export may offload the compile model."""
+    hf_vision = AutoModelForImageTextToText.from_pretrained(
+        model_id, torch_dtype=torch.float32, attn_implementation="eager", device_map="cpu", low_cpu_mem_usage=True
+    )
+    with torch.no_grad():
+        encoder = hf_vision.model.encoder
+        pixel_values = vision_inputs["pixel_values"]
+        image_position_ids = vision_inputs["image_position_ids"]
+        padding_positions = (image_position_ids == -1).all(dim=-1)
+        h = encoder.vision_tower.patch_embedder(pixel_values, image_position_ids, padding_positions)
+        attn_mask = ((~(~padding_positions)).unsqueeze(1).unsqueeze(2).to(h.dtype) * torch.finfo(h.dtype).min)
+        attn_mask = attn_mask.expand(-1, 1, h.shape[1], -1)
+        pos_emb = encoder.vision_tower.encoder.rotary_emb(h, image_position_ids)
+        for layer in encoder.vision_tower.encoder.layers[: encoder.vision_tower.encoder.config.num_hidden_layers]:
+            h = layer(h, attention_mask=attn_mask, position_embeddings=pos_emb, position_ids=image_position_ids)
+        out_len = encoder.vision_tower.config.default_output_length
+        h, _ = encoder.vision_tower.pooler(
+            hidden_states=h,
+            pixel_position_ids=image_position_ids,
+            padding_positions=padding_positions,
+            output_length=out_len,
+        )
+        if encoder.vision_tower.config.standardize:
+            h = (h - encoder.vision_tower.std_bias) * encoder.vision_tower.std_scale
+        vision_embeds = encoder.embed_vision(inputs_embeds=h).clamp(-60000.0, 60000.0)
+        mm_tokens = text_model._get_mm_tokens_per_image()
+        vision_embeds = vision_embeds[:, :mm_tokens, :].float().numpy()
+    del hf_vision
+    return vision_embeds
+
+
 # ---------------------------------------------------------------------------
 # Load HF model, wrap, compile both QPCs.
 # ---------------------------------------------------------------------------
@@ -118,10 +231,11 @@ enc_qpc = enc._compile(
     onnx_path=enc.onnx_path, compile_dir=None, specializations=enc_spec,
     convert_to_fp16=True, mxfp6_matmul=True, mdp_ts_num_devices=num_devices,
     aic_num_cores=num_cores, custom_io=enc_custom_io, aic_enable_depth_first=True,
+    node_precision_info=_write_encoder_accum_npi(enc.onnx_path),
 )
 print(f"  encoder QPC: {enc_qpc}  ({time.time() - t0:.0f}s)")
 
-print("Compiling canvas-decode QPC...")
+print("Compiling canvas-decode QPC (logit-feedback reference path)...")
 t0 = time.time()
 dec = _CanvasDecodeQPC(qeff_model)
 dec_inputs = dec.model.get_dummy_inputs()
@@ -138,6 +252,7 @@ dec_qpc = dec._compile(
     convert_to_fp16=True, mxfp6_matmul=True, mdp_ts_num_devices=num_devices,
     aic_num_cores=num_cores, custom_io=dec_custom_io, retained_state=True,
     aic_enable_depth_first=True,
+    node_precision_info=_write_decode_accum_npi(dec.onnx_path),
 )
 print(f"  canvas-decode QPC: {dec_qpc}  ({time.time() - t0:.0f}s)")
 
@@ -155,28 +270,7 @@ vision_inputs = processor.apply_chat_template(
     tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
 )
 
-with torch.no_grad():
-    encoder = hf_model.model.encoder
-    pixel_values = vision_inputs["pixel_values"]
-    image_position_ids = vision_inputs["image_position_ids"]
-    padding_positions = (image_position_ids == -1).all(dim=-1)
-    h = encoder.vision_tower.patch_embedder(pixel_values, image_position_ids, padding_positions)
-    attn_mask = ((~(~padding_positions)).unsqueeze(1).unsqueeze(2).to(h.dtype)
-                 * torch.finfo(h.dtype).min)
-    attn_mask = attn_mask.expand(-1, 1, h.shape[1], -1)
-    pos_emb = encoder.vision_tower.encoder.rotary_emb(h, image_position_ids)
-    for layer in encoder.vision_tower.encoder.layers[:encoder.vision_tower.encoder.config.num_hidden_layers]:
-        h = layer(h, attention_mask=attn_mask, position_embeddings=pos_emb, position_ids=image_position_ids)
-    out_len = encoder.vision_tower.config.default_output_length
-    h, _ = encoder.vision_tower.pooler(
-        hidden_states=h, pixel_position_ids=image_position_ids,
-        padding_positions=padding_positions, output_length=out_len,
-    )
-    if encoder.vision_tower.config.standardize:
-        h = (h - encoder.vision_tower.std_bias) * encoder.vision_tower.std_scale
-    vision_embeds = encoder.embed_vision(inputs_embeds=h).clamp(-60000.0, 60000.0)
-    mm_tokens = hf_model.config.mm_tokens_per_image
-    vision_embeds = vision_embeds[:, :mm_tokens, :].float().numpy()
+vision_embeds = _vision_embeds_cpu(processor, qeff_model, vision_inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +287,9 @@ mm_type_ids = mm_type_ids.numpy().astype(np.int64) if mm_type_ids is not None el
 if seq_len > prefill_seq_len:
     raise ValueError(f"Prompt has {seq_len} tokens > prefill_seq_len={prefill_seq_len}; recompile with larger prefill_seq_len.")
 pad = prefill_seq_len - seq_len
-input_ids = np.pad(input_ids, ((0, 0), (0, pad)))
-position_ids = np.pad(position_ids, ((0, 0), (0, pad)))
+pad_token_id = processor.tokenizer.pad_token_id or 0
+input_ids = np.pad(input_ids, ((0, 0), (0, pad)), constant_values=pad_token_id)
+position_ids = np.pad(position_ids, ((0, 0), (0, pad)), constant_values=-1)
 mm_type_ids = np.pad(mm_type_ids, ((0, 0), (0, pad)))
 
 enc_session = QAICInferenceSession(str(enc_qpc), device_ids)
@@ -255,6 +350,8 @@ for step in range(diffusion_steps):
     canvas = np.where(~accepted_mask,
                       np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
                       new_canvas)
+    preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
+    print(f"  step {step + 1:2d} t={temperature:.2f} acc={int(accepted_mask.sum())}/{canvas_length} :: {preview[:60]!r}")
     if accepted_mask.sum() >= canvas_length:
         break
 canvas_time = time.perf_counter() - t0
@@ -262,6 +359,7 @@ dec_session.deactivate()
 
 output_text = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
 
-print(f"\nCanvas: {diffusion_steps} steps, {canvas_time:.1f}s, "
-      f"{diffusion_steps * canvas_length / canvas_time:.1f} tok/s")
+steps_run = step + 1
+print(f"\nCanvas: {steps_run} steps, {canvas_time:.1f}s, "
+      f"{steps_run * canvas_length / canvas_time:.1f} tok/s")
 print(f"\nOutput:\n{output_text}")
