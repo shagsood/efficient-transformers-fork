@@ -19,12 +19,20 @@ from transformers.models.granitemoe.modeling_granitemoe import (
     GraniteMoeForCausalLM,
     GraniteMoeModel,
     GraniteMoeMoE,
-    GraniteMoeParallelExperts,
     GraniteMoeRotaryEmbedding,
-    GraniteMoeTopKGating,
     repeat_kv,
     rotate_half,
 )
+try:
+    from transformers.models.granitemoe.modeling_granitemoe import (
+        GraniteMoeParallelExperts,
+        GraniteMoeTopKGating,
+    )
+except ImportError:
+    from transformers.models.granitemoe.modeling_granitemoe import (
+        GraniteMoeExperts as GraniteMoeParallelExperts,
+        GraniteMoeTopKRouter as GraniteMoeTopKGating,
+    )
 
 from QEfficient.blocking.attention_blocking import (
     AttentionBlockingConfig,
@@ -494,11 +502,12 @@ class QEffGraniteMoeTopKGating(GraniteMoeTopKGating):
                 num of experts.
 
         """
-
-        logits = self.layer(hidden_states).float()
-
-        top_k_logits, top_k_indices = torch.topk(logits, self.top_k, dim=1)  # [B, K]
-        top_k_gates = torch.softmax(top_k_logits, dim=1).to(hidden_states.dtype)  # [B, K]
+        if hasattr(self, "layer"):
+            logits = self.layer(hidden_states).float()
+        else:
+            logits = torch.nn.functional.linear(hidden_states, self.weight).float()
+        top_k_logits, top_k_indices = torch.topk(logits, self.top_k, dim=1)  # [num_tokens, top_k]
+        top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)  # [num_tokens, top_k]
 
         B, K = top_k_indices.shape
         E = int(self.num_experts)
@@ -536,28 +545,30 @@ class QEffGraniteMoeMoE(GraniteMoeMoE):
         final_hidden_states = torch.zeros_like(layer_input, dtype=layer_input.dtype)
         for expert_idx in range(num_experts):
             mask = expert_mask[expert_idx].transpose(0, 1).to(layer_input.dtype)
-            # mask_weight = torch.einsum("be,be->b", topk_gates, mask.to(topk_gates.dtype))[:, None]
             mask_weight = torch.einsum("be,be->b", topk_gates, mask.to(dtype=topk_gates.dtype))[:, None]
-            hidden_states = self.input_linear(layer_input, expert_idx)
-            # refactored due to SplitToSequence error
-            hidden_states, gate = hidden_states[..., : self.hidden_size], hidden_states[..., self.hidden_size :]
-            hidden_states = self.activation(hidden_states) * gate
-            expert_outputs = self.output_linear(hidden_states, expert_idx)
-            # current_hidden_states = torch.where(mask_weight > 0, expert_outputs * mask_weight, 0.0, dtype=mask_weight.dtype)
-
+            if hasattr(self, "input_linear"):
+                hidden_states = self.input_linear(layer_input, expert_idx)
+            else:
+                hidden_states = torch.nn.functional.linear(layer_input, self.experts.gate_up_proj[expert_idx])
+            chunked_hidden_states = hidden_states.chunk(2, dim=-1)
+            activation = self.activation if hasattr(self, "activation") else self.experts.act_fn
+            hidden_states = activation(chunked_hidden_states[0]) * chunked_hidden_states[1]
+            if hasattr(self, "output_linear"):
+                expert_outputs = self.output_linear(hidden_states, expert_idx)
+            else:
+                expert_outputs = torch.nn.functional.linear(hidden_states, self.experts.down_proj[expert_idx])
             current_hidden_states = torch.where(
                 mask_weight > 0,
                 expert_outputs * mask_weight,
                 torch.zeros_like(expert_outputs * mask_weight, dtype=final_hidden_states.dtype),
             )
-
             final_hidden_states += current_hidden_states
         final_hidden_states = final_hidden_states.view(bsz, length, self.input_size)
         return final_hidden_states, router_logits
 
 
 class QEffGraniteMoeParallelExperts(GraniteMoeParallelExperts):
-    def forward(self, inputs, expert_size):
+    def forward(self, inputs, expert_size, top_k_weights=None):
         """
         Forward pass of the QEffGraniteMoeParallelExperts module.
         Args:
@@ -568,6 +579,18 @@ class QEffGraniteMoeParallelExperts(GraniteMoeParallelExperts):
         Returns:
             Tensor: Output tensor.
         """
+        if top_k_weights is not None:
+            final_hidden_states = torch.zeros_like(inputs)
+            expert_mask = torch.nn.functional.one_hot(expert_size, num_classes=self.num_experts).permute(2, 1, 0)
+            for expert_idx in range(self.num_experts):
+                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+                current_state = inputs[token_idx]
+                gate, up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                current_hidden_states = self.act_fn(gate) * up
+                current_hidden_states = torch.nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+            return final_hidden_states
 
         results = torch.matmul(inputs, self.weight[expert_size].T)
         return results
