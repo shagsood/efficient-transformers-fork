@@ -561,9 +561,11 @@ class QEffGlm4MoeModel(Glm4MoeModel):
 class QEffGlm4MoeTopkRouter(nn.Module):
     @torch.no_grad()
     def get_topk_indices(self, scores):
-        scores_for_choice = scores.view(-1, self.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
+        n_routed_experts = self.n_routed_experts if hasattr(self, "n_routed_experts") else self.num_experts
+        n_group = self.n_group if hasattr(self, "n_group") else self.num_group
+        scores_for_choice = scores.view(-1, n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
         group_scores = (
-            scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
+            scores_for_choice.view(-1, n_group, n_routed_experts // n_group)
             .topk(2, dim=-1)[0]
             .sum(dim=-1)
         )
@@ -572,15 +574,16 @@ class QEffGlm4MoeTopkRouter(nn.Module):
         group_mask.scatter_(1, group_idx, 1)
         score_mask = (
             group_mask.unsqueeze(-1)
-            .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .reshape(-1, self.n_routed_experts)
+            .expand(-1, n_group, n_routed_experts // n_group)
+            .reshape(-1, n_routed_experts)
         )
         scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
         topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
         return topk_indices
 
     def orig_forward(self, hidden_states):
-        hidden_states = hidden_states.view(-1, self.config.hidden_size)
+        hidden_size = self.hidden_dim if hasattr(self, "hidden_dim") else self.config.hidden_size
+        hidden_states = hidden_states.view(-1, hidden_size)
         router_logits = torch.nn.functional.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
         scores = router_logits.sigmoid()
         topk_indices = self.get_topk_indices(scores)
@@ -594,7 +597,8 @@ class QEffGlm4MoeTopkRouter(nn.Module):
 
     def forward(self, hidden_states):
         # orig_i, orig_w = self.orig_forward(hidden_states)
-        hidden_states = hidden_states.view(-1, self.config.hidden_size)
+        hidden_size = self.hidden_dim if hasattr(self, "hidden_dim") else self.config.hidden_size
+        hidden_states = hidden_states.view(-1, hidden_size)
         # router_logits = torch.nn.functional.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
         router_logits = torch.nn.functional.linear(hidden_states, self.weight)
 
