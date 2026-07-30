@@ -4698,7 +4698,13 @@ class QEFFAutoModelForSpeechSeq2Seq(QEFFTransformersBase, MultimodalUtilityMixin
 
         model.config.use_cache = True
         super().__init__(model, **kwargs)
-        self.num_layers = model.config.num_hidden_layers
+        self.num_layers = getattr(
+            model.config,
+            "num_hidden_layers",
+            getattr(getattr(model.config, "text_config", None), "num_hidden_layers", None),
+        )
+        if self.num_layers is None:
+            raise AttributeError("SpeechSeq2Seq model config must define num_hidden_layers or text_config.num_hidden_layers")
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
 
     @property
