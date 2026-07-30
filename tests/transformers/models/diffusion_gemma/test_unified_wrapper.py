@@ -5,7 +5,7 @@
 #
 # -----------------------------------------------------------------------------
 
-"""Focused sanity tests for the DiffusionGemma Wan2.2-unified wrapper's
+"""Focused sanity tests for the DiffusionGemma single-QPC unified wrapper's
 export contract (see Task 3 of docs/superpowers/plans/2026-07-10-diffusion-
 gemma-single-qpc.md).
 
@@ -64,20 +64,16 @@ def unified_wrapper():
     return QEffDiffusionGemmaUnifiedWrapper(hf), cfg
 
 
-def test_get_specializations_returns_two_specs(unified_wrapper):
+def test_get_specializations_returns_one_fixed_shape_spec(unified_wrapper):
     wrapper, cfg = unified_wrapper
     specs, opts = wrapper.get_specializations(batch_size=1, prefill_seq_len=32, ctx_len=256)
-    assert isinstance(specs, list) and len(specs) == 2
-    prefill, decode = specs
-    assert prefill["_graph_name"] == "Prefill"
-    assert decode["_graph_name"] == "Decode"
-    assert prefill["seq_len"] == 32 and prefill["canvas_len"] == 1
-    assert decode["seq_len"] == 1 and decode["canvas_len"] > 1
-    # Both specs must carry both ctx symbols so the ONNX dynamic axes resolve on
-    # every layer type in the mixed sliding+full-attention stack.
-    for s in specs:
-        assert "ctx_len" in s
-        assert "sliding_window" in s
+    assert isinstance(specs, list) and len(specs) == 1
+    spec = specs[0]
+    assert spec["_graph_name"] == "Unified"
+    assert spec["seq_len"] == 32
+    assert spec["canvas_len"] > 1
+    assert "ctx_len" in spec
+    assert "sliding_window" in spec
     assert opts == {}
 
 
@@ -89,17 +85,17 @@ def test_get_onnx_dynamic_axes_covers_all_layers(unified_wrapper):
         assert f"past_key.{i}" in axes
         assert f"past_value.{i}" in axes
     for key in ("input_ids", "position_ids", "vision_embeds", "mm_token_type_ids",
-                "decoder_input_ids", "decoder_position_ids", "self_conditioning_logits"):
+                "decoder_input_ids", "decoder_position_ids", "self_conditioning_logits",
+                "encoder_attention_mask"):
         assert key in axes, f"missing dynamic axis for {key}"
 
 
 def test_get_output_names_retained_state(unified_wrapper):
     wrapper, cfg = unified_wrapper
     names = wrapper.get_output_names()
-    # First three positional outputs match forward's return: (canvas_logits, vision_embeds,
-    # gated_image_idx, gated_pkv) — with retained-state suffix on vision_embeds.
+    # Positional outputs match forward's return: canvas logits, image index,
+    # then KV retained-state pairs.
     assert names[0] == "canvas_logits"
-    assert "vision_embeds_RetainedState" in names
     assert "image_idx_output" in names
     # KV RetainedState pairs: 2 per layer.
     n_layers = cfg.text_config.num_hidden_layers
@@ -113,7 +109,7 @@ def test_get_dummy_inputs_covers_forward_signature(unified_wrapper):
     expected = {
         "input_ids", "position_ids", "vision_embeds", "image_idx", "mm_token_type_ids",
         "decoder_input_ids", "decoder_position_ids", "self_conditioning_logits",
-        "past_key_values",
+        "encoder_attention_mask", "is_encode", "past_key_values",
     }
     assert set(di.keys()) == expected
     n_layers = cfg.text_config.num_hidden_layers

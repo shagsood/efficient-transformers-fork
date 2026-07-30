@@ -851,8 +851,15 @@ class QEffDiffusionGemmaVisionEncoderWrapper(nn.Module):
 
 
 class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
-    """Single-QPC wrapper: runs encoder-prefill and canvas-decode child wrappers
-    and dispatches between their outputs on a shape-derived predicate."""
+    """Single-QPC, single-specialization wrapper.
+
+    The graph has fixed prompt/canvas shapes and always traces both branches.
+    A runtime ``is_encode`` tensor selects the useful outputs:
+
+    * ``is_encode=1``: encoder-prefill writes retained KV.
+    * ``is_encode=0``: canvas-decode reads existing retained KV and re-emits it
+      unchanged so the dummy encoder branch cannot overwrite the cache.
+    """
 
     # Non-autoregressive: driven directly via QAICInferenceSession, not generate().
     supports_autoregressive_generate = False
@@ -880,13 +887,24 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         decoder_position_ids: Optional[torch.LongTensor] = None,
         self_conditioning_logits: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        is_encode: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
         del batch_index, kwargs
 
-        canvas_len = decoder_input_ids.shape[1] if decoder_input_ids is not None else 1
-        is_encode = canvas_len == torch.tensor(1, dtype=torch.int64, device=decoder_input_ids.device)
+        if past_key_values is not None and not isinstance(past_key_values, QEffGemma4DynamicCache):
+            past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.text_config, past_key_values)
+
+        if is_encode is None:
+            is_encode = torch.ones(1, dtype=torch.int64, device=decoder_input_ids.device)
+        is_encode = is_encode.bool()
+
+        orig_pkv = [
+            (past_key_values.layers[i].keys.clone(), past_key_values.layers[i].values.clone())
+            for i in range(self.text_config.num_hidden_layers)
+        ]
+        canvas_len = decoder_input_ids.shape[1]
 
         # Canvas decode runs first so it reads the input KV before encoder-prefill mutates it.
         dec_out = self.canvas_decode(
@@ -911,21 +929,28 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         canvas_logits = torch.where(is_encode.view(1, 1, 1), enc_canvas_logits, dec_logits)
         gated_image_idx = torch.where(is_encode.view(1, 1), next_image_idx, image_idx)
 
-        return canvas_logits, gated_image_idx, enc_pkv
+        is_kv = is_encode.view(1, 1, 1, 1)
+        gated_pkv = [
+            (torch.where(is_kv, enc_pkv[i][0], orig_pkv[i][0]), torch.where(is_kv, enc_pkv[i][1], orig_pkv[i][1]))
+            for i in range(self.text_config.num_hidden_layers)
+        ]
+
+        return canvas_logits, gated_image_idx, gated_pkv
 
     def get_dummy_inputs(self, **kwargs):
-        # Start from encoder-prefill dummies and override decoder-side keys with
-        # canvas_len=1 (Prefill-shaped) so the wrapper traces both branches on the
-        # same shape.
+        # One fixed-shape specialization: prefill and decode both use the same
+        # prompt/canvas dimensions and differ only by the runtime is_encode flag.
         enc_di = self.encoder_prefill.get_dummy_inputs()
         merged = {**enc_di}
         bs = enc_di["input_ids"].shape[0]
         vocab = self.text_config.vocab_size
-        merged["decoder_input_ids"] = torch.zeros((bs, 1), dtype=torch.int64)
-        merged["decoder_position_ids"] = torch.zeros((bs, 1), dtype=torch.int64)
-        merged["self_conditioning_logits"] = torch.zeros((bs, 1, vocab), dtype=torch.float32)
-        # encoder_attention_mask is optional (canvas_decode builds a fallback when None).
-        # Leave it out of the export dummy to keep the decoder's fallback path traced.
+        canvas_length = getattr(self.config, "canvas_length", 256)
+        seq_len = enc_di["input_ids"].shape[1]
+        merged["decoder_input_ids"] = torch.zeros((bs, canvas_length), dtype=torch.int64)
+        merged["decoder_position_ids"] = torch.arange(canvas_length, dtype=torch.int64).view(1, canvas_length).repeat(bs, 1)
+        merged["self_conditioning_logits"] = torch.zeros((bs, canvas_length, vocab), dtype=torch.float32)
+        merged["encoder_attention_mask"] = torch.ones((bs, seq_len), dtype=torch.int64)
+        merged["is_encode"] = torch.ones(1, dtype=torch.int64)
         return merged
 
     def get_specializations(
@@ -944,29 +969,17 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         canvas_length = canvas_length or getattr(self.config, "canvas_length", 256)
         text_cfg = self.config.text_config
         mm_tokens_per_image = self.model._get_mm_tokens_per_image()
-        specs = [
-            {
-                "_graph_name": "Prefill",
-                "batch_size": batch_size,
-                "seq_len": prefill_seq_len,
-                "canvas_len": 1,
-                "ctx_len": ctx_len,
-                "sliding_window": text_cfg.sliding_window,
-                "vision_batch_size": batch_size,
-                "vision_tokens": mm_tokens_per_image,
-            },
-            {
-                "_graph_name": "Decode",
-                "batch_size": batch_size,
-                "seq_len": 1,
-                "canvas_len": canvas_length,
-                "ctx_len": ctx_len,
-                "sliding_window": text_cfg.sliding_window,
-                "vision_batch_size": batch_size,
-                "vision_tokens": mm_tokens_per_image,
-            },
-        ]
-        return specs, compiler_options
+        spec = {
+            "_graph_name": "Unified",
+            "batch_size": batch_size,
+            "seq_len": prefill_seq_len,
+            "canvas_len": canvas_length,
+            "ctx_len": ctx_len,
+            "sliding_window": text_cfg.sliding_window,
+            "vision_batch_size": batch_size,
+            "vision_tokens": mm_tokens_per_image,
+        }
+        return [spec], compiler_options
 
     def get_onnx_dynamic_axes(self, **kwargs):
         # Union of both children's dynamic axes.
@@ -979,6 +992,7 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
             "decoder_input_ids": {0: "batch_size", 1: "canvas_len"},
             "decoder_position_ids": {0: "batch_size", 1: "canvas_len"},
             "self_conditioning_logits": {0: "batch_size", 1: "canvas_len"},
+            "encoder_attention_mask": {0: "batch_size", 1: "ctx_len"},
         }
         for i, layer_type in enumerate(text_cfg.layer_types):
             ctx_axis = {0: "batch_size", 2: "sliding_window" if layer_type == "sliding_attention" else "ctx_len"}
@@ -990,7 +1004,7 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         # Encoder branch writes KV as retained-state outputs (its own
         # EncoderPrefillWrapper naming is `past_*_out`; on the unified graph we
         # bind them as retained-state so qaic-compile keeps one on-device
-        # allocation across the two specializations of the same QPC).
+        # allocation across prefill/decode calls in the same QPC).
         text_cfg = self.config.text_config
         names = ["canvas_logits", "image_idx_output"]
         for i in range(text_cfg.num_hidden_layers):
