@@ -42,6 +42,7 @@ from transformers import (
     AutoTokenizer,
     Qwen2Config,
 )
+from transformers.models.qwen3_asr.configuration_qwen3_asr import Qwen3ASRConfig, Qwen3ASREncoderConfig
 
 from QEfficient.transformers.models.modeling_auto import (
     QEFFAutoModel,
@@ -290,6 +291,44 @@ def _run_whisper_export_smoke(qeff_model: QEFFAutoModelForSpeechSeq2Seq, out_dir
     return onnx_path
 
 
+def _tiny_qwen3_asr_config() -> Qwen3ASRConfig:
+    audio_config = Qwen3ASREncoderConfig(
+        num_mel_bins=16,
+        encoder_layers=1,
+        encoder_attention_heads=2,
+        encoder_ffn_dim=32,
+        d_model=16,
+        n_window=50,
+        n_window_infer=100,
+        downsample_hidden_size=4,
+        max_position_embeddings=13,
+        output_dim=32,
+    )
+    text_config = AutoConfig.for_model(
+        "qwen3",
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        use_cache=True,
+    )
+    return Qwen3ASRConfig(
+        audio_config=audio_config,
+        text_config=text_config,
+        audio_token_id=3,
+        pad_token_id=0,
+        eos_token_id=2,
+        torch_dtype=torch.float32,
+    )
+
+
 def _assert_proxy_only_onnx_transform_policy(
     qeff_model, enable_proxy: bool, always_on_transforms: Optional[Set[str]] = None
 ) -> None:
@@ -511,6 +550,55 @@ def test_audio_embedding_ctc_cpu_parity_and_export(tmp_path):
     ort_logits = ort_session.run(None, {"input_values": input_values.detach().numpy()})[0]
 
     assert np.allclose(hf_logits, ort_logits, atol=1e-5)
+
+
+@pytest.mark.llm_model
+def test_qwen3_asr_transform_and_tiny_forward():
+    from QEfficient.transformers.models.qwen3_asr.modeling_qwen3_asr import (
+        QEffQwen3ASRForConditionalGeneration,
+        QEffQwen3ASRModel,
+    )
+    from QEfficient.transformers.models.qwen3.modeling_qwen3 import QEffQwen3Model
+
+    config = _tiny_qwen3_asr_config()
+    torch.manual_seed(0)
+    model_hf = AutoModelForSpeechSeq2Seq.from_config(config, **MODEL_KWARGS)
+    model_hf.eval()
+    torch.manual_seed(0)
+    model_qeff_source = AutoModelForSpeechSeq2Seq.from_config(config, **MODEL_KWARGS)
+    model_qeff_source.eval()
+
+    qeff_model = QEFFAutoModelForSpeechSeq2Seq(model_qeff_source)
+    assert isinstance(qeff_model.model, QEffQwen3ASRForConditionalGeneration)
+    assert isinstance(qeff_model.model.model, QEffQwen3ASRModel)
+    assert isinstance(qeff_model.model.model.language_model, QEffQwen3Model)
+
+    audio_token_count = 13
+    seq_len = audio_token_count + 3
+    input_ids = torch.tensor(
+        [[5] + [config.audio_token_id] * audio_token_count + [6, 7]],
+        dtype=torch.int64,
+    )
+    inputs = {
+        "input_ids": input_ids,
+        "input_features": torch.zeros((1, config.audio_config.num_mel_bins, config.audio_config.n_window * 2)),
+        "input_features_mask": torch.ones((1, config.audio_config.n_window * 2), dtype=torch.int64),
+        "attention_mask": torch.ones((1, seq_len), dtype=torch.int64),
+        "position_ids": torch.arange(seq_len, dtype=torch.int64).view(1, seq_len),
+        "use_cache": False,
+    }
+
+    hf_logits = model_hf(**inputs).logits.detach()
+    qeff_inputs = dict(inputs)
+    qeff_inputs["past_key_values"] = qeff_model.model.get_dummy_inputs(
+        prefill_seq_len=seq_len,
+        feature_len=config.audio_config.n_window * 2,
+    )["past_key_values"]
+    qeff_inputs["use_cache"] = True
+    qeff_logits = qeff_model.model(**qeff_inputs).logits.detach()
+
+    assert qeff_logits.shape == (1, 1, config.text_config.vocab_size)
+    assert torch.allclose(qeff_logits, hf_logits[:, -1:, :], atol=1e-5)
 
 
 @pytest.mark.llm_model

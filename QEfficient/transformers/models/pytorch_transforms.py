@@ -218,6 +218,10 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Model,
     Qwen3RMSNorm,
 )
+from transformers.models.qwen3_asr.modeling_qwen3_asr import (
+    Qwen3ASRForConditionalGeneration,
+    Qwen3ASRModel,
+)
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Attention,
     Qwen3_5DecoderLayer,
@@ -554,6 +558,10 @@ from QEfficient.transformers.models.qwen3.modeling_qwen3 import (
     QEffQwen3ForCausalLM,
     QEffQwen3Model,
 )
+from QEfficient.transformers.models.qwen3_asr.modeling_qwen3_asr import (
+    QEffQwen3ASRForConditionalGeneration,
+    QEffQwen3ASRModel,
+)
 from QEfficient.transformers.models.qwen3_5.modeling_qwen3_5 import (
     QEffQwen3_5Attention,
     QEffQwen3_5DecoderLayer,
@@ -860,6 +868,9 @@ class KVCacheTransform(ModuleMappingTransform):
         Qwen3DecoderLayer: QEffQwen3DecoderLayer,
         Qwen3Model: QEffQwen3Model,
         Qwen3ForCausalLM: QEffQwen3ForCausalLM,
+        # Qwen3-ASR
+        Qwen3ASRForConditionalGeneration: QEffQwen3ASRForConditionalGeneration,
+        Qwen3ASRModel: QEffQwen3ASRModel,
         # Qwen3_5
         Qwen3_5GatedDeltaNet: QEffQwen3_5GatedDeltaNet,
         Qwen3_5DecoderLayer: QEffQwen3_5DecoderLayer,
