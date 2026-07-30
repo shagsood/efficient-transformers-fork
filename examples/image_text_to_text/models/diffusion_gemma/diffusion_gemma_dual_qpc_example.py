@@ -20,6 +20,7 @@ For the single-QPC (unified) variant, see diffusion_gemma_single_qpc_example.py.
 
 import os
 import time
+import argparse
 from io import BytesIO
 
 import onnx
@@ -48,7 +49,15 @@ image_url = (
     "https://huggingface.co/datasets/huggingface/documentation-images"
     "/resolve/main/transformers/tasks/car.jpg"
 )
-prompt_text = "Describe this image in detail."
+image_prompt_text = "Describe this image in detail."
+text_only_prompt_text = "What is the capital of France? Answer in one sentence."
+
+parser = argparse.ArgumentParser(description="Run DiffusionGemma dual-QPC inference.")
+parser.add_argument("--text-only", action="store_true", help="Run a prompt with no image tokens.")
+parser.add_argument("--prompt", default=None, help="Override the default image or text-only prompt.")
+parser.add_argument("--seed", type=int, default=1234, help="Seed for the host diffusion sampler.")
+args = parser.parse_args()
+np.random.seed(args.seed)
 
 
 # ---------------------------------------------------------------------------
@@ -261,16 +270,28 @@ print(f"  canvas-decode QPC: {dec_qpc}  ({time.time() - t0:.0f}s)")
 # Vision encoding on CPU.
 # ---------------------------------------------------------------------------
 
-image = Image.open(BytesIO(requests.get(image_url).content)).convert("RGB")
-vision_inputs = processor.apply_chat_template(
-    [{"role": "user", "content": [
-        {"type": "image", "image": image},
-        {"type": "text", "text": prompt_text},
-    ]}],
-    tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
-)
-
-vision_embeds = _vision_embeds_cpu(processor, qeff_model, vision_inputs)
+if args.text_only:
+    prompt_text = args.prompt or text_only_prompt_text
+    print("\nText-only mode: no image, no image tokens.")
+    vision_inputs = processor.apply_chat_template(
+        [{"role": "user", "content": [{"type": "text", "text": prompt_text}]}],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    )
+    vision_embeds = None
+else:
+    prompt_text = args.prompt or image_prompt_text
+    image = Image.open(BytesIO(requests.get(image_url).content)).convert("RGB")
+    vision_inputs = processor.apply_chat_template(
+        [{"role": "user", "content": [
+            {"type": "image", "image": image},
+            {"type": "text", "text": prompt_text},
+        ]}],
+        tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True,
+    )
+    vision_embeds = _vision_embeds_cpu(processor, qeff_model, vision_inputs)
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +316,8 @@ mm_type_ids = np.pad(mm_type_ids, ((0, 0), (0, pad)))
 enc_session = QAICInferenceSession(str(enc_qpc), device_ids)
 ve_dims = next(tuple(b.dims) for b in enc_session.bindings if b.name == "vision_embeds")
 ve = np.zeros(ve_dims, dtype=np.float16)
-ve[:, :vision_embeds.shape[1], :] = vision_embeds.astype(np.float16)
+if vision_embeds is not None:
+    ve[:, :vision_embeds.shape[1], :] = vision_embeds.astype(np.float16)
 
 t0 = time.perf_counter()
 enc_out = enc_session.run({
