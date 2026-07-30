@@ -21,6 +21,7 @@ For the single-QPC (unified) variant, see diffusion_gemma_single_qpc_example.py.
 import os
 import time
 import argparse
+import re
 from io import BytesIO
 
 import onnx
@@ -55,9 +56,13 @@ text_only_prompt_text = "What is the capital of France? Answer in one sentence."
 parser = argparse.ArgumentParser(description="Run DiffusionGemma dual-QPC inference.")
 parser.add_argument("--text-only", action="store_true", help="Run a prompt with no image tokens.")
 parser.add_argument("--prompt", default=None, help="Override the default image or text-only prompt.")
-parser.add_argument("--seed", type=int, default=1234, help="Seed for the host diffusion sampler.")
+parser.add_argument("--seed", type=int, default=1234, help="Seed for the diffusion sampler. Use --seed -1 for the unseeded path.")
+parser.add_argument("--fuse-sampler", action="store_true", help="Run the fused on-device sampler path.")
+parser.add_argument("--max-top-k", type=int, default=64, help="Top-k used by the fused sampler.")
+parser.add_argument("--verbose-steps", action="store_true", help="Decode and print a preview after every diffusion step.")
 args = parser.parse_args()
-np.random.seed(args.seed)
+if args.seed >= 0:
+    np.random.seed(args.seed)
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +87,14 @@ class _EncoderPrefillQPC(QEffCausalLMForTextImageToTextModel):
 
 
 class _CanvasDecodeQPC(QEffCausalLMForTextImageToTextModel):
-    def __init__(self, model):
+    def __init__(self, model, fuse_sampler=False, max_top_k=64):
         QEFFBaseModel.__init__(self, model)
-        self.model = model.get_qeff_canvas_decode()
+        self.model = model.get_qeff_canvas_decode(fuse_sampler=fuse_sampler, max_top_k=max_top_k)
         self.model.qaic_config = None
         self.hash_params["qeff_auto_class"] = self.__class__.__name__
+        if fuse_sampler:
+            self.hash_params["fuse_sampler"] = fuse_sampler
+            self.hash_params["max_top_k"] = max_top_k
         self.continuous_batching = False
 
     @property
@@ -208,6 +216,38 @@ def _vision_embeds_cpu(processor, text_model, vision_inputs):
     return vision_embeds
 
 
+def _clean_diffusion_text(text):
+    text = text.replace("\ufffd", " ").strip()
+    text = re.sub(r"^\s*(thought\s*)+", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s+", " ", text)
+    text = text.replace("。", ".")
+    text = re.sub(r"\bfulling shot\b", "full shot", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(light|dark)\s+(blue|green|teal)ing\b", r"\1 \2", text, flags=re.IGNORECASE)
+    text = re.sub(r"\.(?:of|Of)\b.*$", ".", text)
+    match = re.search(r"(.{12,}?[.!?])", text)
+    if match:
+        text = match.group(1)
+    return text.strip(" \n\t\r\"'")
+
+
+def _coherence_score(text):
+    if not text:
+        return -1_000
+    if len(text) < 12:
+        return -500
+    printable = sum(ch.isprintable() for ch in text)
+    asciiish = sum((ord(ch) < 128 and ch.isprintable()) for ch in text)
+    alpha = sum(ch.isalpha() for ch in text)
+    punct_end = int(text.endswith((".", "!", "?")))
+    return asciiish / max(1, printable) + 0.01 * min(alpha, 120) + punct_end
+
+
+def _select_output_text(tokenizer, token_candidates):
+    decoded = [tokenizer.decode(tokens[0].tolist(), skip_special_tokens=True) for tokens in token_candidates]
+    cleaned = [_clean_diffusion_text(text) for text in decoded]
+    return max(cleaned, key=_coherence_score)
+
+
 # ---------------------------------------------------------------------------
 # Load HF model, wrap, compile both QPCs.
 # ---------------------------------------------------------------------------
@@ -244,9 +284,10 @@ enc_qpc = enc._compile(
 )
 print(f"  encoder QPC: {enc_qpc}  ({time.time() - t0:.0f}s)")
 
-print("Compiling canvas-decode QPC (logit-feedback reference path)...")
+decode_mode = "fused sampler" if args.fuse_sampler else "logit-feedback reference"
+print(f"Compiling canvas-decode QPC ({decode_mode} path)...")
 t0 = time.time()
-dec = _CanvasDecodeQPC(qeff_model)
+dec = _CanvasDecodeQPC(qeff_model, fuse_sampler=args.fuse_sampler, max_top_k=args.max_top_k)
 dec_inputs = dec.model.get_dummy_inputs()
 dec.export(dec_inputs, dec.model.get_output_names(), dec.model.get_onnx_dynamic_axes())
 dec_spec, _ = dec.model.get_specializations(
@@ -256,13 +297,21 @@ dec_custom_io = {}
 for i in range(text_cfg.num_hidden_layers):
     for kv in ("key", "value"):
         dec_custom_io[f"past_{kv}.{i}"] = "float16"
-dec_qpc = dec._compile(
-    onnx_path=dec.onnx_path, compile_dir=None, specializations=dec_spec,
-    convert_to_fp16=True, mxfp6_matmul=True, mdp_ts_num_devices=num_devices,
-    aic_num_cores=num_cores, custom_io=dec_custom_io, retained_state=True,
-    aic_enable_depth_first=True,
-    node_precision_info=_write_decode_accum_npi(dec.onnx_path),
-)
+dec_compile_kwargs = {
+    "onnx_path": dec.onnx_path,
+    "compile_dir": None,
+    "specializations": dec_spec,
+    "convert_to_fp16": True,
+    "mxfp6_matmul": True,
+    "mdp_ts_num_devices": num_devices,
+    "aic_num_cores": num_cores,
+    "custom_io": dec_custom_io,
+    "retained_state": True,
+    "aic_enable_depth_first": True,
+}
+if not args.fuse_sampler:
+    dec_compile_kwargs["node_precision_info"] = _write_decode_accum_npi(dec.onnx_path)
+dec_qpc = dec._compile(**dec_compile_kwargs)
 print(f"  canvas-decode QPC: {dec_qpc}  ({time.time() - t0:.0f}s)")
 
 
@@ -343,6 +392,7 @@ new_canvas = canvas.copy()
 canvas_pos = np.arange(seq_len, seq_len + canvas_length, dtype=np.int64).reshape(1, -1)
 accepted_mask = np.zeros((1, canvas_length), dtype=bool)
 sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
+prev_tokens = canvas.copy()
 enc_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
 enc_attn_mask[:, :seq_len] = 1
 
@@ -354,15 +404,30 @@ entropy_bound, t_max, t_min = 0.1, 0.8, 0.4
 t0 = time.perf_counter()
 for step in range(diffusion_steps):
     temperature = t_min + (t_max - t_min) * (diffusion_steps - 1 - step) / max(1, diffusion_steps - 1)
-    out = dec_session.run({"decoder_input_ids": canvas, "self_conditioning_logits": sc})
-    canvas_logits = out["canvas_logits"].astype(np.float32)
-    sc = canvas_logits
-    lt = canvas_logits / temperature
-    gumbel = -np.log(-np.log(np.random.uniform(size=lt.shape).astype(np.float32) + 1e-20) + 1e-20)
-    denoiser = (lt + gumbel).argmax(-1).astype(np.int64)
-    shifted = lt - lt.max(-1, keepdims=True)
-    log_softmax = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
-    ent = -(np.exp(log_softmax) * log_softmax).sum(-1)[0]
+    if args.fuse_sampler:
+        random_numbers = np.random.uniform(
+            low=0.0,
+            high=1.0,
+            size=(1, canvas_length, args.max_top_k),
+        ).astype(np.float32)
+        out = dec_session.run({
+            "decoder_input_ids": canvas,
+            "temperature": np.array([[[temperature]]], dtype=np.float32),
+            "random_numbers": random_numbers,
+            "prev_tokens": prev_tokens,
+        })
+        denoiser = out["denoiser_tokens"].astype(np.int64)
+        ent = out["token_entropy"].astype(np.float32)[0]
+    else:
+        out = dec_session.run({"decoder_input_ids": canvas, "self_conditioning_logits": sc})
+        canvas_logits = out["canvas_logits"].astype(np.float32)
+        sc = canvas_logits
+        lt = canvas_logits / temperature
+        gumbel = -np.log(-np.log(np.random.uniform(size=lt.shape).astype(np.float32) + 1e-20) + 1e-20)
+        denoiser = (lt + gumbel).argmax(-1).astype(np.int64)
+        shifted = lt - lt.max(-1, keepdims=True)
+        log_softmax = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
+        ent = -(np.exp(log_softmax) * log_softmax).sum(-1)[0]
     order = np.argsort(ent)
     sel = (np.cumsum(ent[order]) - ent[order]) <= entropy_bound
     new_acc = np.zeros(canvas_length, dtype=bool)
@@ -372,14 +437,19 @@ for step in range(diffusion_steps):
     canvas = np.where(~accepted_mask,
                       np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
                       new_canvas)
-    preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
-    print(f"  step {step + 1:2d} t={temperature:.2f} acc={int(accepted_mask.sum())}/{canvas_length} :: {preview[:60]!r}")
-    if accepted_mask.sum() >= canvas_length:
+    prev_tokens = denoiser.copy() if args.fuse_sampler else new_canvas.copy()
+    accepted_count = int(accepted_mask.sum())
+    if args.verbose_steps:
+        preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
+        print(f"  step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}")
+    else:
+        print(f"  step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length}")
+    if accepted_count >= canvas_length:
         break
 canvas_time = time.perf_counter() - t0
 dec_session.deactivate()
 
-output_text = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
+output_text = _select_output_text(processor.tokenizer, [new_canvas])
 
 steps_run = step + 1
 print(f"\nCanvas: {steps_run} steps, {canvas_time:.1f}s, "
