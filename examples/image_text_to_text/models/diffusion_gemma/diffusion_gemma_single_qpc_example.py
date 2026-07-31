@@ -469,7 +469,7 @@ for block in range(num_blocks):
     cursor += block_tokens.shape[1]
     print(
         f"  block {block + 1:2d} done: {steps_run} steps, {canvas_time:.1f}s, "
-        f"accepted={accepted_count}/{canvas_length}, committed={block_tokens.shape[1]}, cursor={cursor}"
+        f"accepted={accepted_count}/{canvas_length}, finalized={block_tokens.shape[1]}, cursor={cursor}"
     )
     if hit_eos:
         print(f"  EOS at block {block + 1}, offset {eos_pos}; truncating and stopping.")
@@ -481,8 +481,9 @@ session.deactivate()
 
 all_tokens = np.concatenate(generated, axis=1) if generated else np.zeros((1, 0), dtype=np.int64)
 raw_output = processor.tokenizer.decode(all_tokens[0].tolist(), skip_special_tokens=True)
-output_text = _clean_diffusion_text(raw_output, truncate_first_sentence=(num_blocks == 1 or args.truncate_first_sentence))
+executed_blocks = len(generated)
+output_text = _clean_diffusion_text(raw_output, truncate_first_sentence=(executed_blocks == 1 or args.truncate_first_sentence))
 
-print(f"\nCanvas: {total_steps} steps across {num_blocks} blocks, {total_canvas_time:.1f}s, "
+print(f"\nCanvas: {total_steps} steps across {executed_blocks} blocks, {total_canvas_time:.1f}s, "
       f"{total_steps * canvas_length / total_canvas_time:.1f} tok/s")
 print(f"\nOutput:\n{output_text}")
