@@ -7,6 +7,7 @@
 
 import os
 import warnings
+import copy
 from pathlib import Path
 from time import perf_counter
 from typing import List, Optional, Union
@@ -136,6 +137,93 @@ def _resolve_torch_dtype(kwargs: dict) -> None:
     # Keep the v5 alias in sync so HF from_pretrained and config see one dtype.
     if "dtype" in kwargs:
         kwargs["dtype"] = kwargs["torch_dtype"]
+
+
+def _load_qwen3_asr_native_checkpoint(pretrained_model_name_or_path: str, kwargs: dict):
+    """Load native Qwen3-ASR checkpoints whose weights are stored under thinker.*."""
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+    from transformers import AutoConfig
+    from transformers.models.qwen3_asr.configuration_qwen3_asr import Qwen3ASRConfig
+    from transformers.models.qwen3_asr.modeling_qwen3_asr import Qwen3ASRForConditionalGeneration
+
+    config_kwargs = {
+        key: kwargs[key]
+        for key in ("trust_remote_code", "revision", "token", "subfolder", "cache_dir")
+        if key in kwargs
+    }
+    hf_config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **config_kwargs)
+    thinker_config = getattr(hf_config, "thinker_config", None)
+    if hf_config.model_type != "qwen3_asr" or not isinstance(thinker_config, dict):
+        return None
+
+    if Path(pretrained_model_name_or_path).is_dir():
+        model_dir = Path(pretrained_model_name_or_path)
+    else:
+        model_dir = Path(
+            snapshot_download(
+                pretrained_model_name_or_path,
+                allow_patterns=["model.safetensors", "config.json"],
+                revision=kwargs.get("revision", None),
+                token=kwargs.get("token", None),
+                cache_dir=kwargs.get("cache_dir", None),
+            )
+        )
+
+    weights_path = model_dir / "model.safetensors"
+    if not weights_path.exists():
+        return None
+
+    with safe_open(weights_path, framework="pt", device="cpu") as state_file:
+        keys = list(state_file.keys())
+        if not keys or not all(key.startswith("thinker.") for key in keys):
+            return None
+
+        normalized_config = copy.deepcopy(thinker_config)
+        normalized_config["audio_config"]["model_type"] = "qwen3_asr_encoder"
+        normalized_config["audio_config"].pop("num_hidden_layers", None)
+        text_config = normalized_config["text_config"]
+        if "rope_scaling" in text_config and "rope_parameters" not in text_config:
+            rope_scaling = text_config.pop("rope_scaling") or {}
+            rope_theta = text_config.pop("rope_theta", None)
+            text_config["rope_parameters"] = {
+                "rope_type": rope_scaling.get("rope_type") or rope_scaling.get("type") or "default",
+            }
+            if rope_theta is not None:
+                text_config["rope_parameters"]["rope_theta"] = rope_theta
+
+        model_config = Qwen3ASRConfig(**normalized_config)
+        model_config.torch_dtype = kwargs.get("torch_dtype", torch.float32)
+        model = Qwen3ASRForConditionalGeneration(model_config)
+
+        remapped_state = {}
+        for key in keys:
+            new_key = key
+            if new_key.startswith("thinker.audio_tower.proj1."):
+                new_key = new_key.replace(
+                    "thinker.audio_tower.proj1.", "model.multi_modal_projector.linear_1.", 1
+                )
+            elif new_key.startswith("thinker.audio_tower.proj2."):
+                new_key = new_key.replace(
+                    "thinker.audio_tower.proj2.", "model.multi_modal_projector.linear_2.", 1
+                )
+            elif new_key.startswith("thinker.audio_tower."):
+                new_key = new_key.replace("thinker.audio_tower.", "model.audio_tower.", 1)
+            elif new_key.startswith("thinker.model."):
+                new_key = new_key.replace("thinker.model.", "model.language_model.", 1)
+            elif new_key.startswith("thinker.lm_head."):
+                new_key = new_key.replace("thinker.lm_head.", "lm_head.", 1)
+            remapped_state[new_key] = state_file.get_tensor(key)
+
+    missing, unexpected = model.load_state_dict(remapped_state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Qwen3-ASR native checkpoint remap failed: "
+            f"missing={list(missing)[:10]} unexpected={list(unexpected)[:10]}"
+        )
+    model.to(dtype=kwargs.get("torch_dtype", torch.float32))
+    model.eval()
+    return model
 
 
 def _build_layerwise_vision_export_model(hf_auto_class, pretrained_model_name_or_path, kwargs):
@@ -4675,6 +4763,26 @@ class QEFFAutoModelForSpeechSeq2Seq(QEFFTransformersBase, MultimodalUtilityMixin
     _pytorch_transforms = [CustomOpsTransform, AwqToMatmulNbitsTransform, GPTQToMatmulNbitsTransform, KVCacheTransform]
     _onnx_transforms = []
 
+    @classmethod
+    @with_replaced_quantizers
+    def from_pretrained(cls, pretrained_model_name_or_path: str, *args, **kwargs):
+        enable_proxy = kwargs.pop("enable_proxy", False)
+
+        if kwargs.get("attn_implementation", None) not in {None, "eager"}:
+            logger.warning('Updating attn_implementation="eager"')
+        if kwargs.get("low_cpu_mem_usage", None):
+            logger.warning("Updating low_cpu_mem_usage=False")
+
+        kwargs.update({"attn_implementation": "eager", "low_cpu_mem_usage": False})
+        _resolve_torch_dtype(kwargs)
+
+        model = _load_qwen3_asr_native_checkpoint(pretrained_model_name_or_path, kwargs)
+        if model is None:
+            model = cls._hf_auto_class.from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+        kwargs.update({"enable_proxy": enable_proxy} if enable_proxy else {})
+        return cls(model, pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
+
     def __init__(self, model: nn.Module, **kwargs):
         """
         Initialize a QEFFAutoModelForSpeechSeq2Seq instance.
@@ -4834,6 +4942,7 @@ class QEFFAutoModelForSpeechSeq2Seq(QEFFTransformersBase, MultimodalUtilityMixin
             batch_size,
             encoder_ctx_len,
             ctx_len,
+            prefill_seq_len=prefill_seq_len,
             **compiler_options,
         )
 
@@ -4928,24 +5037,82 @@ class QEFFAutoModelForSpeechSeq2Seq(QEFFTransformersBase, MultimodalUtilityMixin
             self.qpc_session = QAICInferenceSession(str(self.qpc_path), device_ids)
             self.batch_size = self.qpc_session.bindings[0].dims[0]
 
-        inputs["input_features"] = inputs["input_features"].numpy().astype(np.float16)
+        feature_len = inputs["input_features"].shape[2]
+        input_ids_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else 1
+        for allowed_shape in self.qpc_session.allowed_shapes:
+            feature_idx = self.qpc_session.binding_index_map.get("input_features")
+            input_ids_idx = self.qpc_session.binding_index_map.get("input_ids")
+            if feature_idx is None or input_ids_idx is None:
+                continue
+            allowed_feature_len = allowed_shape[feature_idx][1][2]
+            allowed_input_ids_len = allowed_shape[input_ids_idx][1][1]
+            if allowed_feature_len >= feature_len and allowed_input_ids_len >= input_ids_len:
+                if allowed_feature_len > feature_len:
+                    pad = allowed_feature_len - feature_len
+                    inputs["input_features"] = torch.nn.functional.pad(inputs["input_features"], (0, pad), "constant", 0)
+                    inputs["input_features_mask"] = torch.nn.functional.pad(
+                        inputs["input_features_mask"], (0, pad), "constant", 0
+                    )
+                break
 
-        # add start token id and initial position ids to inputs
-        seq_len = 1
-        inputs["input_ids"] = (
-            torch.ones((self.batch_size, seq_len), dtype=torch.int64) * self.model.config.decoder_start_token_id
-        ).numpy()
-        inputs["position_ids"] = (
-            torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(self.batch_size, 1).numpy()
-        )
+        inputs["input_features"] = inputs["input_features"].numpy().astype(np.float16)
+        if "input_features_mask" in inputs and hasattr(inputs["input_features_mask"], "numpy"):
+            inputs["input_features_mask"] = inputs["input_features_mask"].numpy().astype(np.int64)
+
+        # add prompt/start token ids and initial position ids to inputs
+        if "input_ids" in inputs:
+            seq_len = inputs["input_ids"].shape[1]
+            inputs["input_ids"] = inputs["input_ids"].numpy().astype(np.int64)
+        else:
+            seq_len = 1
+            eos_token_id = getattr(
+                self.model.config,
+                "eos_token_id",
+                getattr(getattr(self.model.config, "text_config", None), "eos_token_id", None),
+            )
+            if isinstance(eos_token_id, (list, tuple)):
+                eos_token_id = eos_token_id[0]
+            decoder_start_token_id = getattr(
+                self.model.config,
+                "decoder_start_token_id",
+                getattr(getattr(self.model.config, "text_config", None), "decoder_start_token_id", None),
+            )
+            if decoder_start_token_id is None:
+                decoder_start_token_id = eos_token_id
+            inputs["input_ids"] = (torch.ones((self.batch_size, seq_len), dtype=torch.int64) * decoder_start_token_id).numpy()
+        inputs["position_ids"] = torch.arange(seq_len, dtype=torch.int64).view(1, seq_len).repeat(self.batch_size, 1).numpy()
 
         self.qpc_session.skip_buffers(
             [x for x in self.qpc_session.input_names + self.qpc_session.output_names if is_retained_state_name(x)]
         )
 
-        outputs = {
-            "logits": np.random.randn(self.batch_size, 1, self.model.config.vocab_size).astype(np.float32),
-        }
+        outputs = {}
+        for allowed_shape in self.qpc_session.allowed_shapes:
+            if all(
+                name not in self.qpc_session.binding_index_map
+                or list(value.shape) == allowed_shape[self.qpc_session.binding_index_map[name]][1]
+                for name, value in inputs.items()
+            ):
+                for output_name in self.qpc_session.output_names:
+                    if is_retained_state_name(output_name):
+                        continue
+                    output_index = self.qpc_session.binding_index_map[output_name]
+                    output_dtype = self.qpc_session.aic_to_np_dtype_mapping[
+                        self.qpc_session.bindings[output_index].type
+                    ]
+                    outputs[output_name] = np.zeros(allowed_shape[output_index][1], dtype=output_dtype)
+                break
+        if not outputs:
+            vocab_size = getattr(
+                self.model.config,
+                "vocab_size",
+                getattr(getattr(self.model.config, "text_config", None), "vocab_size", None),
+            )
+            if vocab_size is None:
+                raise AttributeError("SpeechSeq2Seq model config must define vocab_size or text_config.vocab_size")
+            outputs = {
+                "logits": np.random.randn(self.batch_size, 1, vocab_size).astype(np.float32),
+            }
         self.qpc_session.set_buffers(outputs)
 
         # encoder run
@@ -4956,8 +5123,22 @@ class QEFFAutoModelForSpeechSeq2Seq(QEFFTransformersBase, MultimodalUtilityMixin
             write_io_files(inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
 
         # array to hold generated tokens
-        generated_ids = np.full((self.batch_size, generation_len + 1), self.model.config.eos_token_id)
-        generated_ids[:, 0] = [self.model.config.decoder_start_token_id]
+        eos_token_id = getattr(
+            self.model.config,
+            "eos_token_id",
+            getattr(getattr(self.model.config, "text_config", None), "eos_token_id", None),
+        )
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_id = eos_token_id[0]
+        decoder_start_token_id = getattr(
+            self.model.config,
+            "decoder_start_token_id",
+            getattr(getattr(self.model.config, "text_config", None), "decoder_start_token_id", None),
+        )
+        if decoder_start_token_id is None:
+            decoder_start_token_id = eos_token_id
+        generated_ids = np.full((self.batch_size, generation_len + 1), eos_token_id)
+        generated_ids[:, 0] = [decoder_start_token_id]
         logits = outputs["logits"]
         next_token = logits.argmax(-1)
         generated_ids[:, 1] = next_token.squeeze(1)
@@ -4965,7 +5146,37 @@ class QEFFAutoModelForSpeechSeq2Seq(QEFFTransformersBase, MultimodalUtilityMixin
         if streamer:
             streamer.put(next_token)
 
-        inputs["input_features"] = np.zeros((self.batch_size, self.model.config.num_mel_bins, 1)).astype(np.float16)
+        num_mel_bins = getattr(
+            self.model.config,
+            "num_mel_bins",
+            getattr(getattr(self.model.config, "audio_config", None), "num_mel_bins", None),
+        )
+        if num_mel_bins is None:
+            raise AttributeError("SpeechSeq2Seq model config must define num_mel_bins or audio_config.num_mel_bins")
+        decode_feature_len = getattr(getattr(self.model.config, "audio_config", None), "n_window", 0) * 2
+        decode_feature_len = decode_feature_len or 1
+        inputs["input_features"] = np.zeros((self.batch_size, num_mel_bins, decode_feature_len)).astype(np.float16)
+        inputs["input_features_mask"] = np.ones((self.batch_size, decode_feature_len), dtype=np.int64)
+        inputs["input_ids"] = next_token
+        inputs["position_ids"] = np.full((self.batch_size, 1), seq_len, dtype=np.int64)
+        outputs = {}
+        for allowed_shape in self.qpc_session.allowed_shapes:
+            if all(
+                name not in self.qpc_session.binding_index_map
+                or list(value.shape) == allowed_shape[self.qpc_session.binding_index_map[name]][1]
+                for name, value in inputs.items()
+            ):
+                for output_name in self.qpc_session.output_names:
+                    if is_retained_state_name(output_name):
+                        continue
+                    output_index = self.qpc_session.binding_index_map[output_name]
+                    output_dtype = self.qpc_session.aic_to_np_dtype_mapping[
+                        self.qpc_session.bindings[output_index].type
+                    ]
+                    outputs[output_name] = np.zeros(allowed_shape[output_index][1], dtype=output_dtype)
+                break
+        if outputs:
+            self.qpc_session.set_buffers(outputs)
 
         loop_start = perf_counter()
         for num_tokens in range(generation_len):
@@ -4978,7 +5189,7 @@ class QEFFAutoModelForSpeechSeq2Seq(QEFFTransformersBase, MultimodalUtilityMixin
             next_token = logits.argmax(-1)
             generated_ids[:, num_tokens + 1] = next_token.squeeze(1)
 
-            if next_token[0][0] == self.model.config.eos_token_id:
+            if next_token[0][0] == eos_token_id:
                 break
 
             inputs["input_ids"] = next_token

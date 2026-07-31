@@ -27,6 +27,7 @@ For the complete list of supported audio models, see the [Validated Models - Aud
 Popular models include:
 - Whisper (tiny, base, small, medium, large, large-v3-turbo)
 - Wav2Vec2 (base-960h)
+- Qwen3-ASR (`Qwen/Qwen3-ASR-0.6B`)
 
 ## Available Examples
 
@@ -79,6 +80,27 @@ This example:
 - Uses Wav2Vec2-base-960h model by default
 - Compiles and runs inference on Cloud AI 100
 - Outputs the recognized text
+
+### qwen3_asr_parity.py
+Numerical stage comparison for Qwen3-ASR prefill logits.
+
+**Usage:**
+```bash
+python qwen3_asr_parity.py \
+    --model-name Qwen/Qwen3-ASR-0.6B \
+    --onnx-path /path/to/Qwen3ASRForConditionalGeneration.onnx \
+    --qpc-io-dir /path/to/io_dir \
+    --ctx-len 180 \
+    --output qwen3_asr_samples.md
+```
+
+This example:
+- Loads the LibriSpeech dummy sample and Qwen3-ASR chat prompt
+- Aligns audio features to `n_window * 2` chunks and trims audio placeholders
+- Prints top logits for HF, QEff, QPC, and ORT when the exported graph can be executed with the prepared inputs
+- Reports edge metrics on raw pre-sampling logits
+
+Top-token agreement or coherent transcripts are useful diagnostics only. Qwen3-ASR correctness still requires raw-logit parity across the required HF, QEff, ORT, and QPC edges.
 
 ## Documentation
 

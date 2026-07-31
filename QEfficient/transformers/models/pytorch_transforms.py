@@ -219,6 +219,8 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
 )
 from transformers.models.qwen3_asr.modeling_qwen3_asr import (
+    Qwen3ASRAudioAttention,
+    Qwen3ASREncoder,
     Qwen3ASRForConditionalGeneration,
     Qwen3ASRModel,
 )
@@ -559,6 +561,8 @@ from QEfficient.transformers.models.qwen3.modeling_qwen3 import (
     QEffQwen3Model,
 )
 from QEfficient.transformers.models.qwen3_asr.modeling_qwen3_asr import (
+    QEffQwen3ASRAudioAttention,
+    QEffQwen3ASREncoder,
     QEffQwen3ASRForConditionalGeneration,
     QEffQwen3ASRModel,
 )
@@ -869,6 +873,8 @@ class KVCacheTransform(ModuleMappingTransform):
         Qwen3Model: QEffQwen3Model,
         Qwen3ForCausalLM: QEffQwen3ForCausalLM,
         # Qwen3-ASR
+        Qwen3ASRAudioAttention: QEffQwen3ASRAudioAttention,
+        Qwen3ASREncoder: QEffQwen3ASREncoder,
         Qwen3ASRForConditionalGeneration: QEffQwen3ASRForConditionalGeneration,
         Qwen3ASRModel: QEffQwen3ASRModel,
         # Qwen3_5

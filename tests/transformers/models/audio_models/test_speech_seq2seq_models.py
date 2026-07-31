@@ -15,7 +15,7 @@ import onnxruntime
 import pytest
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+from transformers import AutoConfig, AutoModelForSpeechSeq2Seq, AutoProcessor
 
 from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForSpeechSeq2Seq
 from QEfficient.transformers.quantizers.auto import replace_transformers_quantizers
@@ -49,6 +49,9 @@ def load_seq2seq_model(model_config):
         "attn_implementation": "eager",
         "low_cpu_mem_usage": False,
     }
+    config = AutoConfig.from_pretrained(model_path)
+    if config.model_type == "qwen3_asr":
+        kwargs.pop("use_cache")
     n_layer = model_config.get("n_layer", -1)
     if n_layer != -1:
         kwargs["num_hidden_layers"] = n_layer
