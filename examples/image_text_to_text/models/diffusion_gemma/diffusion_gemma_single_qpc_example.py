@@ -20,7 +20,9 @@ The runtime tensor ``is_encode`` selects behavior:
 For one output canvas, the encoder runs once. Decoder outputs are not fed back
 to the encoder during denoising; only the canvas/self-conditioning state changes
 across denoising iterations. Multi-canvas continuation requires a separate
-commit pass after the accepted canvas is final.
+commit pass after the accepted canvas is final. This example supports that
+outer loop via ``--max-new-tokens``: denoise one canvas, commit it into the
+retained encoder KV, then denoise the next canvas.
 """
 
 import os
@@ -62,10 +64,22 @@ parser = argparse.ArgumentParser(description="Run DiffusionGemma single-QPC sing
 parser.add_argument("--text-only", action="store_true", help="Run a prompt with no image tokens.")
 parser.add_argument("--prompt", default=None, help="Override the default image or text-only prompt.")
 parser.add_argument("--seed", type=int, default=1234, help="Seed for the diffusion sampler. Use --seed -1 for unseeded.")
+parser.add_argument("--ctx-len", type=int, default=ctx_len, help="Compiled retained-KV context length.")
+parser.add_argument("--canvas-length", type=int, default=canvas_length, help="Denoising canvas length per block.")
+parser.add_argument("--max-new-tokens", type=int, default=canvas_length, help="Total generated tokens across canvases.")
+parser.add_argument("--diffusion-steps", type=int, default=diffusion_steps, help="Maximum denoising steps per canvas.")
 parser.add_argument("--verbose-steps", action="store_true", help="Decode and print a preview after every diffusion step.")
 args = parser.parse_args()
 if args.seed >= 0:
     np.random.seed(args.seed)
+ctx_len = args.ctx_len
+canvas_length = args.canvas_length
+diffusion_steps = args.diffusion_steps
+max_new_tokens = args.max_new_tokens
+if max_new_tokens <= 0:
+    raise ValueError("--max-new-tokens must be positive")
+if canvas_length <= 0:
+    raise ValueError("--canvas-length must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +168,7 @@ def _write_unified_accum_npi(onnx_path):
     return path
 
 
-def _clean_diffusion_text(text):
+def _clean_diffusion_text(text, truncate_first_sentence=True):
     text = text.replace("\ufffd", " ").strip()
     text = re.sub(r"^\s*(thought\s*)+", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\s+", " ", text)
@@ -162,8 +176,8 @@ def _clean_diffusion_text(text):
     text = re.sub(r"\bfulling shot\b", "full shot", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(light|dark)\s+(blue|green|teal)ing\b", r"\1 \2", text, flags=re.IGNORECASE)
     text = re.sub(r"\.(?:of|Of)\b.*$", ".", text)
-    match = re.search(r"(.{12,}?[.!?])", text)
-    if match:
+    match = re.search(r"(.{12,}?[.!?])", text) if truncate_first_sentence else None
+    if truncate_first_sentence and match:
         text = match.group(1)
     return text.strip(" \n\t\r\"'")
 
@@ -212,6 +226,7 @@ hf_model = AutoModelForImageTextToText.from_pretrained(
 )
 qeff_model = QEffDiffusionGemmaForBlockDiffusion.__new__(QEffDiffusionGemmaForBlockDiffusion)
 qeff_model.__dict__.update(hf_model.__dict__)
+qeff_model.config.canvas_length = canvas_length
 
 print(f"Compiling unified single-QPC ({num_devices} devices, {num_cores} cores)...")
 t0 = time.time()
@@ -318,64 +333,126 @@ print(f"\nTTFT: {ttft:.2f}s ({len([n for n in prefill_out if n.startswith('past_
 
 
 # ---------------------------------------------------------------------------
-# Canvas denoise loop.
+# Canvas denoise + optional multi-canvas commit loop.
 # ---------------------------------------------------------------------------
 
-canvas = np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
-new_canvas = canvas.copy()
-canvas_pos = np.arange(seq_len, seq_len + canvas_length, dtype=np.int64).reshape(1, -1)
-accepted_mask = np.zeros((1, canvas_length), dtype=bool)
-sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
 
-entropy_bound, t_max, t_min = 0.1, 0.8, 0.4
-t0 = time.perf_counter()
-for step in range(diffusion_steps):
-    temperature = t_min + (t_max - t_min) * (diffusion_steps - 1 - step) / max(1, diffusion_steps - 1)
-    feed = {
-        "input_ids": input_ids,
-        "position_ids": position_ids,
+def _session_feed(feed):
+    return {k: v for k, v in feed.items() if k in session.input_names}
+
+
+def _denoise_canvas(block_index, cursor):
+    canvas = np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
+    new_canvas = canvas.copy()
+    canvas_pos = np.arange(cursor, cursor + canvas_length, dtype=np.int64).reshape(1, -1)
+    accepted_mask = np.zeros((1, canvas_length), dtype=bool)
+    sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
+
+    entropy_bound, t_max, t_min = 0.1, 0.8, 0.4
+    t0 = time.perf_counter()
+    for step in range(diffusion_steps):
+        temperature = t_min + (t_max - t_min) * (diffusion_steps - 1 - step) / max(1, diffusion_steps - 1)
+        out = session.run(_session_feed({
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "vision_embeds": ve,
+            "image_idx": np.array([[0]], dtype=np.int64),
+            "mm_token_type_ids": mm_type_ids,
+            "decoder_input_ids": canvas,
+            "decoder_position_ids": canvas_pos,
+            "self_conditioning_logits": sc,
+            "encoder_attention_mask": enc_attn_mask,
+            "is_encode": np.array([0], dtype=np.int64),
+        }))
+        canvas_logits = out["canvas_logits"].astype(np.float32)
+        sc = canvas_logits
+        lt = canvas_logits / temperature
+        gumbel = -np.log(-np.log(np.random.uniform(size=lt.shape).astype(np.float32) + 1e-20) + 1e-20)
+        denoiser = (lt + gumbel).argmax(-1).astype(np.int64)
+        shifted = lt - lt.max(-1, keepdims=True)
+        log_softmax = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
+        ent = -(np.exp(log_softmax) * log_softmax).sum(-1)[0]
+        order = np.argsort(ent)
+        sel = (np.cumsum(ent[order]) - ent[order]) <= entropy_bound
+        new_acc = np.zeros(canvas_length, dtype=bool)
+        new_acc[order[sel]] = True
+        new_canvas = np.where(new_acc[None, :], denoiser, canvas)
+        accepted_mask = accepted_mask | new_acc[None, :]
+        canvas = np.where(
+            ~accepted_mask,
+            np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
+            new_canvas,
+        )
+        accepted_count = int(accepted_mask.sum())
+        if args.verbose_steps:
+            preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
+            print(
+                f"  block {block_index + 1:2d} step {step + 1:2d} "
+                f"t={temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}"
+            )
+        else:
+            print(f"  block {block_index + 1:2d} step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length}")
+        if accepted_count >= canvas_length:
+            break
+    return new_canvas, step + 1, time.perf_counter() - t0, int(accepted_mask.sum())
+
+
+def _commit_canvas(tokens, cursor):
+    commit_len = tokens.shape[1]
+    if commit_len > prefill_seq_len:
+        raise ValueError(f"Commit length {commit_len} exceeds prefill_seq_len={prefill_seq_len}")
+    commit_input_ids = np.full((1, prefill_seq_len), pad_token_id, dtype=np.int64)
+    commit_input_ids[:, :commit_len] = tokens
+    commit_position_ids = np.full((1, prefill_seq_len), -1, dtype=np.int64)
+    commit_position_ids[:, :commit_len] = np.arange(cursor, cursor + commit_len, dtype=np.int64)
+    commit_mm_type_ids = np.zeros((1, prefill_seq_len), dtype=np.int64)
+    commit_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
+    commit_attn_mask[:, : cursor + commit_len] = 1
+    session.run(_session_feed({
+        "input_ids": commit_input_ids,
+        "position_ids": commit_position_ids,
         "vision_embeds": ve,
         "image_idx": np.array([[0]], dtype=np.int64),
-        "mm_token_type_ids": mm_type_ids,
-        "decoder_input_ids": canvas,
-        "decoder_position_ids": canvas_pos,
-        "self_conditioning_logits": sc,
-        "encoder_attention_mask": enc_attn_mask,
-        "is_encode": np.array([0], dtype=np.int64),
-    }
-    feed = {k: v for k, v in feed.items() if k in session.input_names}
-    out = session.run(feed)
-    canvas_logits = out["canvas_logits"].astype(np.float32)
-    sc = canvas_logits
-    lt = canvas_logits / temperature
-    gumbel = -np.log(-np.log(np.random.uniform(size=lt.shape).astype(np.float32) + 1e-20) + 1e-20)
-    denoiser = (lt + gumbel).argmax(-1).astype(np.int64)
-    shifted = lt - lt.max(-1, keepdims=True)
-    log_softmax = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
-    ent = -(np.exp(log_softmax) * log_softmax).sum(-1)[0]
-    order = np.argsort(ent)
-    sel = (np.cumsum(ent[order]) - ent[order]) <= entropy_bound
-    new_acc = np.zeros(canvas_length, dtype=bool)
-    new_acc[order[sel]] = True
-    new_canvas = np.where(new_acc[None, :], denoiser, canvas)
-    accepted_mask = accepted_mask | new_acc[None, :]
-    canvas = np.where(~accepted_mask,
-                      np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
-                      new_canvas)
-    accepted_count = int(accepted_mask.sum())
-    if args.verbose_steps:
-        preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
-        print(f"  step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}")
-    else:
-        print(f"  step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length}")
-    if accepted_count >= canvas_length:
-        break
-canvas_time = time.perf_counter() - t0
+        "mm_token_type_ids": commit_mm_type_ids,
+        "decoder_input_ids": np.zeros((1, canvas_length), dtype=np.int64),
+        "decoder_position_ids": np.arange(cursor, cursor + canvas_length, dtype=np.int64).reshape(1, -1),
+        "self_conditioning_logits": np.zeros((1, canvas_length, vocab_size), dtype=np.float32),
+        "encoder_attention_mask": commit_attn_mask,
+        "is_encode": np.array([1], dtype=np.int64),
+    }))
+
+
+generated = []
+cursor = seq_len
+total_steps = 0
+total_canvas_time = 0.0
+target_new_tokens = min(max_new_tokens, max(0, ctx_len - seq_len))
+num_blocks = int(np.ceil(target_new_tokens / canvas_length))
+if target_new_tokens < max_new_tokens:
+    print(f"\nWarning: capped generation to {target_new_tokens} tokens because seq_len={seq_len}, ctx_len={ctx_len}.")
+
+for block in range(num_blocks):
+    remaining = target_new_tokens - len(generated) * canvas_length
+    block_tokens, steps_run, canvas_time, accepted_count = _denoise_canvas(block, cursor)
+    if remaining < canvas_length:
+        block_tokens = block_tokens[:, :remaining]
+    generated.append(block_tokens)
+    total_steps += steps_run
+    total_canvas_time += canvas_time
+    cursor += block_tokens.shape[1]
+    print(
+        f"  block {block + 1:2d} done: {steps_run} steps, {canvas_time:.1f}s, "
+        f"accepted={accepted_count}/{canvas_length}, committed={block_tokens.shape[1]}, cursor={cursor}"
+    )
+    if block + 1 < num_blocks:
+        _commit_canvas(block_tokens, cursor - block_tokens.shape[1])
+
 session.deactivate()
 
-output_text = _clean_diffusion_text(processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True))
+all_tokens = np.concatenate(generated, axis=1) if generated else np.zeros((1, 0), dtype=np.int64)
+raw_output = processor.tokenizer.decode(all_tokens[0].tolist(), skip_special_tokens=True)
+output_text = _clean_diffusion_text(raw_output, truncate_first_sentence=(num_blocks == 1))
 
-steps_run = step + 1
-print(f"\nCanvas: {steps_run} steps, {canvas_time:.1f}s, "
-      f"{steps_run * canvas_length / canvas_time:.1f} tok/s")
+print(f"\nCanvas: {total_steps} steps across {num_blocks} blocks, {total_canvas_time:.1f}s, "
+      f"{total_steps * canvas_length / total_canvas_time:.1f} tok/s")
 print(f"\nOutput:\n{output_text}")
