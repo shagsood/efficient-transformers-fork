@@ -283,13 +283,19 @@ def _select_output_text(tokenizer, token_candidates):
 config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
-hf_model = AutoModelForImageTextToText.from_pretrained(
-    model_id, config=config, torch_dtype=torch.float32, attn_implementation="eager"
-)
-# Bootstrap the QEff-patched top-level model class.
-qeff_model = QEffDiffusionGemmaForBlockDiffusion.__new__(QEffDiffusionGemmaForBlockDiffusion)
-qeff_model.__dict__.update(hf_model.__dict__)
-qeff_model.config.canvas_length = canvas_length
+
+def _load_qeff_model():
+    hf_model = AutoModelForImageTextToText.from_pretrained(
+        model_id, config=config, torch_dtype=torch.float32, attn_implementation="eager"
+    )
+    # Bootstrap the QEff-patched top-level model class.
+    qeff_model = QEffDiffusionGemmaForBlockDiffusion.__new__(QEffDiffusionGemmaForBlockDiffusion)
+    qeff_model.__dict__.update(hf_model.__dict__)
+    qeff_model.config.canvas_length = canvas_length
+    return qeff_model
+
+
+qeff_model = _load_qeff_model()
 
 print(f"Compiling encoder-prefill QPC ({num_devices} devices, {num_cores} cores)...")
 t0 = time.time()
@@ -316,6 +322,7 @@ print(f"  encoder QPC: {enc_qpc}  ({time.time() - t0:.0f}s)")
 decode_mode = "fused sampler" if args.fuse_sampler else "logit-feedback reference"
 print(f"Compiling canvas-decode QPC ({decode_mode} path)...")
 t0 = time.time()
+qeff_model = _load_qeff_model()
 dec = _CanvasDecodeQPC(qeff_model, fuse_sampler=args.fuse_sampler, max_top_k=args.max_top_k)
 dec_inputs = dec.model.get_dummy_inputs()
 dec.export(dec_inputs, dec.model.get_output_names(), dec.model.get_onnx_dynamic_axes())
