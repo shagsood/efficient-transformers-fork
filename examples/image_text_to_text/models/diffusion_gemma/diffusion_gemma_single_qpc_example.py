@@ -68,6 +68,8 @@ parser.add_argument("--ctx-len", type=int, default=ctx_len, help="Compiled retai
 parser.add_argument("--canvas-length", type=int, default=canvas_length, help="Denoising canvas length per block.")
 parser.add_argument("--max-new-tokens", type=int, default=canvas_length, help="Total generated tokens across canvases.")
 parser.add_argument("--diffusion-steps", type=int, default=diffusion_steps, help="Maximum denoising steps per canvas.")
+parser.add_argument("--no-stop-on-eos", action="store_true", help="Do not truncate/stop at the first EOS in a canvas.")
+parser.add_argument("--truncate-first-sentence", action="store_true", help="Return only the first complete sentence.")
 parser.add_argument("--verbose-steps", action="store_true", help="Decode and print a preview after every diffusion step.")
 args = parser.parse_args()
 if args.seed >= 0:
@@ -310,8 +312,8 @@ if vision_embeds is not None:
     ve[:, :vision_embeds.shape[1], :] = vision_embeds.astype(np.float16)
 vocab_size = text_cfg.vocab_size
 canvas_pos = np.arange(seq_len, seq_len + canvas_length, dtype=np.int64).reshape(1, -1)
-enc_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
-enc_attn_mask[:, :seq_len] = 1
+prompt_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
+prompt_attn_mask[:, :seq_len] = 1
 
 t0 = time.perf_counter()
 prefill_out = session.run({
@@ -323,7 +325,7 @@ prefill_out = session.run({
     "decoder_input_ids": np.zeros((1, canvas_length), dtype=np.int64),
     "decoder_position_ids": canvas_pos,
     "self_conditioning_logits": np.zeros((1, canvas_length, vocab_size), dtype=np.float32),
-    "encoder_attention_mask": enc_attn_mask,
+    "encoder_attention_mask": prompt_attn_mask,
     "is_encode": np.array([1], dtype=np.int64),
 })
 ttft = time.perf_counter() - t0
@@ -345,6 +347,8 @@ def _denoise_canvas(block_index, cursor):
     canvas = np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
     new_canvas = canvas.copy()
     canvas_pos = np.arange(cursor, cursor + canvas_length, dtype=np.int64).reshape(1, -1)
+    enc_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
+    enc_attn_mask[:, :cursor] = 1
     accepted_mask = np.zeros((1, canvas_length), dtype=bool)
     sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
 
@@ -422,20 +426,43 @@ def _commit_canvas(tokens, cursor):
     }))
 
 
+eos_token_ids = processor.tokenizer.eos_token_id
+if eos_token_ids is None:
+    eos_token_ids = []
+elif isinstance(eos_token_ids, int):
+    eos_token_ids = [eos_token_ids]
+else:
+    eos_token_ids = list(eos_token_ids)
+
+
+def _finalize_canvas_tokens(tokens):
+    if args.no_stop_on_eos or not eos_token_ids:
+        return tokens, False, -1
+    eos_positions = np.where(np.isin(tokens[0], eos_token_ids))[0]
+    if eos_positions.size == 0:
+        return tokens, False, -1
+    eos_pos = int(eos_positions[0])
+    return tokens[:, : eos_pos + 1], True, eos_pos
+
+
 generated = []
 cursor = seq_len
 total_steps = 0
 total_canvas_time = 0.0
 target_new_tokens = min(max_new_tokens, max(0, ctx_len - seq_len))
+if target_new_tokens <= 0:
+    raise ValueError(f"No generation room: seq_len={seq_len}, ctx_len={ctx_len}. Recompile with larger --ctx-len.")
 num_blocks = int(np.ceil(target_new_tokens / canvas_length))
 if target_new_tokens < max_new_tokens:
     print(f"\nWarning: capped generation to {target_new_tokens} tokens because seq_len={seq_len}, ctx_len={ctx_len}.")
 
 for block in range(num_blocks):
-    remaining = target_new_tokens - len(generated) * canvas_length
+    emitted_tokens = sum(part.shape[1] for part in generated)
+    remaining = target_new_tokens - emitted_tokens
     block_tokens, steps_run, canvas_time, accepted_count = _denoise_canvas(block, cursor)
     if remaining < canvas_length:
         block_tokens = block_tokens[:, :remaining]
+    block_tokens, hit_eos, eos_pos = _finalize_canvas_tokens(block_tokens)
     generated.append(block_tokens)
     total_steps += steps_run
     total_canvas_time += canvas_time
@@ -444,14 +471,17 @@ for block in range(num_blocks):
         f"  block {block + 1:2d} done: {steps_run} steps, {canvas_time:.1f}s, "
         f"accepted={accepted_count}/{canvas_length}, committed={block_tokens.shape[1]}, cursor={cursor}"
     )
-    if block + 1 < num_blocks:
+    if hit_eos:
+        print(f"  EOS at block {block + 1}, offset {eos_pos}; truncating and stopping.")
+        break
+    if block + 1 < num_blocks and block_tokens.shape[1] > 0:
         _commit_canvas(block_tokens, cursor - block_tokens.shape[1])
 
 session.deactivate()
 
 all_tokens = np.concatenate(generated, axis=1) if generated else np.zeros((1, 0), dtype=np.int64)
 raw_output = processor.tokenizer.decode(all_tokens[0].tolist(), skip_special_tokens=True)
-output_text = _clean_diffusion_text(raw_output, truncate_first_sentence=(num_blocks == 1))
+output_text = _clean_diffusion_text(raw_output, truncate_first_sentence=(num_blocks == 1 or args.truncate_first_sentence))
 
 print(f"\nCanvas: {total_steps} steps across {num_blocks} blocks, {total_canvas_time:.1f}s, "
       f"{total_steps * canvas_length / total_canvas_time:.1f} tok/s")

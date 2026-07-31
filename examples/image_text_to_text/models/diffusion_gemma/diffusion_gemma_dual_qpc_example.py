@@ -7,13 +7,17 @@
 
 """DiffusionGemma dual-QPC example on Cloud AI 100.
 
-DiffusionGemma is a non-autoregressive block-diffusion VLM: the encoder does a
-one-shot prefill over the prompt (+ vision), then the decoder iterates a fixed
-canvas of `canvas_length` tokens over N diffusion steps, denoising the canvas
-via an entropy-bound sampler. `QEFFAutoModelForImageTextToText.generate()` does
-not apply; this example drives the two exported QPCs (encoder-prefill and
-canvas-decode) via `QAICInferenceSession` directly, with the runner host-copying
-encoder past_*_out into decoder past_*.{i} inputs between diffusion steps.
+DiffusionGemma is a block-diffusion VLM: the encoder prefills prompt (+ vision)
+KV, then the decoder denoises fixed-size canvases. For generation longer than
+one canvas, this runner follows HF's block-autoregressive loop: denoise one
+canvas, commit the final canvas through the encoder to append KV, then denoise
+the next canvas.
+
+`QEFFAutoModelForImageTextToText.generate()` does not apply; this example drives
+the two exported QPCs (encoder-prefill/commit and canvas-decode) via
+`QAICInferenceSession` directly. Use `--encoder-devices` and `--decoder-devices`
+to keep the two QPCs resident on separate TS4 groups and avoid deactivate/load
+thrash. KV is still copied through host at canvas boundaries.
 
 For the single-QPC (unified) variant, see diffusion_gemma_single_qpc_example.py.
 """
@@ -45,7 +49,8 @@ canvas_length = 256
 diffusion_steps = 48
 num_cores = 16
 num_devices = 4
-device_ids = [int(x) for x in os.environ.get("DG", "4,5,6,7").split(",")]
+encoder_device_ids = [int(x) for x in os.environ.get("DG_ENC", os.environ.get("DG", "4,5,6,7")).split(",")]
+decoder_device_ids = [int(x) for x in os.environ.get("DG_DEC", os.environ.get("DG", "4,5,6,7")).split(",")]
 image_url = (
     "https://huggingface.co/datasets/huggingface/documentation-images"
     "/resolve/main/transformers/tasks/car.jpg"
@@ -59,10 +64,33 @@ parser.add_argument("--prompt", default=None, help="Override the default image o
 parser.add_argument("--seed", type=int, default=1234, help="Seed for the diffusion sampler. Use --seed -1 for the unseeded path.")
 parser.add_argument("--fuse-sampler", action="store_true", help="Run the fused on-device sampler path.")
 parser.add_argument("--max-top-k", type=int, default=64, help="Top-k used by the fused sampler.")
+parser.add_argument("--ctx-len", type=int, default=ctx_len, help="Compiled retained-KV context length.")
+parser.add_argument("--canvas-length", type=int, default=canvas_length, help="Denoising canvas length per block.")
+parser.add_argument("--max-new-tokens", type=int, default=canvas_length, help="Total generated tokens across canvases.")
+parser.add_argument("--diffusion-steps", type=int, default=diffusion_steps, help="Maximum denoising steps per canvas.")
+parser.add_argument("--encoder-devices", default=None, help="Comma-separated encoder QPC device IDs. Defaults to DG_ENC or DG.")
+parser.add_argument("--decoder-devices", default=None, help="Comma-separated decoder QPC device IDs. Defaults to DG_DEC or DG.")
+parser.add_argument("--no-stop-on-eos", action="store_true", help="Do not truncate/stop at the first EOS in a canvas.")
+parser.add_argument("--truncate-first-sentence", action="store_true", help="Return only the first complete sentence.")
 parser.add_argument("--verbose-steps", action="store_true", help="Decode and print a preview after every diffusion step.")
 args = parser.parse_args()
 if args.seed >= 0:
     np.random.seed(args.seed)
+ctx_len = args.ctx_len
+canvas_length = args.canvas_length
+diffusion_steps = args.diffusion_steps
+max_new_tokens = args.max_new_tokens
+if args.encoder_devices:
+    encoder_device_ids = [int(x) for x in args.encoder_devices.split(",")]
+if args.decoder_devices:
+    decoder_device_ids = [int(x) for x in args.decoder_devices.split(",")]
+num_devices = len(decoder_device_ids)
+if len(encoder_device_ids) != len(decoder_device_ids):
+    raise ValueError("--encoder-devices and --decoder-devices must have the same device count for matching TS specs.")
+if max_new_tokens <= 0:
+    raise ValueError("--max-new-tokens must be positive")
+if canvas_length <= 0:
+    raise ValueError("--canvas-length must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +244,7 @@ def _vision_embeds_cpu(processor, text_model, vision_inputs):
     return vision_embeds
 
 
-def _clean_diffusion_text(text):
+def _clean_diffusion_text(text, truncate_first_sentence=True):
     text = text.replace("\ufffd", " ").strip()
     text = re.sub(r"^\s*(thought\s*)+", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\s+", " ", text)
@@ -224,8 +252,8 @@ def _clean_diffusion_text(text):
     text = re.sub(r"\bfulling shot\b", "full shot", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(light|dark)\s+(blue|green|teal)ing\b", r"\1 \2", text, flags=re.IGNORECASE)
     text = re.sub(r"\.(?:of|Of)\b.*$", ".", text)
-    match = re.search(r"(.{12,}?[.!?])", text)
-    if match:
+    match = re.search(r"(.{12,}?[.!?])", text) if truncate_first_sentence else None
+    if truncate_first_sentence and match:
         text = match.group(1)
     return text.strip(" \n\t\r\"'")
 
@@ -261,6 +289,7 @@ hf_model = AutoModelForImageTextToText.from_pretrained(
 # Bootstrap the QEff-patched top-level model class.
 qeff_model = QEffDiffusionGemmaForBlockDiffusion.__new__(QEffDiffusionGemmaForBlockDiffusion)
 qeff_model.__dict__.update(hf_model.__dict__)
+qeff_model.config.canvas_length = canvas_length
 
 print(f"Compiling encoder-prefill QPC ({num_devices} devices, {num_cores} cores)...")
 t0 = time.time()
@@ -362,96 +391,187 @@ input_ids = np.pad(input_ids, ((0, 0), (0, pad)), constant_values=pad_token_id)
 position_ids = np.pad(position_ids, ((0, 0), (0, pad)), constant_values=-1)
 mm_type_ids = np.pad(mm_type_ids, ((0, 0), (0, pad)))
 
-enc_session = QAICInferenceSession(str(enc_qpc), device_ids)
+enc_session = QAICInferenceSession(str(enc_qpc), encoder_device_ids)
 ve_dims = next(tuple(b.dims) for b in enc_session.bindings if b.name == "vision_embeds")
 ve = np.zeros(ve_dims, dtype=np.float16)
 if vision_embeds is not None:
     ve[:, :vision_embeds.shape[1], :] = vision_embeds.astype(np.float16)
 
+
+def _session_feed(session, feed):
+    return {k: v for k, v in feed.items() if k in session.input_names}
+
+
+def _run_encoder_commit(tokens, token_position_ids, token_mm_type_ids, past=None):
+    feed = {
+        "input_ids": tokens,
+        "position_ids": token_position_ids,
+        "vision_embeds": ve,
+        "image_idx": np.array([[0]], dtype=np.int64),
+        "mm_token_type_ids": token_mm_type_ids,
+    }
+    if past:
+        feed.update(past)
+    out = enc_session.run(_session_feed(enc_session, feed))
+    return {n[:-len("_out")]: v for n, v in out.items() if n.startswith("past_") and n.endswith("_out")}
+
+
 t0 = time.perf_counter()
-enc_out = enc_session.run({
-    "input_ids": input_ids,
-    "position_ids": position_ids,
-    "vision_embeds": ve,
-    "image_idx": np.array([[0]], dtype=np.int64),
-    "mm_token_type_ids": mm_type_ids,
-})
+kv_host = _run_encoder_commit(input_ids, position_ids, mm_type_ids)
 ttft = time.perf_counter() - t0
-kv_host = {n[:-len("_out")]: v for n, v in enc_out.items() if n.startswith("past_") and n.endswith("_out")}
-enc_session.deactivate()
 print(f"\nTTFT: {ttft:.2f}s ({len(kv_host)} KV buffers captured)")
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: canvas denoise (entropy-bound sampler on host).
+# Phase 2: canvas denoise + optional multi-canvas commit loop.
 # ---------------------------------------------------------------------------
 
 vocab_size = text_cfg.vocab_size
-canvas = np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
-new_canvas = canvas.copy()
-canvas_pos = np.arange(seq_len, seq_len + canvas_length, dtype=np.int64).reshape(1, -1)
-accepted_mask = np.zeros((1, canvas_length), dtype=bool)
-sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
-prev_tokens = canvas.copy()
-enc_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
-enc_attn_mask[:, :seq_len] = 1
-
-dec_session = QAICInferenceSession(str(dec_qpc), device_ids)
-const_feed = {"decoder_position_ids": canvas_pos, "encoder_attention_mask": enc_attn_mask, **kv_host}
-dec_session.set_buffers({k: v for k, v in const_feed.items() if k in dec_session.input_names})
+dec_session = QAICInferenceSession(str(dec_qpc), decoder_device_ids)
 
 entropy_bound, t_max, t_min = 0.1, 0.8, 0.4
-t0 = time.perf_counter()
-for step in range(diffusion_steps):
-    temperature = t_min + (t_max - t_min) * (diffusion_steps - 1 - step) / max(1, diffusion_steps - 1)
-    if args.fuse_sampler:
-        random_numbers = np.random.uniform(
-            low=0.0,
-            high=1.0,
-            size=(1, canvas_length, args.max_top_k),
-        ).astype(np.float32)
-        out = dec_session.run({
-            "decoder_input_ids": canvas,
-            "temperature": np.array([[[temperature]]], dtype=np.float32),
-            "random_numbers": random_numbers,
-            "prev_tokens": prev_tokens,
-        })
-        denoiser = out["denoiser_tokens"].astype(np.int64)
-        ent = out["token_entropy"].astype(np.float32)[0]
-    else:
-        out = dec_session.run({"decoder_input_ids": canvas, "self_conditioning_logits": sc})
-        canvas_logits = out["canvas_logits"].astype(np.float32)
-        sc = canvas_logits
-        lt = canvas_logits / temperature
-        gumbel = -np.log(-np.log(np.random.uniform(size=lt.shape).astype(np.float32) + 1e-20) + 1e-20)
-        denoiser = (lt + gumbel).argmax(-1).astype(np.int64)
-        shifted = lt - lt.max(-1, keepdims=True)
-        log_softmax = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
-        ent = -(np.exp(log_softmax) * log_softmax).sum(-1)[0]
-    order = np.argsort(ent)
-    sel = (np.cumsum(ent[order]) - ent[order]) <= entropy_bound
-    new_acc = np.zeros(canvas_length, dtype=bool)
-    new_acc[order[sel]] = True
-    new_canvas = np.where(new_acc[None, :], denoiser, canvas)
-    accepted_mask = accepted_mask | new_acc[None, :]
-    canvas = np.where(~accepted_mask,
-                      np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
-                      new_canvas)
-    prev_tokens = denoiser.copy() if args.fuse_sampler else new_canvas.copy()
-    accepted_count = int(accepted_mask.sum())
-    if args.verbose_steps:
-        preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
-        print(f"  step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}")
-    else:
-        print(f"  step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length}")
-    if accepted_count >= canvas_length:
+
+
+def _denoise_canvas(block_index, cursor, past):
+    canvas = np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
+    new_canvas = canvas.copy()
+    prev_tokens = canvas.copy()
+    accepted_mask = np.zeros((1, canvas_length), dtype=bool)
+    sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
+    canvas_pos = np.arange(cursor, cursor + canvas_length, dtype=np.int64).reshape(1, -1)
+    enc_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
+    enc_attn_mask[:, :cursor] = 1
+    const_feed = {"decoder_position_ids": canvas_pos, "encoder_attention_mask": enc_attn_mask, **past}
+    dec_session.set_buffers(_session_feed(dec_session, const_feed))
+
+    t0 = time.perf_counter()
+    for step in range(diffusion_steps):
+        temperature = t_min + (t_max - t_min) * (diffusion_steps - 1 - step) / max(1, diffusion_steps - 1)
+        if args.fuse_sampler:
+            random_numbers = np.random.uniform(
+                low=0.0,
+                high=1.0,
+                size=(1, canvas_length, args.max_top_k),
+            ).astype(np.float32)
+            out = dec_session.run(_session_feed(dec_session, {
+                "decoder_input_ids": canvas,
+                "temperature": np.array([[[temperature]]], dtype=np.float32),
+                "random_numbers": random_numbers,
+                "prev_tokens": prev_tokens,
+            }))
+            denoiser = out["denoiser_tokens"].astype(np.int64)
+            ent = out["token_entropy"].astype(np.float32)[0]
+        else:
+            out = dec_session.run(_session_feed(dec_session, {
+                "decoder_input_ids": canvas,
+                "self_conditioning_logits": sc,
+            }))
+            canvas_logits = out["canvas_logits"].astype(np.float32)
+            sc = canvas_logits
+            lt = canvas_logits / temperature
+            gumbel = -np.log(-np.log(np.random.uniform(size=lt.shape).astype(np.float32) + 1e-20) + 1e-20)
+            denoiser = (lt + gumbel).argmax(-1).astype(np.int64)
+            shifted = lt - lt.max(-1, keepdims=True)
+            log_softmax = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
+            ent = -(np.exp(log_softmax) * log_softmax).sum(-1)[0]
+        order = np.argsort(ent)
+        sel = (np.cumsum(ent[order]) - ent[order]) <= entropy_bound
+        new_acc = np.zeros(canvas_length, dtype=bool)
+        new_acc[order[sel]] = True
+        new_canvas = np.where(new_acc[None, :], denoiser, canvas)
+        accepted_mask = accepted_mask | new_acc[None, :]
+        canvas = np.where(
+            ~accepted_mask,
+            np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
+            new_canvas,
+        )
+        prev_tokens = denoiser.copy() if args.fuse_sampler else new_canvas.copy()
+        accepted_count = int(accepted_mask.sum())
+        if args.verbose_steps:
+            preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
+            print(
+                f"  block {block_index + 1:2d} step {step + 1:2d} "
+                f"t={temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}"
+            )
+        else:
+            print(f"  block {block_index + 1:2d} step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length}")
+        if accepted_count >= canvas_length:
+            break
+    return new_canvas, step + 1, time.perf_counter() - t0, int(accepted_mask.sum())
+
+
+def _pad_commit_inputs(tokens, cursor):
+    commit_len = tokens.shape[1]
+    if commit_len > prefill_seq_len:
+        raise ValueError(f"Commit length {commit_len} exceeds prefill_seq_len={prefill_seq_len}")
+    commit_input_ids = np.full((1, prefill_seq_len), pad_token_id, dtype=np.int64)
+    commit_input_ids[:, :commit_len] = tokens
+    commit_position_ids = np.full((1, prefill_seq_len), -1, dtype=np.int64)
+    commit_position_ids[:, :commit_len] = np.arange(cursor, cursor + commit_len, dtype=np.int64)
+    commit_mm_type_ids = np.zeros((1, prefill_seq_len), dtype=np.int64)
+    return commit_input_ids, commit_position_ids, commit_mm_type_ids
+
+
+eos_token_ids = processor.tokenizer.eos_token_id
+if eos_token_ids is None:
+    eos_token_ids = []
+elif isinstance(eos_token_ids, int):
+    eos_token_ids = [eos_token_ids]
+else:
+    eos_token_ids = list(eos_token_ids)
+
+
+def _finalize_canvas_tokens(tokens):
+    if args.no_stop_on_eos or not eos_token_ids:
+        return tokens, False, -1
+    eos_positions = np.where(np.isin(tokens[0], eos_token_ids))[0]
+    if eos_positions.size == 0:
+        return tokens, False, -1
+    eos_pos = int(eos_positions[0])
+    return tokens[:, : eos_pos + 1], True, eos_pos
+
+
+generated = []
+cursor = seq_len
+total_steps = 0
+total_canvas_time = 0.0
+target_new_tokens = min(max_new_tokens, max(0, ctx_len - seq_len))
+if target_new_tokens <= 0:
+    raise ValueError(f"No generation room: seq_len={seq_len}, ctx_len={ctx_len}. Recompile with larger --ctx-len.")
+num_blocks = int(np.ceil(target_new_tokens / canvas_length))
+if target_new_tokens < max_new_tokens:
+    print(f"\nWarning: capped generation to {target_new_tokens} tokens because seq_len={seq_len}, ctx_len={ctx_len}.")
+
+for block in range(num_blocks):
+    emitted_tokens = sum(part.shape[1] for part in generated)
+    remaining = target_new_tokens - emitted_tokens
+    block_tokens, steps_run, canvas_time, accepted_count = _denoise_canvas(block, cursor, kv_host)
+    if remaining < canvas_length:
+        block_tokens = block_tokens[:, :remaining]
+    block_tokens, hit_eos, eos_pos = _finalize_canvas_tokens(block_tokens)
+    generated.append(block_tokens)
+    total_steps += steps_run
+    total_canvas_time += canvas_time
+    old_cursor = cursor
+    cursor += block_tokens.shape[1]
+    print(
+        f"  block {block + 1:2d} done: {steps_run} steps, {canvas_time:.1f}s, "
+        f"accepted={accepted_count}/{canvas_length}, committed={block_tokens.shape[1]}, cursor={cursor}"
+    )
+    if hit_eos:
+        print(f"  EOS at block {block + 1}, offset {eos_pos}; truncating and stopping.")
         break
-canvas_time = time.perf_counter() - t0
+    if block + 1 < num_blocks and block_tokens.shape[1] > 0:
+        commit_inputs = _pad_commit_inputs(block_tokens, old_cursor)
+        kv_host = _run_encoder_commit(*commit_inputs, past=kv_host)
+
 dec_session.deactivate()
+enc_session.deactivate()
 
-output_text = _select_output_text(processor.tokenizer, [new_canvas])
+all_tokens = np.concatenate(generated, axis=1) if generated else np.zeros((1, 0), dtype=np.int64)
+raw_output = processor.tokenizer.decode(all_tokens[0].tolist(), skip_special_tokens=True)
+output_text = _clean_diffusion_text(raw_output, truncate_first_sentence=(num_blocks == 1 or args.truncate_first_sentence))
 
-steps_run = step + 1
-print(f"\nCanvas: {steps_run} steps, {canvas_time:.1f}s, "
-      f"{steps_run * canvas_length / canvas_time:.1f} tok/s")
+print(f"\nCanvas: {total_steps} steps across {num_blocks} blocks, {total_canvas_time:.1f}s, "
+      f"{total_steps * canvas_length / total_canvas_time:.1f} tok/s")
 print(f"\nOutput:\n{output_text}")
