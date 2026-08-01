@@ -37,10 +37,17 @@ from transformers import (
     AutoModel,
     AutoModelForCausalLM,
     AutoModelForCTC,
+    AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
     AutoModelForSpeechSeq2Seq,
     AutoTokenizer,
     Qwen2Config,
+)
+from transformers.models.inkling.configuration_inkling import (
+    InklingAudioConfig,
+    InklingConfig,
+    InklingTextConfig,
+    InklingVisionConfig,
 )
 from transformers.models.qwen3_asr.configuration_qwen3_asr import Qwen3ASRConfig, Qwen3ASREncoderConfig
 
@@ -49,6 +56,7 @@ from QEfficient.transformers.models.modeling_auto import (
     QEFFAutoModelForCausalLM,
     QEFFAutoModelForCTC,
     QEFFAutoModelForImageTextToText,
+    QEFFAutoModelForMultimodalLM,
     QEFFAutoModelForSequenceClassification,
     QEFFAutoModelForSpeechSeq2Seq,
 )
@@ -99,6 +107,9 @@ VLM_EXPORT_MODEL_IDS = {
     "gemma3": "tiny-random/gemma-3",
     "qwen2_5_vl": "optimum-intel-internal-testing/tiny-random-qwen2.5-vl",
     "internvl2": "optimum-intel-internal-testing/tiny-random-internvl2",
+}
+AUDIO_MULTIMODAL_MODEL_IDS = {
+    "inkling": "thinkingmachines/Inkling-Small",
 }
 TINY_TEXT_EMBEDDING_MODEL_ID = "hf-internal-testing/tiny-random-BertModel"
 TINY_AUDIO_CTC_MODEL_ID = "hf-internal-testing/tiny-random-wav2vec2"
@@ -325,6 +336,55 @@ def _tiny_qwen3_asr_config() -> Qwen3ASRConfig:
         audio_token_id=3,
         pad_token_id=0,
         eos_token_id=2,
+        torch_dtype=torch.float32,
+    )
+
+
+def _tiny_inkling_config() -> InklingConfig:
+    text_config = InklingTextConfig(
+        vocab_size=64,
+        unpadded_vocab_size=64,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        swa_num_attention_heads=2,
+        swa_num_key_value_heads=1,
+        swa_head_dim=8,
+        sliding_window_size=8,
+        d_rel=4,
+        rel_extent=8,
+        conv_kernel_size=4,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        route_scale=1.0,
+        logits_mup_width_multiplier=1.0,
+        layer_types=["hybrid"],
+        mlp_layer_types=["sparse"],
+        max_position_embeddings=32,
+        pad_token_id=0,
+        use_cache=True,
+    )
+    audio_config = InklingAudioConfig(n_mel_bins=4, mel_vocab_size=8, text_hidden_size=16)
+    vision_config = InklingVisionConfig(
+        text_hidden_size=16,
+        patch_size=2,
+        temporal_patch_size=1,
+        num_channels=3,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+    )
+    return InklingConfig(
+        text_config=text_config,
+        audio_config=audio_config,
+        vision_config=vision_config,
+        image_token_id=3,
+        audio_token_id=4,
         torch_dtype=torch.float32,
     )
 
@@ -599,6 +659,92 @@ def test_qwen3_asr_transform_and_tiny_forward():
 
     assert qeff_logits.shape == (1, 1, config.text_config.vocab_size)
     assert torch.allclose(qeff_logits, hf_logits[:, -1:, :], atol=1e-5)
+
+
+@pytest.mark.llm_model
+def test_inkling_multimodal_transform_prefill_and_decode_parity(tmp_path):
+    from QEfficient.transformers.models.inkling.modeling_inkling import (
+        QEffInklingForConditionalGeneration,
+        QEffInklingModel,
+        QEffInklingTextModel,
+    )
+
+    assert AUDIO_MULTIMODAL_MODEL_IDS["inkling"] == "thinkingmachines/Inkling-Small"
+    torch.manual_seed(0)
+    model_hf = AutoModelForMultimodalLM.from_config(_tiny_inkling_config(), **MODEL_KWARGS).eval()
+    torch.manual_seed(0)
+    model_qeff_source = AutoModelForMultimodalLM.from_config(_tiny_inkling_config(), **MODEL_KWARGS).eval()
+    qeff_model = QEFFAutoModelForMultimodalLM(model_qeff_source, kv_offload=False)
+
+    assert isinstance(qeff_model.model, QEffInklingForConditionalGeneration)
+    assert isinstance(qeff_model.model.model, QEffInklingModel)
+    assert isinstance(qeff_model.model.model.language_model, QEffInklingTextModel)
+
+    input_ids = torch.tensor([[5, 3, 4, 4, 6, 7]], dtype=torch.int64)
+    prefill_inputs = {
+        "input_ids": input_ids,
+        "position_ids": torch.arange(input_ids.shape[1], dtype=torch.int64).view(1, -1),
+        "attention_mask": torch.ones_like(input_ids),
+        "pixel_values": torch.zeros((1, 1, 2, 2, 3), dtype=torch.float32),
+        "audio_input_ids": torch.zeros((1, 3, 4), dtype=torch.int64),
+        "audio_input_ids_mask": torch.tensor([[1, 1, 0]], dtype=torch.int64),
+    }
+
+    with torch.no_grad():
+        hf_prefill = model_hf(**prefill_inputs, use_cache=True)
+
+    qeff_inputs = dict(prefill_inputs)
+    qeff_inputs["past_key_values"] = qeff_model.model.get_dummy_inputs(
+        prefill_seq_len=input_ids.shape[1], ctx_len=8, audio_feature_len=3, num_audios=1, num_patches=1
+    )["past_key_values"]
+    with torch.no_grad():
+        qeff_prefill = qeff_model.model(**qeff_inputs, use_cache=True)
+
+    assert qeff_prefill.logits.shape == (1, 1, 64)
+    assert len(qeff_prefill.past_key_values[0]) == 6
+    assert torch.allclose(qeff_prefill.logits, hf_prefill.logits[:, -1:, :], atol=2e-5)
+
+    decode_inputs = {
+        "input_ids": torch.tensor([[8]], dtype=torch.int64),
+        "position_ids": torch.tensor([[input_ids.shape[1]]], dtype=torch.int64),
+        "attention_mask": torch.ones((1, input_ids.shape[1] + 1), dtype=torch.int64),
+    }
+    with torch.no_grad():
+        hf_decode = model_hf(**decode_inputs, past_key_values=hf_prefill.past_key_values, use_cache=True)
+        qeff_decode = qeff_model.model(
+            **decode_inputs,
+            past_key_values=qeff_prefill.past_key_values,
+            use_cache=True,
+        )
+    assert torch.allclose(qeff_decode.logits, hf_decode.logits[:, -1:, :], atol=2e-5)
+
+    onnx_path = _exported_onnx_path(qeff_model.export(tmp_path / "inkling"))
+    onnx_model = onnx.load(onnx_path, load_external_data=False)
+    retained_names = {output.name for output in onnx_model.graph.output if output.name.endswith("_RetainedState")}
+    assert len(retained_names) == 6
+    assert "conv_state.0.3_RetainedState" in retained_names
+
+    ort_session = _ort_session(onnx_path)
+    ort_inputs = {
+        "input_ids": input_ids.numpy(),
+        "position_ids": prefill_inputs["position_ids"].numpy(),
+        "pixel_values": prefill_inputs["pixel_values"].numpy(),
+        "audio_input_ids": prefill_inputs["audio_input_ids"].numpy(),
+        "audio_input_ids_mask": prefill_inputs["audio_input_ids_mask"].numpy(),
+    }
+    ort_cache = qeff_model.model.get_dummy_inputs(
+        prefill_seq_len=input_ids.shape[1],
+        ctx_len=input_ids.shape[1],
+        audio_feature_len=3,
+        num_audios=1,
+        num_patches=1,
+    )["past_key_values"]
+    for layer_idx, layer_states in enumerate(ort_cache):
+        for name, state in zip(qeff_model.model.get_onnx_past_key_value_names(layer_idx), layer_states):
+            ort_inputs[name] = state.numpy()
+    required_inputs = {item.name for item in ort_session.get_inputs()}
+    ort_logits = ort_session.run(None, {name: ort_inputs[name] for name in required_inputs})[0]
+    assert np.allclose(ort_logits, qeff_prefill.logits.numpy(), atol=2e-5)
 
 
 @pytest.mark.llm_model

@@ -78,6 +78,7 @@
 
 | Architecture                        | Model Family | Representative Models                                                                 | Qeff Single Qpc | Qeff Dual Qpc | vllm Single Qpc | vllm Dual Qpc |
 |------------------------------------|--------------|----------------------------------------------------------------------------------------|------------|---------------------|-------------------|-----------------|
+| **InklingForConditionalGeneration** | inkling_mm_model | [thinkingmachines/Inkling-Small](https://huggingface.co/thinkingmachines/Inkling-Small) |  |  |  |  |
 | **LlavaForConditionalGeneration**  | LLaVA-1.5   | [llava-hf/llava-1.5-7b-hf](https://huggingface.co/llava-hf/llava-1.5-7b-hf)         | ✔️               | ✔️                       | ✔️                      | ✔️                      |
 | **MllamaForConditionalGeneration** ⚠️ *(Deprecated)* | Llama 3.2   | [meta-llama/Llama-3.2-11B-Vision Instruct](https://huggingface.co/meta-llama/Llama-3.2-11B-Vision-Instruct)<br>[meta-llama/Llama-3.2-90B-Vision-Instruct](https://huggingface.co/meta-llama/Llama-3.2-90B-Vision-Instruct)           | ✔️                       | ✔️                      | ✔️                      | ✔️                      |
 | **LlavaNextForConditionalGeneration** | Granite Vision | [ibm-granite/granite-vision-3.2-2b](https://huggingface.co/ibm-granite/granite-vision-3.2-2b)  | ✕                       | ✔️                      | ✕                       | ✔️                      |

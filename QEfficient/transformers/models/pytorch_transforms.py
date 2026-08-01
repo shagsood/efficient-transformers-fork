@@ -6,8 +6,8 @@
 # -----------------------------------------------------------------------------
 
 import warnings
+from collections.abc import Callable
 from types import MethodType
-from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -101,6 +101,7 @@ from transformers.models.granitemoe.modeling_granitemoe import (
     GraniteMoeRMSNorm,
     GraniteMoeRotaryEmbedding,
 )
+
 try:
     from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeParallelExperts,
@@ -109,8 +110,19 @@ try:
 except ImportError:
     from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeExperts as GraniteMoeParallelExperts,
+    )
+    from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeTopKRouter as GraniteMoeTopKGating,
     )
+from transformers.models.inkling.modeling_inkling import (
+    InklingAttention,
+    InklingForConditionalGeneration,
+    InklingModel,
+    InklingMoE,
+    InklingRMSNorm,
+    InklingShortConvolution,
+    InklingTextModel,
+)
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaDecoderLayer,
@@ -218,12 +230,6 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Model,
     Qwen3RMSNorm,
 )
-from transformers.models.qwen3_asr.modeling_qwen3_asr import (
-    Qwen3ASRAudioAttention,
-    Qwen3ASREncoder,
-    Qwen3ASRForConditionalGeneration,
-    Qwen3ASRModel,
-)
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Attention,
     Qwen3_5DecoderLayer,
@@ -251,6 +257,12 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeTopKRouter,
     Qwen3_5MoeVisionAttention,
     Qwen3_5MoeVisionModel,
+)
+from transformers.models.qwen3_asr.modeling_qwen3_asr import (
+    Qwen3ASRAudioAttention,
+    Qwen3ASREncoder,
+    Qwen3ASRForConditionalGeneration,
+    Qwen3ASRModel,
 )
 from transformers.models.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeAttention,
@@ -442,6 +454,15 @@ from QEfficient.transformers.models.grok_1.modeling_grok1 import (
     QEffGrok1MoeBlock,
     QEffGrok1MultiHeadAttention,
 )
+from QEfficient.transformers.models.inkling.modeling_inkling import (
+    QEffInklingAttention,
+    QEffInklingForConditionalGeneration,
+    QEffInklingModel,
+    QEffInklingMoE,
+    QEffInklingShortConvolution,
+    QEffInklingTextModel,
+    QEffPrefillChunkedInklingMoE,
+)
 from QEfficient.transformers.models.internvl.modeling_internvl import (
     QEffInternDecoderWrapper,
     QEffInternVisionEmbeddings,
@@ -560,12 +581,6 @@ from QEfficient.transformers.models.qwen3.modeling_qwen3 import (
     QEffQwen3ForCausalLM,
     QEffQwen3Model,
 )
-from QEfficient.transformers.models.qwen3_asr.modeling_qwen3_asr import (
-    QEffQwen3ASRAudioAttention,
-    QEffQwen3ASREncoder,
-    QEffQwen3ASRForConditionalGeneration,
-    QEffQwen3ASRModel,
-)
 from QEfficient.transformers.models.qwen3_5.modeling_qwen3_5 import (
     QEffQwen3_5Attention,
     QEffQwen3_5DecoderLayer,
@@ -592,6 +607,12 @@ from QEfficient.transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     QEffQwen3_5MoeTopKRouter,
     QEffQwen3_5MoeVisionAttention,
     QEffQwen3_5MoeVisionModel,
+)
+from QEfficient.transformers.models.qwen3_asr.modeling_qwen3_asr import (
+    QEffQwen3ASRAudioAttention,
+    QEffQwen3ASREncoder,
+    QEffQwen3ASRForConditionalGeneration,
+    QEffQwen3ASRModel,
 )
 from QEfficient.transformers.models.qwen3_moe.modeling_qwen3_moe import (
     QEffPrefillChunkedQwen3MoeSparseMoeBlock,
@@ -683,6 +704,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
         Qwen3VLTextRMSNorm: CustomRMSNormAIC,
         Glm4MoeRMSNorm: CustomRMSNormAIC,
+        InklingRMSNorm: CustomRMSNormAIC,
         Wav2Vec2Encoder: QEffWav2Vec2Encoder,
         Wav2Vec2EncoderStableLayerNorm: QEffWav2Vec2EncoderStableLayerNorm,
         # BERT-family: replace _create_attention_masks (uses create_bidirectional_mask,
@@ -820,6 +842,13 @@ class KVCacheTransform(ModuleMappingTransform):
         GraniteMoeTopKGating: QEffGraniteMoeTopKGating,
         GraniteMoeMoE: QEffGraniteMoeMoE,
         GraniteMoeDecoderLayer: QEffGraniteMoeDecoderLayer,
+        # Inkling
+        InklingAttention: QEffInklingAttention,
+        InklingShortConvolution: QEffInklingShortConvolution,
+        InklingMoE: QEffInklingMoE,
+        InklingTextModel: QEffInklingTextModel,
+        InklingModel: QEffInklingModel,
+        InklingForConditionalGeneration: QEffInklingForConditionalGeneration,
         # mllama
         MllamaTextRMSNorm: CustomRMSNormAIC,
         MllamaTextSelfAttention: QEffMllamaTextSelfAttention,
@@ -934,7 +963,7 @@ class KVCacheTransform(ModuleMappingTransform):
     }
 
     @classmethod
-    def apply(cls, model: nn.Module) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module) -> tuple[nn.Module, bool]:
         model, transformed = super().apply(model)
         return model, transformed
 
@@ -963,6 +992,8 @@ class PrefillOnlyChunkedTransform(ModuleMappingTransform):
         QEffQwen3_5MoeSparseMoeBlock: QEffPrefillChunkedQwen3_5MoeSparseMoeBlock,
         # Gemma4_Moe
         QEffGemma4TextExperts: QEffPrefillChunckedGemma4TextExperts,
+        # Inkling
+        QEffInklingMoE: QEffPrefillChunkedInklingMoE,
     }
 
 
@@ -984,6 +1015,8 @@ class RevertPrefillKeepAttentionTransform(ModuleMappingTransform):
         QEffPrefillChunkedQwen3_5MoeSparseMoeBlock: QEffQwen3_5MoeSparseMoeBlock,
         # Gemma4_Moe
         QEffPrefillChunckedGemma4TextExperts: QEffGemma4TextExperts,
+        # Inkling
+        QEffPrefillChunkedInklingMoE: QEffInklingMoE,
     }
 
 
@@ -1088,7 +1121,7 @@ class SpDTransform:
     }
 
     @classmethod
-    def apply(cls, model: nn.Module, qaic_config: Optional[dict] = None, **kwargs) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, qaic_config: dict | None = None, **kwargs) -> tuple[nn.Module, bool]:
         transformed = False
         pretrained_model_name_or_path_temp = kwargs.pop("pretrained_model_name_or_path", None)
         if qaic_config is None or (speculative_model_type := qaic_config.get("speculative_model_type")) is None:
@@ -1155,7 +1188,7 @@ class SamplerTransform:
     }
 
     @classmethod
-    def apply(cls, model: nn.Module, qaic_config: Optional[dict] = None, **kwargs) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, qaic_config: dict | None = None, **kwargs) -> tuple[nn.Module, bool]:
         transformed = False
         if qaic_config is None or not qaic_config.get("include_sampler", False):
             return model, transformed
@@ -1317,7 +1350,7 @@ class PoolingTransform:
     """
 
     @classmethod
-    def apply(cls, model: nn.Module, pooling: Union[str, Callable]) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, pooling: str | Callable) -> tuple[nn.Module, bool]:
         transformed = False
         pooling_method = (
             POOLING_MAP[pooling]
@@ -1359,7 +1392,7 @@ class BlockingAttentionTransform:
     _skip_classes = {}
 
     @classmethod
-    def apply(cls, model: nn.Module, attn_blocking_config) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, attn_blocking_config) -> tuple[nn.Module, bool]:
         transformed = False
         supported_attention_classes = {
             qeff_class
