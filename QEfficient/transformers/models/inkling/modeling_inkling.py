@@ -347,7 +347,7 @@ def _cumsum_scatter_gather_update_inkling_expert_blocked(
     packed_chunk_size = max(1, min(packed_chunk_size, seq_len))
 
     matched_idx = _build_matched_idx_from_cumsum(selected)
-    valid_rows = selected.to(torch.int32).sum(dim=1, keepdim=True)
+    valid_rows = selected.to(torch.int32).sum(dim=1).unsqueeze(1)
     hidden_states_expanded = hidden_states.unsqueeze(0).expand(batch_size, -1, -1)
 
     for packed_start in range(0, seq_len, packed_chunk_size):
