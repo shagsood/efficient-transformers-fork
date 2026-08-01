@@ -680,6 +680,20 @@ def test_inkling_multimodal_transform_prefill_and_decode_parity(tmp_path):
     assert isinstance(qeff_model.model.model, QEffInklingModel)
     assert isinstance(qeff_model.model.model.language_model, QEffInklingTextModel)
 
+    specializations, compiler_options = qeff_model.model.get_specializations(
+        batch_size=1,
+        ctx_len=8,
+        prefill_seq_len=6,
+        comp_ctx_lengths_prefill=None,
+        comp_ctx_lengths_decode=None,
+        img_size=None,
+        num_patches=1,
+        num_audios=1,
+        audio_feature_len=3,
+    )
+    assert [spec["seq_len"] for spec in specializations] == [6, 1]
+    assert compiler_options == {}
+
     input_ids = torch.tensor([[5, 3, 4, 4, 6, 7]], dtype=torch.int64)
     prefill_inputs = {
         "input_ids": input_ids,

@@ -737,6 +737,9 @@ class QEffInklingForConditionalGeneration(InklingForConditionalGeneration):
 
     def get_specializations(self, batch_size: int, ctx_len: int, **compiler_options):
         prefill_seq_len = compiler_options.pop("prefill_seq_len", constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN)
+        compiler_options.pop("comp_ctx_lengths_prefill", None)
+        compiler_options.pop("comp_ctx_lengths_decode", None)
+        compiler_options.pop("img_size", None)
         audio_feature_len = compiler_options.pop("audio_feature_len", 4)
         num_audios = compiler_options.pop("num_audios", batch_size)
         num_patches = compiler_options.pop("num_patches", 1)
