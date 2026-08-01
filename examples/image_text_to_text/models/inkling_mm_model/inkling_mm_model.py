@@ -9,7 +9,6 @@ import argparse
 import io
 import wave
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import requests
@@ -30,13 +29,13 @@ INKLING_PAD_TOKEN = "<|endoftext|>"
 INKLING_STOP_TOKEN = "<|content_model_end_sampling|>"
 
 
-def parse_device_ids(value: Optional[str]):
+def parse_device_ids(value: str | None):
     if value is None or value.strip() == "":
         return None
     return [int(device_id) for device_id in value.split(",") if device_id.strip()]
 
 
-def load_image(path_or_url: Optional[str]) -> Image.Image:
+def load_image(path_or_url: str | None) -> Image.Image:
     if path_or_url is None:
         return Image.new("RGB", (40, 40), color=(90, 110, 180))
     if path_or_url.startswith(("http://", "https://")):
@@ -73,7 +72,7 @@ def _decode_pcm_wav(data: bytes) -> tuple[np.ndarray, int]:
     return audio.astype(np.float32), sampling_rate
 
 
-def load_audio(path_or_url: Optional[str]) -> tuple[np.ndarray | str, int]:
+def load_audio(path_or_url: str | None) -> tuple[np.ndarray | str, int]:
     if path_or_url is None:
         return synthesize_audio(), SAMPLE_RATE
     if path_or_url.startswith(("http://", "https://")):
@@ -99,13 +98,13 @@ def configure_tokenizer(processor):
         tokenizer.eos_token = INKLING_STOP_TOKEN
 
 
-def inkling_messages(prompt: str):
+def inkling_messages(prompt: str, image: Image.Image, audio):
     return [
         {
             "role": "user",
             "content": [
-                {"type": "image"},
-                {"type": "audio"},
+                {"type": "image", "image": image},
+                {"type": "audio", "audio": audio},
                 {"type": "text", "text": prompt},
             ],
         }
@@ -113,20 +112,18 @@ def inkling_messages(prompt: str):
 
 
 def prepare_inputs(processor, prompt: str, image: Image.Image, audio, sampling_rate: int, prefill_seq_len: int):
-    text = processor.apply_chat_template(
-        inkling_messages(prompt),
+    inputs = processor.apply_chat_template(
+        inkling_messages(prompt, image, audio),
         add_generation_prompt=True,
-        tokenize=False,
-        reasoning_effort="none",
-    )
-    inputs = processor(
-        text=text,
-        images=image,
-        audio=audio,
-        sampling_rate=sampling_rate,
+        tokenize=True,
+        return_dict=True,
         return_tensors="pt",
-        padding="max_length",
-        max_length=prefill_seq_len,
+        reasoning_effort="none",
+        processor_kwargs={
+            "sampling_rate": sampling_rate,
+            "padding": "max_length",
+            "max_length": prefill_seq_len,
+        },
     )
 
     if "audio_input_ids_mask" in inputs:
