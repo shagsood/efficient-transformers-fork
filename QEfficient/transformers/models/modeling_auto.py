@@ -22,6 +22,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForCTC,
     AutoModelForImageTextToText,
+    AutoModelForMultimodalLM,
     AutoModelForSequenceClassification,
     AutoModelForSpeechSeq2Seq,
     PreTrainedTokenizer,
@@ -3094,7 +3095,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             inputs["pixel_values"] = inputs["pixel_values"].astype("float16")
 
         inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
-        inputs["image_idx"] = np.array([[0]])
+        if "image_idx" in qpc_session.input_names:
+            inputs["image_idx"] = np.array([[0]])
 
         if self.comp_ctx_lengths_prefill is not None:
             list_of_comp_ctx_lengths_prefill = [
@@ -3123,7 +3125,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             if self._write_io_dir is not None:
                 write_io_files(chunk_inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
 
-            chunk_inputs["image_idx"] = outputs["image_idx_output"]
+            if "image_idx" in qpc_session.input_names:
+                chunk_inputs["image_idx"] = outputs["image_idx_output"]
 
         prefill_time = perf_counter() - prefill_start
         # Get first token
@@ -3397,6 +3400,12 @@ MISCLASSIFIED_CAUSAL_LM_TO_QEFF_AUTO_CLASS_MAP = {
     "InternVLChatModel": QEFFAutoModelForImageTextToText,
     "MolmoForCausalLM": QEFFAutoModelForImageTextToText,
 }
+
+
+class QEFFAutoModelForMultimodalLM(QEFFAutoModelForImageTextToText):
+    """QEfficient entry point for models that combine text with audio, images, or both."""
+
+    _hf_auto_class = AutoModelForMultimodalLM
 
 
 class QEFFAutoModelForCausalLM(QEFFBaseModel):
@@ -3685,6 +3694,7 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
             The configuration dictionary of the underlying HuggingFace model.
         """
         return self.model.config.__dict__
+
 
     def get_seq_len_and_handle_specialized_prefill_model(
         self,
