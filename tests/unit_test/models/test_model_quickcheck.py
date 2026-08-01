@@ -667,6 +667,7 @@ def test_inkling_multimodal_transform_prefill_and_decode_parity(tmp_path):
         QEffInklingForConditionalGeneration,
         QEffInklingModel,
         QEffInklingTextModel,
+        QEffInklingTopkRouter,
     )
 
     assert AUDIO_MULTIMODAL_MODEL_IDS["inkling"] == "thinkingmachines/Inkling-Small"
@@ -679,6 +680,7 @@ def test_inkling_multimodal_transform_prefill_and_decode_parity(tmp_path):
     assert isinstance(qeff_model.model, QEffInklingForConditionalGeneration)
     assert isinstance(qeff_model.model.model, QEffInklingModel)
     assert isinstance(qeff_model.model.model.language_model, QEffInklingTextModel)
+    assert isinstance(qeff_model.model.model.language_model.layers[0].mlp.gate, QEffInklingTopkRouter)
 
     specializations, compiler_options = qeff_model.model.get_specializations(
         batch_size=1,
@@ -734,6 +736,10 @@ def test_inkling_multimodal_transform_prefill_and_decode_parity(tmp_path):
 
     onnx_path = _exported_onnx_path(qeff_model.export(tmp_path / "inkling"))
     onnx_model = onnx.load(onnx_path, load_external_data=False)
+    assert all(node.op_type != "ReduceLogSumExp" for node in onnx_model.graph.node)
+    assert all(
+        node.op_type != "ReduceLogSumExp" for function in onnx_model.functions for node in function.node
+    )
     retained_names = {output.name for output in onnx_model.graph.output if output.name.endswith("_RetainedState")}
     assert len(retained_names) == 6
     assert "conv_state.0.3_RetainedState" in retained_names

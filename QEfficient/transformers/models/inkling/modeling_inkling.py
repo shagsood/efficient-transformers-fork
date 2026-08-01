@@ -22,6 +22,7 @@ from transformers.models.inkling.modeling_inkling import (
     InklingMoE,
     InklingShortConvolution,
     InklingTextModel,
+    InklingTopkRouter,
     eager_attention_forward,
 )
 from transformers.models.inkling.modeling_inkling import (
@@ -282,6 +283,29 @@ class QEffInklingAttention(InklingAttention):
         )
         attn_output = self.o_proj(attn_output.reshape(*input_shape, self.num_heads * self.head_dim).contiguous())
         return attn_output, attn_weights
+
+
+class QEffInklingTopkRouter(InklingTopkRouter):
+    """Equivalent router normalization without unsupported ReduceLogSumExp."""
+
+    def forward(self, hidden_states) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        flat = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(flat, self.weight)
+        scores = router_logits.sigmoid()
+        routed_scores = scores[..., : -self.n_shared_experts]
+        scores_for_choice = routed_scores + self.e_score_correction_bias
+        topk_indices = torch.topk(scores_for_choice, self.top_k, dim=-1, sorted=False)[1]
+
+        routed_logits = router_logits[..., : -self.n_shared_experts]
+        shared_logits = router_logits[..., -self.n_shared_experts :]
+        topk_logits = torch.cat([routed_logits.gather(-1, topk_indices), shared_logits], dim=-1)
+        topk_probs = torch.sigmoid(topk_logits)
+        topk_weights = topk_probs / topk_probs.sum(dim=-1).unsqueeze(-1)
+        topk_weights = topk_weights * self.route_scale * self.global_scale
+
+        shared_gammas = topk_weights[..., -self.n_shared_experts :].contiguous()
+        topk_weights = topk_weights[..., : self.top_k].contiguous()
+        return routed_logits, topk_weights, topk_indices, shared_gammas
 
 
 class QEffInklingMoE(InklingMoE):

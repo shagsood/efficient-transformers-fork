@@ -122,6 +122,7 @@ from transformers.models.inkling.modeling_inkling import (
     InklingRMSNorm,
     InklingShortConvolution,
     InklingTextModel,
+    InklingTopkRouter,
 )
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
@@ -461,6 +462,7 @@ from QEfficient.transformers.models.inkling.modeling_inkling import (
     QEffInklingMoE,
     QEffInklingShortConvolution,
     QEffInklingTextModel,
+    QEffInklingTopkRouter,
     QEffPrefillChunkedInklingMoE,
 )
 from QEfficient.transformers.models.internvl.modeling_internvl import (
@@ -845,6 +847,7 @@ class KVCacheTransform(ModuleMappingTransform):
         # Inkling
         InklingAttention: QEffInklingAttention,
         InklingShortConvolution: QEffInklingShortConvolution,
+        InklingTopkRouter: QEffInklingTopkRouter,
         InklingMoE: QEffInklingMoE,
         InklingTextModel: QEffInklingTextModel,
         InklingModel: QEffInklingModel,
