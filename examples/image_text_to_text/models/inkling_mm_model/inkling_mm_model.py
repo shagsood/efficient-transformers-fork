@@ -25,6 +25,9 @@ DEFAULT_PREFILL_SEQ_LEN = 128
 DEFAULT_CTX_LEN = 1024
 DEFAULT_GENERATION_LEN = 128
 DEFAULT_AUDIO_SECONDS = 0.2
+DEFAULT_NUM_PATCHES = 2
+DEFAULT_NUM_AUDIOS = 1
+DEFAULT_AUDIO_FEATURE_LEN = 4
 INKLING_PAD_TOKEN = "<|endoftext|>"
 INKLING_STOP_TOKEN = "<|content_model_end_sampling|>"
 
@@ -132,14 +135,29 @@ def prepare_inputs(processor, prompt: str, image: Image.Image, audio, sampling_r
     return inputs
 
 
-def processor_dimensions(inputs) -> dict[str, int]:
-    pixel_values = inputs["pixel_values"]
-    audio_input_ids = inputs["audio_input_ids"]
+def processor_dimensions(inputs: dict[str, torch.Tensor]) -> dict[str, int]:
     return {
-        "num_patches": int(pixel_values.shape[0]),
-        "num_audios": int(audio_input_ids.shape[0]),
-        "audio_feature_len": int(audio_input_ids.shape[1]),
+        "num_patches": int(inputs["pixel_values"].shape[0]),
+        "num_audios": int(inputs["audio_input_ids"].shape[0]),
+        "audio_feature_len": int(inputs["audio_input_ids"].shape[1]),
     }
+
+
+def validate_static_dimensions(actual: dict[str, int], expected: dict[str, int], qpc_source: str) -> None:
+    mismatches = {
+        name: (actual[name], expected[name])
+        for name in ("num_patches", "num_audios", "audio_feature_len")
+        if actual[name] != expected[name]
+    }
+    if not mismatches:
+        return
+
+    details = ", ".join(f"{name}: input={got}, {qpc_source}={want}" for name, (got, want) in mismatches.items())
+    raise ValueError(
+        "Processed inputs do not match the static multimodal specialization "
+        f"({details}). Use input assets that match the QPC or pass matching "
+        "--num-patches/--num-audios/--audio-feature-len values when compiling."
+    )
 
 
 def main():
@@ -160,6 +178,9 @@ def main():
     parser.add_argument("--generation-len", type=int, default=DEFAULT_GENERATION_LEN)
     parser.add_argument("--num-cores", type=int, default=16)
     parser.add_argument("--num-devices", type=int, default=8)
+    parser.add_argument("--num-patches", type=int, default=DEFAULT_NUM_PATCHES)
+    parser.add_argument("--num-audios", type=int, default=DEFAULT_NUM_AUDIOS)
+    parser.add_argument("--audio-feature-len", type=int, default=DEFAULT_AUDIO_FEATURE_LEN)
     parser.add_argument("--device-ids", type=parse_device_ids, default=None)
     parser.add_argument("--compile-dir", default="qpc_inkling_mm_model")
     parser.add_argument("--qpc-path", help="Existing QPC path. If set, compile is skipped.")
@@ -179,7 +200,15 @@ def main():
     image = load_image(args.image)
     audio, sampling_rate = load_audio(args.audio)
     inputs = prepare_inputs(processor, args.prompt, image, audio, sampling_rate, args.prefill_seq_len)
-    dims = processor_dimensions(inputs)
+    validate_static_dimensions(
+        processor_dimensions(inputs),
+        {
+            "num_patches": args.num_patches,
+            "num_audios": args.num_audios,
+            "audio_feature_len": args.audio_feature_len,
+        },
+        "compiled",
+    )
 
     qeff_model = QEFFAutoModelForMultimodalLM.from_pretrained(
         args.model_id,
@@ -201,9 +230,9 @@ def main():
             num_devices=args.num_devices,
             mxfp6_matmul=not args.no_mxfp6,
             mxint8_kv_cache=not args.no_mxint8_kv_cache,
-            num_patches=dims["num_patches"],
-            num_audios=dims["num_audios"],
-            audio_feature_len=dims["audio_feature_len"],
+            num_patches=args.num_patches,
+            num_audios=args.num_audios,
+            audio_feature_len=args.audio_feature_len,
             use_onnx_subfunctions=True,
         )
 
