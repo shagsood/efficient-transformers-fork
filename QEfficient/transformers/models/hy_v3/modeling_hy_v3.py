@@ -5,7 +5,6 @@
 #
 # -----------------------------------------------------------------------------
 
-from typing import Optional, Type
 
 import torch
 from torch import nn
@@ -41,7 +40,8 @@ from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
 
 class QEffHYV3RotaryEmbedding(HYV3RotaryEmbedding):
     """
-    Copied from HYV3RotaryEmbedding: https://github.com/huggingface/transformers/blob/main/src/transformers/models/hy_v3/modeling_hy_v3.py
+    Copied from HYV3RotaryEmbedding in
+    transformers.models.hy_v3.modeling_hy_v3.
     The only differences are:
     - Add static sin/cos computations.
     """
@@ -138,7 +138,7 @@ def eager_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
     **kwargs,
@@ -175,7 +175,7 @@ def _build_matched_idx_from_cumsum(T2Ei: torch.Tensor):
     batch_size, seq_len = T2Ei.shape
     int32_max = torch.iinfo(torch.int32).max
     int32_max_scalar = torch.tensor(int32_max, dtype=torch.int32, device=T2Ei.device)
-    token_idx = torch.arange(seq_len, dtype=torch.int32, device=T2Ei.device).unsqueeze(0).expand(batch_size, -1)
+    token_idx = torch.arange(seq_len, dtype=torch.int32, device=T2Ei.device).unsqueeze(0).expand(batch_size, seq_len)
     valid_prefix = torch.cumsum(T2Ei.to(torch.int32), dim=1)
     valid_rows = valid_prefix[:, -1:]  # [batch_size, 1] — total active-row count per batch
     valid_dest = valid_prefix - 1
@@ -219,7 +219,7 @@ def _cumsum_scatter_gather_update_expert_blocked(
     # graph and lowers to a plain `Slice`, which QAIC handles cleanly.
     matched_idx, valid_rows = _build_matched_idx_from_cumsum(T2Ei)
     row_range = torch.arange(packed_chunk_size, dtype=torch.int32, device=x.device).unsqueeze(0)
-    x_expanded = x.unsqueeze(0).expand(batch_size, -1, -1)
+    x_expanded = x.unsqueeze(0).expand(batch_size, x.shape[0], x.shape[1])
 
     for packed_start in range(0, seq_len, packed_chunk_size):
         packed_stop = packed_start + packed_chunk_size
@@ -258,22 +258,25 @@ class QEffHYV3Attention(HYV3Attention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        comp_ctx_lengths: Optional[torch.LongTensor] = None,
-        batch_index: Optional[torch.LongTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        sin_cached: Optional[torch.Tensor] = None,
-        cos_cached: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None,
+        past_key_value: Cache | None = None,
+        comp_ctx_lengths: torch.LongTensor | None = None,
+        batch_index: torch.LongTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        sin_cached: torch.Tensor | None = None,
+        cos_cached: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        batch_size, q_len = hidden_states.shape[:-1]
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
-        value_states = self.v_proj(hidden_states).view(hidden_shape)
+        query_states = self.q_proj(hidden_states).view(
+            batch_size, q_len, self.config.num_attention_heads, self.head_dim
+        )
+        key_states = self.k_proj(hidden_states).view(batch_size, q_len, self.config.num_key_value_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(
+            batch_size, q_len, self.config.num_key_value_heads, self.head_dim
+        )
 
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
@@ -350,7 +353,9 @@ class QEffHYV3Attention(HYV3Attention):
                 **kwargs,
             )
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.reshape(
+            batch_size, q_len, self.config.num_attention_heads * self.head_dim
+        ).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
@@ -361,7 +366,7 @@ class QEffHYV3TopKRouter(HYV3TopKRouter):
         hidden_states: torch.Tensor,
         e_score_correction_bias: torch.Tensor,
     ) -> tuple:
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        hidden_states = hidden_states.reshape(hidden_states.shape[0], self.hidden_dim)
         router_logits = nn.functional.linear(hidden_states.float(), self.weight.float())
         routing_weights = torch.sigmoid(router_logits)
 
@@ -437,11 +442,17 @@ class QEffHYV3MoE(HYV3MoE):
         hidden_dim = self.gate.hidden_dim
 
         gate_proj_w, up_proj_w, down_proj_w = self._split_expert_weights()
-        gate_proj = gate_proj_w[top_k_index.flatten()]
-        up_proj = up_proj_w[top_k_index.flatten()]
-        down_proj = down_proj_w[top_k_index.flatten()]
+        flat_top_k_index = top_k_index.reshape(num_tokens * self.top_k)
+        gate_proj = gate_proj_w[flat_top_k_index]
+        up_proj = up_proj_w[flat_top_k_index]
+        down_proj = down_proj_w[flat_top_k_index]
 
-        expert_in = hidden_states.unsqueeze(1).expand(-1, self.top_k, -1).contiguous().view(-1, 1, hidden_dim)
+        expert_in = (
+            hidden_states.unsqueeze(1)
+            .expand(num_tokens, self.top_k, hidden_dim)
+            .contiguous()
+            .view(num_tokens * self.top_k, 1, hidden_dim)
+        )
         gate_out = torch.bmm(expert_in, gate_proj)
         up_out = torch.bmm(expert_in, up_proj)
         hidden = self.act_fn(gate_out) * up_out
@@ -467,15 +478,13 @@ class QEffHYV3MoE(HYV3MoE):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        hidden_states = hidden_states.view(batch_size * seq_len, hidden_dim)
 
         _, top_k_weights, top_k_index = self.gate(hidden_states, self.e_score_correction_bias)
         routed_output = self.moe(hidden_states, top_k_index, top_k_weights)
 
         if self.enable_moe_fp32_combine:
-            hidden_states = (routed_output.float() + self.shared_experts(hidden_states).float()).to(
-                hidden_states.dtype
-            )
+            hidden_states = (routed_output.float() + self.shared_experts(hidden_states).float()).to(hidden_states.dtype)
         else:
             hidden_states = routed_output + self.shared_experts(hidden_states)
 
@@ -518,9 +527,9 @@ class QEffPrefillChunkedHYV3MoE(QEffHYV3MoE):
         # slot's sub-view of a contiguous build (verified on tiny-random).
         gate_proj_w, up_proj_w, down_proj_w = self._split_expert_weights()
         rw = routing_weights.transpose(0, 1).view(local_experts, num_nsp, num_tokens).transpose(0, 1)
-        W_g = gate_proj_w.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1)
-        W_u = up_proj_w.view(local_experts, num_nsp, hidden_dim, -1).transpose(0, 1)
-        W_d = down_proj_w.view(local_experts, num_nsp, -1, hidden_dim).transpose(0, 1)
+        W_g = gate_proj_w.view(local_experts, num_nsp, hidden_dim, self.expert_dim).transpose(0, 1)
+        W_u = up_proj_w.view(local_experts, num_nsp, hidden_dim, self.expert_dim).transpose(0, 1)
+        W_d = down_proj_w.view(local_experts, num_nsp, self.expert_dim, hidden_dim).transpose(0, 1)
         expert_out = hidden_states.new_zeros((num_nsp, num_tokens, hidden_dim))
         routing_weights_unsqueezed = rw.unsqueeze(-1)
 
@@ -550,15 +559,13 @@ class QEffPrefillChunkedHYV3MoE(QEffHYV3MoE):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        hidden_states = hidden_states.view(batch_size * seq_len, hidden_dim)
 
         _, top_k_weights, top_k_index = self.gate(hidden_states, self.e_score_correction_bias)
         routed_output = self._forward_expert_blocked(hidden_states, top_k_index, top_k_weights)
 
         if self.enable_moe_fp32_combine:
-            hidden_states = (routed_output.float() + self.shared_experts(hidden_states).float()).to(
-                hidden_states.dtype
-            )
+            hidden_states = (routed_output.float() + self.shared_experts(hidden_states).float()).to(hidden_states.dtype)
         else:
             hidden_states = routed_output + self.shared_experts(hidden_states)
 
@@ -569,16 +576,16 @@ class QEffHYV3DecoderLayer(HYV3DecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        comp_ctx_lengths: Optional[torch.LongTensor] = None,
-        batch_index: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[tuple] = None,  # necessary, but kept here for BC
-        sin_cached: Optional[torch.Tensor] = None,
-        cos_cached: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Cache | None = None,
+        comp_ctx_lengths: torch.LongTensor | None = None,
+        batch_index: torch.LongTensor | None = None,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple | None = None,  # necessary, but kept here for BC
+        sin_cached: torch.Tensor | None = None,
+        cos_cached: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -614,16 +621,16 @@ class QEffHYV3Model(HYV3Model):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        comp_ctx_lengths: Optional[torch.LongTensor] = None,
-        batch_index: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        use_cache: Optional[bool] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        comp_ctx_lengths: torch.LongTensor | None = None,
+        batch_index: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        output_hidden_states: bool | None = None,
+        use_cache: bool | None = None,
         **kwargs,
     ) -> MoeModelOutputWithPast:
         output_hidden_states = (
@@ -693,7 +700,7 @@ class QEffHYV3Model(HYV3Model):
 
 
 class QEffHYV3ForCausalLM(HYV3ForCausalLM):
-    def get_submodules_for_export(self) -> Type[nn.Module]:
+    def get_submodules_for_export(self) -> type[nn.Module]:
         """
         Return the set of class used as the repeated layer across the model for subfunction extraction.
         """
@@ -701,16 +708,16 @@ class QEffHYV3ForCausalLM(HYV3ForCausalLM):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        comp_ctx_lengths: Optional[torch.LongTensor] = None,
-        batch_index: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        comp_ctx_lengths: torch.LongTensor | None = None,
+        batch_index: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         outputs: MoeModelOutputWithPast = self.model(
@@ -730,7 +737,7 @@ class QEffHYV3ForCausalLM(HYV3ForCausalLM):
         hidden_states = outputs.last_hidden_state
         # INT32 gather index (U2) — ONNX Gather is strict about index dtype
         logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
-        hidden_states = hidden_states[torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
+        hidden_states = hidden_states[torch.arange(position_ids.shape[0]).view(position_ids.shape[0], 1), logit_index]
         logits = self.lm_head(hidden_states).to(hidden_states.dtype)
 
         return CausalLMOutputWithPast(
