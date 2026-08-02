@@ -737,9 +737,7 @@ def test_inkling_multimodal_transform_prefill_and_decode_parity(tmp_path):
     onnx_path = _exported_onnx_path(qeff_model.export(tmp_path / "inkling"))
     onnx_model = onnx.load(onnx_path, load_external_data=False)
     assert all(node.op_type != "ReduceLogSumExp" for node in onnx_model.graph.node)
-    assert all(
-        node.op_type != "ReduceLogSumExp" for function in onnx_model.functions for node in function.node
-    )
+    assert all(node.op_type != "ReduceLogSumExp" for function in onnx_model.functions for node in function.node)
     retained_names = {output.name for output in onnx_model.graph.output if output.name.endswith("_RetainedState")}
     assert len(retained_names) == 6
     assert "conv_state.0.3_RetainedState" in retained_names
@@ -765,6 +763,65 @@ def test_inkling_multimodal_transform_prefill_and_decode_parity(tmp_path):
     required_inputs = {item.name for item in ort_session.get_inputs()}
     ort_logits = ort_session.run(None, {name: ort_inputs[name] for name in required_inputs})[0]
     assert np.allclose(ort_logits, qeff_prefill.logits.numpy(), atol=2e-5)
+
+    try:
+        from QEfficient.generation.cloud_infer import QAICInferenceSession
+
+        qeff_model.model.config.torch_dtype = torch.float16
+        qpc_path = Path(
+            qeff_model.compile(
+                onnx_path=str(onnx_path),
+                compile_dir=str(tmp_path / "inkling-qpc"),
+                prefill_seq_len=input_ids.shape[1],
+                ctx_len=input_ids.shape[1],
+                batch_size=1,
+                num_devices=1,
+                num_cores=16,
+                audio_feature_len=3,
+                num_audios=1,
+                num_patches=1,
+            )
+        )
+        device_group = os.environ.get("DEVICE_GROUP", "0")
+        qid = int(device_group.split(",")[0])
+        qpc_session = QAICInferenceSession(qpc_path, device_ids=[qid])
+        qpc_inputs = {}
+        for name in qpc_session.input_names:
+            public_name = name.rsplit("/", 1)[-1]
+            if public_name not in ort_inputs:
+                continue
+            binding = qpc_session.bindings[qpc_session.binding_index_map[name]]
+            dtype = qpc_session.aic_to_np_dtype_mapping[binding.type]
+            qpc_inputs[name] = ort_inputs[public_name].astype(dtype, copy=False)
+        qpc_outputs = qpc_session.run(qpc_inputs)
+    except Exception:
+        if os.environ.get("REQUIRE_LOCAL_AI100") == "1":
+            raise
+        pytest.skip("Skipping Inkling AI 100 edge because local compile/runtime is unavailable")
+
+    qpc_logits = qpc_outputs["logits"].astype(np.float32)
+    ort_logits_fp32 = ort_logits.astype(np.float32)
+    cosine = np.dot(ort_logits_fp32.ravel(), qpc_logits.ravel()) / (
+        np.linalg.norm(ort_logits_fp32.ravel()) * np.linalg.norm(qpc_logits.ravel())
+    )
+    max_abs = np.max(np.abs(ort_logits_fp32 - qpc_logits))
+    retained_output_names = sorted(name for name in qpc_outputs if name.endswith("_RetainedState"))
+    print(
+        "[inkling-tiny-hw] ORT==QPC "
+        f"cosine={cosine:.10f} "
+        f"ort_argmax={int(ort_logits_fp32.argmax())} "
+        f"qpc_argmax={int(qpc_logits.argmax())} "
+        f"max_abs={max_abs:.10f}"
+    )
+    print(f"[inkling-tiny-hw] retained_outputs={retained_output_names}")
+    print(f"[inkling-tiny-hw] qpc={qpc_path}")
+    assert int(ort_logits_fp32.argmax()) == int(qpc_logits.argmax())
+    assert cosine >= 0.999
+    assert (qpc_path / "programqpc.bin").is_file()
+    artifacts_dir = os.environ.get("ARTIFACTS_DIR")
+    if artifacts_dir:
+        Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
+        (Path(artifacts_dir) / "local-tiny-qpc-path.txt").write_text(f"{qpc_path}\n")
 
 
 @pytest.mark.llm_model
