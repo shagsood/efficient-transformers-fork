@@ -9,6 +9,7 @@ import argparse
 import io
 import wave
 from pathlib import Path
+from types import MethodType
 
 import numpy as np
 import requests
@@ -160,6 +161,17 @@ def validate_static_dimensions(actual: dict[str, int], expected: dict[str, int],
     )
 
 
+def preserve_host_generation_inputs(qeff_model):
+    original_auto_correct_inputs = qeff_model.auto_correct_inputs
+
+    def auto_correct_inputs_with_attention_mask(self, inputs):
+        corrected = original_auto_correct_inputs(inputs)
+        corrected["attention_mask"] = inputs["attention_mask"]
+        return corrected
+
+    qeff_model.auto_correct_inputs = MethodType(auto_correct_inputs_with_attention_mask, qeff_model)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Inkling-Small image+audio+text generation on Cloud AI 100")
     parser.add_argument("--model-id", default=MODEL_ID, help="Hugging Face model ID or local model directory")
@@ -217,6 +229,7 @@ def main():
         attn_implementation="eager",
         kv_offload=False,
     )
+    preserve_host_generation_inputs(qeff_model)
 
     if args.qpc_path:
         qeff_model.qpc_path = Path(args.qpc_path)
