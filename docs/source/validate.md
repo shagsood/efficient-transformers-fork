@@ -8,6 +8,7 @@
 
 | Architecture            | Model Family       | Representative Models                                                                 | [vLLM Support](https://quic.github.io/cloud-ai-sdk-pages/latest/Getting-Started/Installation/vLLM/vLLM/index.html) |
 |-------------------------|--------------------|--------------------------------------------------------------------------------------|--------------|
+| **HYV3ForCausalLM** | hy_v3 | [tencent/Hy3](https://huggingface.co/tencent/Hy3) |  |
 | **MolmoForCausalLM** | Molmo① | [allenai/Molmo-7B-D-0924](https://huggingface.co/allenai/Molmo-7B-D-0924) | ✕           |
 | **Olmo2ForCausalLM**   |       OLMo-2       | [allenai/OLMo-2-0425-1B](https://huggingface.co/allenai/OLMo-2-0425-1B)                                                               | ✔️         |
 | **FalconForCausalLM**   | Falcon②            | [tiiuae/falcon-40b](https://huggingface.co/tiiuae/falcon-40b)                                                                | ✔️          |

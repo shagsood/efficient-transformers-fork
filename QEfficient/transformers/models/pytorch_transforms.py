@@ -6,8 +6,8 @@
 # -----------------------------------------------------------------------------
 
 import warnings
+from collections.abc import Callable
 from types import MethodType
-from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -932,7 +932,7 @@ class KVCacheTransform(ModuleMappingTransform):
     }
 
     @classmethod
-    def apply(cls, model: nn.Module) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module) -> tuple[nn.Module, bool]:
         model, transformed = super().apply(model)
         return model, transformed
 
@@ -1090,7 +1090,7 @@ class SpDTransform:
     }
 
     @classmethod
-    def apply(cls, model: nn.Module, qaic_config: Optional[dict] = None, **kwargs) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, qaic_config: dict | None = None, **kwargs) -> tuple[nn.Module, bool]:
         transformed = False
         pretrained_model_name_or_path_temp = kwargs.pop("pretrained_model_name_or_path", None)
         if qaic_config is None or (speculative_model_type := qaic_config.get("speculative_model_type")) is None:
@@ -1157,7 +1157,7 @@ class SamplerTransform:
     }
 
     @classmethod
-    def apply(cls, model: nn.Module, qaic_config: Optional[dict] = None, **kwargs) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, qaic_config: dict | None = None, **kwargs) -> tuple[nn.Module, bool]:
         transformed = False
         if qaic_config is None or not qaic_config.get("include_sampler", False):
             return model, transformed
@@ -1319,7 +1319,7 @@ class PoolingTransform:
     """
 
     @classmethod
-    def apply(cls, model: nn.Module, pooling: Union[str, Callable]) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, pooling: str | Callable) -> tuple[nn.Module, bool]:
         transformed = False
         pooling_method = (
             POOLING_MAP[pooling]
@@ -1361,7 +1361,7 @@ class BlockingAttentionTransform:
     _skip_classes = {}
 
     @classmethod
-    def apply(cls, model: nn.Module, attn_blocking_config) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, attn_blocking_config) -> tuple[nn.Module, bool]:
         transformed = False
         supported_attention_classes = {
             qeff_class
