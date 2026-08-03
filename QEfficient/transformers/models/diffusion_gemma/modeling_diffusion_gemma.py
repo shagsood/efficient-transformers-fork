@@ -749,7 +749,7 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
             if encoder_attention_mask is not None:
                 if layer_type == "sliding_attention":
                     sliding_indices = torch.arange(
-                        self.config.sliding_window,
+                        self.text_config.sliding_window,
                         dtype=torch.int64,
                         device=encoder_attention_mask.device,
                     )

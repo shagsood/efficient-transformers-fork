@@ -405,3 +405,25 @@ def test_decoder_pad_mask_marks_empty_encoder_slots(unified_wrapper):
     assert torch.equal(additive[0, 0, 0, :3], torch.zeros(3))
     assert torch.all(additive[0, 0, 0, 3:width] < -1e30)
     assert torch.equal(additive[0, 0, 0, width:], torch.zeros(4))
+
+
+def test_decoder_pad_mask_uses_text_config_sliding_window(unified_wrapper):
+    from QEfficient.transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        QEffDiffusionGemmaForBlockDiffusion,
+    )
+
+    _, cfg = unified_wrapper
+    tiny_cfg = deepcopy(cfg)
+    tiny_cfg.canvas_length = 4
+    tiny_cfg.image_token_id = 31
+    tiny_cfg.text_config.vocab_size = 32
+    if hasattr(tiny_cfg, "sliding_window"):
+        delattr(tiny_cfg, "sliding_window")
+
+    torch.manual_seed(0)
+    model = QEffDiffusionGemmaForBlockDiffusion._from_config(tiny_cfg).eval()
+    split = model.get_qeff_canvas_decode().eval()
+    inputs = split.get_dummy_inputs()
+    with torch.no_grad():
+        logits = split(**inputs)[0]
+    assert logits.shape[:2] == inputs["decoder_input_ids"].shape
