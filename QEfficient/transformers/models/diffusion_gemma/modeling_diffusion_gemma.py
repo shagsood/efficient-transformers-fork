@@ -688,6 +688,7 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
         decoder_position_ids: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         prev_tokens: Optional[torch.LongTensor] = None,
+        self_conditioning_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         # wrap legacy cache
@@ -707,6 +708,8 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
             ) * self.embed_tokens.embed_scale.to(inputs_embeds.dtype)
         else:
             soft_embeddings = torch.zeros_like(inputs_embeds)
+        if self_conditioning_mask is not None:
+            soft_embeddings = soft_embeddings * self_conditioning_mask.to(soft_embeddings.dtype)[:, None, None]
         inputs_embeds = self.self_conditioning(inputs_embeds, soft_embeddings)
 
         canvas_length = inputs_embeds.shape[1]
@@ -854,11 +857,13 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
     """Single-QPC, single-specialization wrapper.
 
     The graph has fixed prompt/canvas shapes and always traces both branches.
-    A runtime ``is_encode`` tensor selects the useful outputs:
+    A runtime ``execution_mode`` tensor selects the useful outputs and first-step
+    self-conditioning semantics:
 
-    * ``is_encode=1``: encoder-prefill writes retained KV.
-    * ``is_encode=0``: canvas-decode reads existing retained KV and re-emits it
-      unchanged so the dummy encoder branch cannot overwrite the cache.
+    * 0: encoder prefill.
+    * 1: finalized-canvas encoder commit.
+    * 2: decoder first step (self-conditioning disabled).
+    * 3: decoder later step (previous logits used for self-conditioning).
     """
 
     # Non-autoregressive: driven directly via QAICInferenceSession, not generate().
@@ -887,7 +892,7 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         decoder_position_ids: Optional[torch.LongTensor] = None,
         self_conditioning_logits: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        is_encode: Optional[torch.LongTensor] = None,
+        execution_mode: Optional[torch.LongTensor] = None,
         batch_index: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
@@ -896,9 +901,9 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         if past_key_values is not None and not isinstance(past_key_values, QEffGemma4DynamicCache):
             past_key_values = QEffGemma4DynamicCache.from_legacy_cache(self.text_config, past_key_values)
 
-        if is_encode is None:
-            is_encode = torch.ones(1, dtype=torch.int64, device=decoder_input_ids.device)
-        is_encode = is_encode.bool()
+        if execution_mode is None:
+            execution_mode = torch.zeros(1, dtype=torch.int64, device=decoder_input_ids.device)
+        is_encode = execution_mode < 2
 
         orig_pkv = [
             (past_key_values.layers[i].keys.clone(), past_key_values.layers[i].values.clone())
@@ -913,6 +918,7 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
             self_conditioning_logits=self_conditioning_logits,
             past_key_values=past_key_values,
             encoder_attention_mask=encoder_attention_mask,
+            execution_mode=execution_mode,
         )
         dec_logits = dec_out[0] if isinstance(dec_out, tuple) else dec_out
 
@@ -939,7 +945,7 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
 
     def get_dummy_inputs(self, **kwargs):
         # One fixed-shape specialization: prefill and decode both use the same
-        # prompt/canvas dimensions and differ only by the runtime is_encode flag.
+        # prompt/canvas dimensions and differ only by the runtime execution mode.
         enc_di = self.encoder_prefill.get_dummy_inputs()
         merged = {**enc_di}
         bs = enc_di["input_ids"].shape[0]
@@ -950,7 +956,7 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         merged["decoder_position_ids"] = torch.arange(canvas_length, dtype=torch.int64).view(1, canvas_length).repeat(bs, 1)
         merged["self_conditioning_logits"] = torch.zeros((bs, canvas_length, vocab), dtype=torch.float32)
         merged["encoder_attention_mask"] = torch.ones((bs, seq_len), dtype=torch.int64)
-        merged["is_encode"] = torch.ones(1, dtype=torch.int64)
+        merged["execution_mode"] = torch.zeros(1, dtype=torch.int64)
         return merged
 
     def get_specializations(
@@ -1228,12 +1234,16 @@ class QEffDiffusionGemmaCanvasDecodeWrapper(nn.Module):
         temperature: Optional[torch.Tensor] = None,
         random_numbers: Optional[torch.Tensor] = None,
         prev_tokens: Optional[torch.LongTensor] = None,
+        execution_mode: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
         del kwargs
         text_cfg = self.config.text_config
         if past_key_values is not None and not isinstance(past_key_values, QEffGemma4DynamicCache):
             past_key_values = QEffGemma4DynamicCache.from_legacy_cache(text_cfg, past_key_values)
+        if execution_mode is None:
+            execution_mode = torch.full((1,), 3, dtype=torch.int64, device=decoder_input_ids.device)
+        self_conditioning_mask = execution_mode == 3
 
         # Fused mode uses token-feedback self-conditioning (cheap [B,256] input) and must NOT
         # also receive self_conditioning_logits — feeding both would double-apply feedback.
@@ -1244,6 +1254,7 @@ class QEffDiffusionGemmaCanvasDecodeWrapper(nn.Module):
             decoder_position_ids=decoder_position_ids,
             encoder_attention_mask=encoder_attention_mask,
             prev_tokens=prev_tokens if self.fuse_sampler else None,
+            self_conditioning_mask=self_conditioning_mask,
         )
         canvas_logits = self.model._apply_logit_softcapping(self.lm_head(dec_out.last_hidden_state).float())
 
@@ -1333,6 +1344,7 @@ class QEffDiffusionGemmaCanvasDecodeWrapper(nn.Module):
             "decoder_input_ids": torch.zeros((bs, canvas_length), dtype=torch.int64),
             "decoder_position_ids": torch.arange(canvas_length, dtype=torch.int64).view(1, canvas_length).repeat(bs, 1),
             "encoder_attention_mask": enc_attn_mask,
+            "execution_mode": torch.full((1,), 3, dtype=torch.int64),
             "past_key_values": self.model.get_dummy_pkv_cache(config=text_cfg, batch_size=bs, seq_len=seq_len),
         }
         if self.fuse_sampler:
@@ -1345,7 +1357,20 @@ class QEffDiffusionGemmaCanvasDecodeWrapper(nn.Module):
             # Soft self-conditioning logits — only the un-fused path consumes this 256MB tensor.
             inputs["self_conditioning_logits"] = torch.zeros((bs, canvas_length, text_cfg.vocab_size), dtype=torch.float32)
         return inputs
-        return inputs
+
+
+class QEffDiffusionGemmaDecoderOnlyUnifiedWrapper(QEffDiffusionGemmaCanvasDecodeWrapper):
+    """Diagnostic single-mode wrapper for the unified-vs-split decoder A/B.
+
+    It intentionally has the standalone decoder's fixed I/O and the same
+    ``execution_mode`` first/later-step semantics, but contains no encoder
+    invocation or output ``Where`` selection.  Compile it only to localize a
+    unified-graph discrepancy; it is not a replacement for the retained-state
+    single-QPC deployment wrapper.
+    """
+
+    def __init__(self, model: "QEffDiffusionGemmaForBlockDiffusion"):
+        super().__init__(model, fuse_sampler=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1389,6 +1414,10 @@ class QEffDiffusionGemmaForBlockDiffusion(DiffusionGemmaForBlockDiffusion):
         on-device instead of the full ``[B, canvas, vocab]`` ``canvas_logits``.
         """
         return QEffDiffusionGemmaCanvasDecodeWrapper(self, fuse_sampler=fuse_sampler, max_top_k=max_top_k)
+
+    def get_qeff_decoder_only_unified_probe(self) -> QEffDiffusionGemmaDecoderOnlyUnifiedWrapper:
+        """Build the fixed-shape decoder-only diagnostic graph for a QPC A/B."""
+        return QEffDiffusionGemmaDecoderOnlyUnifiedWrapper(self)
 
     def get_submodules_for_export(self) -> Type[nn.Module]:
         return {QEffDiffusionGemmaEncoderTextLayer}

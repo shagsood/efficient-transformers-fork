@@ -12,10 +12,10 @@ one fixed-shape specialization:
 
   input_ids=[1,prefill_seq_len], decoder_input_ids=[1,canvas_length]
 
-The runtime tensor ``is_encode`` selects behavior:
+The runtime tensor ``execution_mode`` selects behavior:
 
-  * is_encode=1: encoder-prefill writes retained KV.
-  * is_encode=0: canvas-decode reads retained KV and denoises the canvas.
+  * 0: encoder prefill; 1: finalized-canvas commit.
+  * 2: decoder first step; 3: decoder later step with self-conditioning.
 
 For one output canvas, the encoder runs once. Decoder outputs are not fed back
 to the encoder during denoising; only the canvas/self-conditioning state changes
@@ -25,16 +25,25 @@ outer loop via ``--max-new-tokens``: denoise one canvas, commit it into the
 retained encoder KV, then denoise the next canvas.
 """
 
-import os
-import time
 import argparse
+import os
 import re
+import time
 from io import BytesIO
 
-import onnx
 import numpy as np
+import onnx
 import requests
 import torch
+from diffusion_gemma_debug import (
+    HostSampler,
+    TraceWriter,
+    array_summary,
+    kv_sample_manifest,
+    logits_sample,
+    npi_tensor_count,
+    write_matched_accum_npi,
+)
 from PIL import Image
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
@@ -71,9 +80,27 @@ parser.add_argument("--diffusion-steps", type=int, default=diffusion_steps, help
 parser.add_argument("--no-stop-on-eos", action="store_true", help="Do not truncate/stop at the first EOS in a canvas.")
 parser.add_argument("--truncate-first-sentence", action="store_true", help="Return only the first complete sentence.")
 parser.add_argument("--verbose-steps", action="store_true", help="Decode and print a preview after every diffusion step.")
+parser.add_argument("--trace-file", default=None, help="Write deterministic JSONL equivalence instrumentation.")
+parser.add_argument(
+    "--sampler-policy",
+    choices=HostSampler.POLICIES,
+    default="numpy-gumbel",
+    help="Historical NumPy sampler or the Transformers-compatible torch sampler and adaptive stopping.",
+)
+parser.add_argument(
+    "--precision-profile",
+    choices=("current", "matched"),
+    default="current",
+    help="Use the historical precision islands or one semantic selector shared with dual-QPC.",
+)
+parser.add_argument(
+    "--matmul-precision",
+    choices=("mxfp6", "fp16"),
+    default="mxfp6",
+    help="Matmul weight precision; fp16 is a slower equivalence-control compile.",
+)
 args = parser.parse_args()
-if args.seed >= 0:
-    np.random.seed(args.seed)
+trace = TraceWriter(args.trace_file, "single-qpc")
 ctx_len = args.ctx_len
 canvas_length = args.canvas_length
 diffusion_steps = args.diffusion_steps
@@ -243,11 +270,16 @@ for i in range(text_cfg.num_hidden_layers):
     for kv in ("key", "value"):
         uni_custom_io[f"past_{kv}.{i}"] = "float16"
         uni_custom_io[f"past_{kv}.{i}_RetainedState"] = "float16"
+uni_npi_path = (
+    write_matched_accum_npi(uni.onnx_path)
+    if args.precision_profile == "matched"
+    else _write_unified_accum_npi(uni.onnx_path)
+)
 uni_qpc = uni._compile(
     onnx_path=uni.onnx_path, compile_dir=None, specializations=uni_spec,
-    convert_to_fp16=True, mxfp6_matmul=True, mdp_ts_num_devices=num_devices,
+    convert_to_fp16=True, mxfp6_matmul=args.matmul_precision == "mxfp6", mdp_ts_num_devices=num_devices,
     aic_num_cores=num_cores, custom_io=uni_custom_io, retained_state=True,
-    aic_enable_depth_first=True, node_precision_info=_write_unified_accum_npi(uni.onnx_path),
+    aic_enable_depth_first=True, node_precision_info=uni_npi_path,
 )
 print(f"  unified QPC: {uni_qpc}  ({time.time() - t0:.0f}s)")
 
@@ -315,6 +347,40 @@ canvas_pos = np.arange(seq_len, seq_len + canvas_length, dtype=np.int64).reshape
 prompt_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
 prompt_attn_mask[:, :seq_len] = 1
 
+trace.event(
+    "run_config",
+    prompt=prompt_text,
+    text_only=args.text_only,
+    prompt_length=seq_len,
+    prefill_seq_len=prefill_seq_len,
+    ctx_len=ctx_len,
+    canvas_length=canvas_length,
+    max_new_tokens=max_new_tokens,
+    diffusion_steps=diffusion_steps,
+    seed=args.seed,
+    precision=f"{args.matmul_precision}-matmul/fp16-kv/fp32-accum-island",
+    precision_profile=args.precision_profile,
+    precision_island={"unified_selected_tensors": npi_tensor_count(uni_npi_path)},
+    fuse_sampler=False,
+    sampler=args.sampler_policy,
+    sampler_config={
+        "entropy_bound": 0.1,
+        "t_min": 0.4,
+        "t_max": 0.8,
+        "stability_threshold": 1,
+        "confidence_threshold": 0.005,
+        "acceptance": "per-step" if args.sampler_policy == "hf-torch" else "cumulative",
+        "final_canvas": "argmax" if args.sampler_policy == "hf-torch" else "accepted",
+    },
+    diffusion_stop=(
+        "stable-argmax-and-mean-entropy-below-0.005-or-step-cap"
+        if args.sampler_policy == "hf-torch"
+        else "full-acceptance-or-step-cap"
+    ),
+    stop_on_eos=not args.no_stop_on_eos,
+    truncate_first_sentence=args.truncate_first_sentence,
+)
+
 t0 = time.perf_counter()
 prefill_out = session.run({
     "input_ids": input_ids,
@@ -326,12 +392,21 @@ prefill_out = session.run({
     "decoder_position_ids": canvas_pos,
     "self_conditioning_logits": np.zeros((1, canvas_length, vocab_size), dtype=np.float32),
     "encoder_attention_mask": prompt_attn_mask,
-    "is_encode": np.array([1], dtype=np.int64),
+    "execution_mode": np.array([0], dtype=np.int64),
 })
 ttft = time.perf_counter() - t0
 retained_buffers = [n for n in session.input_names + session.output_names if n.startswith("past_")]
 session.skip_buffers(retained_buffers)
 print(f"\nTTFT: {ttft:.2f}s ({len([n for n in prefill_out if n.startswith('past_')])} KV buffers retained)")
+trace.event(
+    "prefill",
+    position_ids=array_summary(position_ids, include_values=True),
+    attention_mask=array_summary(prompt_attn_mask, include_values=True),
+    kv_behavior="retained-state write in unified QPC; decode reads and re-emits unchanged; commit overwrites selected positions",
+    kv_buffers=sorted(retained_buffers),
+    kv_samples=kv_sample_manifest(prefill_out, seq_len),
+    bound_inputs=sorted(session.input_names),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -343,19 +418,30 @@ def _session_feed(feed):
     return {k: v for k, v in feed.items() if k in session.input_names}
 
 
+sampler = HostSampler(args.sampler_policy, args.seed, vocab_size, canvas_length)
+
+
 def _denoise_canvas(block_index, cursor):
-    canvas = np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
-    new_canvas = canvas.copy()
+    canvas = sampler.initialize_canvas()
     canvas_pos = np.arange(cursor, cursor + canvas_length, dtype=np.int64).reshape(1, -1)
     enc_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
     enc_attn_mask[:, :cursor] = 1
-    accepted_mask = np.zeros((1, canvas_length), dtype=bool)
     sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
 
-    entropy_bound, t_max, t_min = 0.1, 0.8, 0.4
+    trace.event(
+        "canvas_start",
+        block=block_index,
+        cursor=cursor,
+        decoder_position_ids=array_summary(canvas_pos, include_values=True),
+        encoder_attention_mask=array_summary(enc_attn_mask, include_values=True),
+        initial_canvas=array_summary(canvas, include_values=True),
+        kv_behavior="read retained-state KV in unified QPC",
+        encoder_attention_mask_bound="encoder_attention_mask" in session.input_names,
+    )
+
     t0 = time.perf_counter()
     for step in range(diffusion_steps):
-        temperature = t_min + (t_max - t_min) * (diffusion_steps - 1 - step) / max(1, diffusion_steps - 1)
+        canvas_input = canvas.copy()
         out = session.run(_session_feed({
             "input_ids": input_ids,
             "position_ids": position_ids,
@@ -366,39 +452,50 @@ def _denoise_canvas(block_index, cursor):
             "decoder_position_ids": canvas_pos,
             "self_conditioning_logits": sc,
             "encoder_attention_mask": enc_attn_mask,
-            "is_encode": np.array([0], dtype=np.int64),
+            "execution_mode": np.array([2 if step == 0 else 3], dtype=np.int64),
         }))
         canvas_logits = out["canvas_logits"].astype(np.float32)
-        sc = canvas_logits
-        lt = canvas_logits / temperature
-        gumbel = -np.log(-np.log(np.random.uniform(size=lt.shape).astype(np.float32) + 1e-20) + 1e-20)
-        denoiser = (lt + gumbel).argmax(-1).astype(np.int64)
-        shifted = lt - lt.max(-1, keepdims=True)
-        log_softmax = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
-        ent = -(np.exp(log_softmax) * log_softmax).sum(-1)[0]
-        order = np.argsort(ent)
-        sel = (np.cumsum(ent[order]) - ent[order]) <= entropy_bound
-        new_acc = np.zeros(canvas_length, dtype=bool)
-        new_acc[order[sel]] = True
-        new_canvas = np.where(new_acc[None, :], denoiser, canvas)
-        accepted_mask = accepted_mask | new_acc[None, :]
-        canvas = np.where(
-            ~accepted_mask,
-            np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
-            new_canvas,
+        sample = sampler.step(canvas_logits, canvas, step, diffusion_steps)
+        sc = sample.self_conditioning_logits
+        canvas = sample.next_canvas
+        final_canvas = sample.final_canvas
+        accepted_count = sample.accepted_count
+        trace.event(
+            "denoise_step",
+            block=block_index,
+            step=step,
+            decoder_phase="first" if step == 0 else "later",
+            self_conditioning="disabled" if step == 0 else "previous_canvas_logits",
+            execution_mode=2 if step == 0 else 3,
+            temperature=sample.temperature,
+            canvas_input=array_summary(canvas_input, include_values=True),
+            denoiser_tokens=array_summary(sample.denoiser_canvas, include_values=True),
+            argmax_tokens=array_summary(sample.argmax_canvas, include_values=True),
+            logits_sample=logits_sample(canvas_logits),
+            pre_sampling_logits=array_summary(canvas_logits) if step == 0 else None,
+            pre_sampling_argmax=(
+                array_summary(canvas_logits.argmax(-1).astype(np.int64), include_values=True) if step == 0 else None
+            ),
+            acceptance_mask=array_summary(sample.accepted_mask, include_values=True),
+            accepted_count=accepted_count,
+            mean_entropy=sample.mean_entropy,
+            adaptive_stop=sample.should_stop,
+            stop_reason=sample.stop_reason,
         )
-        accepted_count = int(accepted_mask.sum())
         if args.verbose_steps:
-            preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
+            preview = processor.tokenizer.decode(final_canvas[0].tolist(), skip_special_tokens=True)
             print(
                 f"  block {block_index + 1:2d} step {step + 1:2d} "
-                f"t={temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}"
+                f"t={sample.temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}"
             )
         else:
-            print(f"  block {block_index + 1:2d} step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length}")
-        if accepted_count >= canvas_length:
+            print(
+                f"  block {block_index + 1:2d} step {step + 1:2d} "
+                f"t={sample.temperature:.2f} acc={accepted_count}/{canvas_length}"
+            )
+        if sample.should_stop:
             break
-    return new_canvas, step + 1, time.perf_counter() - t0, int(accepted_mask.sum())
+    return final_canvas, step + 1, time.perf_counter() - t0, accepted_count
 
 
 def _commit_canvas(tokens, cursor):
@@ -412,6 +509,14 @@ def _commit_canvas(tokens, cursor):
     commit_mm_type_ids = np.zeros((1, prefill_seq_len), dtype=np.int64)
     commit_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
     commit_attn_mask[:, : cursor + commit_len] = 1
+    trace.event(
+        "commit",
+        cursor=cursor,
+        token_ids=array_summary(tokens, include_values=True),
+        position_ids=array_summary(commit_position_ids, include_values=True),
+        attention_mask=array_summary(commit_attn_mask, include_values=True),
+        kv_behavior="retained-state read/modify/write in unified QPC",
+    )
     session.run(_session_feed({
         "input_ids": commit_input_ids,
         "position_ids": commit_position_ids,
@@ -422,7 +527,7 @@ def _commit_canvas(tokens, cursor):
         "decoder_position_ids": np.arange(cursor, cursor + canvas_length, dtype=np.int64).reshape(1, -1),
         "self_conditioning_logits": np.zeros((1, canvas_length, vocab_size), dtype=np.float32),
         "encoder_attention_mask": commit_attn_mask,
-        "is_encode": np.array([1], dtype=np.int64),
+        "execution_mode": np.array([1], dtype=np.int64),
     }))
 
 
@@ -467,6 +572,16 @@ for block in range(num_blocks):
     total_steps += steps_run
     total_canvas_time += canvas_time
     cursor += block_tokens.shape[1]
+    trace.event(
+        "canvas_final",
+        block=block,
+        steps=steps_run,
+        accepted_count=accepted_count,
+        final_token_ids=array_summary(block_tokens, include_values=True),
+        eos_hit=hit_eos,
+        eos_offset=eos_pos,
+        generated_length=sum(part.shape[1] for part in generated),
+    )
     print(
         f"  block {block + 1:2d} done: {steps_run} steps, {canvas_time:.1f}s, "
         f"accepted={accepted_count}/{canvas_length}, finalized={block_tokens.shape[1]}, cursor={cursor}"
@@ -487,3 +602,11 @@ output_text = _clean_diffusion_text(raw_output, truncate_first_sentence=(execute
 print(f"\nCanvas: {total_steps} steps across {executed_blocks} blocks, {total_canvas_time:.1f}s, "
       f"{total_steps * canvas_length / total_canvas_time:.1f} tok/s")
 print(f"\nOutput:\n{output_text}")
+trace.event(
+    "run_final",
+    generated_length=all_tokens.shape[1],
+    final_token_ids=array_summary(all_tokens, include_values=True),
+    blocks=executed_blocks,
+    total_steps=total_steps,
+)
+trace.close()

@@ -22,16 +22,25 @@ thrash. KV is still copied through host at canvas boundaries.
 For the single-QPC (unified) variant, see diffusion_gemma_single_qpc_example.py.
 """
 
-import os
-import time
 import argparse
+import os
 import re
+import time
 from io import BytesIO
 
-import onnx
 import numpy as np
+import onnx
 import requests
 import torch
+from diffusion_gemma_debug import (
+    HostSampler,
+    TraceWriter,
+    array_summary,
+    kv_sample_manifest,
+    logits_sample,
+    npi_tensor_count,
+    write_matched_accum_npi,
+)
 from PIL import Image
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
@@ -73,9 +82,27 @@ parser.add_argument("--decoder-devices", default=None, help="Comma-separated dec
 parser.add_argument("--no-stop-on-eos", action="store_true", help="Do not truncate/stop at the first EOS in a canvas.")
 parser.add_argument("--truncate-first-sentence", action="store_true", help="Return only the first complete sentence.")
 parser.add_argument("--verbose-steps", action="store_true", help="Decode and print a preview after every diffusion step.")
+parser.add_argument("--trace-file", default=None, help="Write deterministic JSONL equivalence instrumentation.")
+parser.add_argument(
+    "--sampler-policy",
+    choices=HostSampler.POLICIES,
+    default="numpy-gumbel",
+    help="Historical NumPy sampler or the Transformers-compatible torch sampler and adaptive stopping.",
+)
+parser.add_argument(
+    "--precision-profile",
+    choices=("current", "matched"),
+    default="current",
+    help="Use the historical precision islands or one semantic selector shared with single-QPC.",
+)
+parser.add_argument(
+    "--matmul-precision",
+    choices=("mxfp6", "fp16"),
+    default="mxfp6",
+    help="Matmul weight precision; fp16 is a slower equivalence-control compile.",
+)
 args = parser.parse_args()
-if args.seed >= 0:
-    np.random.seed(args.seed)
+trace = TraceWriter(args.trace_file, "dual-qpc")
 ctx_len = args.ctx_len
 canvas_length = args.canvas_length
 diffusion_steps = args.diffusion_steps
@@ -91,6 +118,8 @@ if max_new_tokens <= 0:
     raise ValueError("--max-new-tokens must be positive")
 if canvas_length <= 0:
     raise ValueError("--canvas-length must be positive")
+if args.fuse_sampler and args.sampler_policy != "numpy-gumbel":
+    raise ValueError("--fuse-sampler only supports --sampler-policy numpy-gumbel")
 
 
 # ---------------------------------------------------------------------------
@@ -311,11 +340,16 @@ for i in range(text_cfg.num_hidden_layers):
     for kv in ("key", "value"):
         enc_custom_io[f"past_{kv}.{i}"] = "float16"
         enc_custom_io[f"past_{kv}.{i}_out"] = "float16"
+enc_npi_path = (
+    write_matched_accum_npi(enc.onnx_path)
+    if args.precision_profile == "matched"
+    else _write_encoder_accum_npi(enc.onnx_path)
+)
 enc_qpc = enc._compile(
     onnx_path=enc.onnx_path, compile_dir=None, specializations=enc_spec,
-    convert_to_fp16=True, mxfp6_matmul=True, mdp_ts_num_devices=num_devices,
+    convert_to_fp16=True, mxfp6_matmul=args.matmul_precision == "mxfp6", mdp_ts_num_devices=num_devices,
     aic_num_cores=num_cores, custom_io=enc_custom_io, aic_enable_depth_first=True,
-    node_precision_info=_write_encoder_accum_npi(enc.onnx_path),
+    node_precision_info=enc_npi_path,
 )
 print(f"  encoder QPC: {enc_qpc}  ({time.time() - t0:.0f}s)")
 
@@ -338,7 +372,7 @@ dec_compile_kwargs = {
     "compile_dir": None,
     "specializations": dec_spec,
     "convert_to_fp16": True,
-    "mxfp6_matmul": True,
+    "mxfp6_matmul": args.matmul_precision == "mxfp6",
     "mdp_ts_num_devices": num_devices,
     "aic_num_cores": num_cores,
     "custom_io": dec_custom_io,
@@ -346,7 +380,14 @@ dec_compile_kwargs = {
     "aic_enable_depth_first": True,
 }
 if not args.fuse_sampler:
-    dec_compile_kwargs["node_precision_info"] = _write_decode_accum_npi(dec.onnx_path)
+    dec_npi_path = (
+        write_matched_accum_npi(dec.onnx_path)
+        if args.precision_profile == "matched"
+        else _write_decode_accum_npi(dec.onnx_path)
+    )
+    dec_compile_kwargs["node_precision_info"] = dec_npi_path
+else:
+    dec_npi_path = None
 dec_qpc = dec._compile(**dec_compile_kwargs)
 print(f"  canvas-decode QPC: {dec_qpc}  ({time.time() - t0:.0f}s)")
 
@@ -428,6 +469,54 @@ kv_host = _run_encoder_commit(input_ids, position_ids, mm_type_ids)
 ttft = time.perf_counter() - t0
 print(f"\nTTFT: {ttft:.2f}s ({len(kv_host)} KV buffers captured)")
 
+prompt_attn_mask = np.zeros((1, ctx_len), dtype=np.int64)
+prompt_attn_mask[:, :seq_len] = 1
+trace.event(
+    "run_config",
+    prompt=prompt_text,
+    text_only=args.text_only,
+    prompt_length=seq_len,
+    prefill_seq_len=prefill_seq_len,
+    ctx_len=ctx_len,
+    canvas_length=canvas_length,
+    max_new_tokens=max_new_tokens,
+    diffusion_steps=diffusion_steps,
+    seed=args.seed,
+    precision=f"{args.matmul_precision}-matmul/fp16-kv/fp32-accum-island",
+    precision_profile=args.precision_profile,
+    precision_island={
+        "encoder_selected_tensors": npi_tensor_count(enc_npi_path),
+        "decoder_selected_tensors": npi_tensor_count(dec_npi_path) if dec_npi_path else 0,
+    },
+    fuse_sampler=args.fuse_sampler,
+    sampler="fused-top-k-gumbel-max" if args.fuse_sampler else args.sampler_policy,
+    sampler_config={
+        "entropy_bound": 0.1,
+        "t_min": 0.4,
+        "t_max": 0.8,
+        "stability_threshold": 1,
+        "confidence_threshold": 0.005,
+        "acceptance": "per-step" if args.sampler_policy == "hf-torch" else "cumulative",
+        "final_canvas": "argmax" if args.sampler_policy == "hf-torch" else "accepted",
+    },
+    diffusion_stop=(
+        "stable-argmax-and-mean-entropy-below-0.005-or-step-cap"
+        if args.sampler_policy == "hf-torch"
+        else "full-acceptance-or-step-cap"
+    ),
+    stop_on_eos=not args.no_stop_on_eos,
+    truncate_first_sentence=args.truncate_first_sentence,
+)
+trace.event(
+    "prefill",
+    position_ids=array_summary(position_ids, include_values=True),
+    attention_mask=array_summary(prompt_attn_mask, include_values=True),
+    kv_behavior="encoder QPC regular outputs copied through host to decoder QPC inputs",
+    kv_buffers=sorted(kv_host),
+    kv_samples=kv_sample_manifest(kv_host, seq_len),
+    bound_inputs=sorted(enc_session.input_names),
+)
+
 
 # ---------------------------------------------------------------------------
 # Phase 2: canvas denoise + optional multi-canvas commit loop.
@@ -437,11 +526,17 @@ vocab_size = text_cfg.vocab_size
 dec_session = QAICInferenceSession(str(dec_qpc), decoder_device_ids)
 
 entropy_bound, t_max, t_min = 0.1, 0.8, 0.4
+sampler_rng = np.random.RandomState(args.seed if args.seed >= 0 else None)
+sampler = HostSampler(args.sampler_policy, args.seed, vocab_size, canvas_length)
 
 
 def _denoise_canvas(block_index, cursor, past):
-    canvas = np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
-    new_canvas = canvas.copy()
+    canvas = (
+        sampler_rng.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64)
+        if args.fuse_sampler
+        else sampler.initialize_canvas()
+    )
+    final_canvas = canvas.copy()
     prev_tokens = canvas.copy()
     accepted_mask = np.zeros((1, canvas_length), dtype=bool)
     sc = np.zeros((1, canvas_length, vocab_size), dtype=np.float32)
@@ -450,61 +545,117 @@ def _denoise_canvas(block_index, cursor, past):
     enc_attn_mask[:, :cursor] = 1
     const_feed = {"decoder_position_ids": canvas_pos, "encoder_attention_mask": enc_attn_mask, **past}
     dec_session.set_buffers(_session_feed(dec_session, const_feed))
+    trace.event(
+        "canvas_start",
+        block=block_index,
+        cursor=cursor,
+        decoder_position_ids=array_summary(canvas_pos, include_values=True),
+        encoder_attention_mask=array_summary(enc_attn_mask, include_values=True),
+        initial_canvas=array_summary(canvas, include_values=True),
+        kv_behavior="host KV set once as persistent decoder QPC buffers for this canvas",
+        encoder_attention_mask_bound="encoder_attention_mask" in dec_session.input_names,
+    )
 
     t0 = time.perf_counter()
     for step in range(diffusion_steps):
         temperature = t_min + (t_max - t_min) * (diffusion_steps - 1 - step) / max(1, diffusion_steps - 1)
+        canvas_input = canvas.copy()
         if args.fuse_sampler:
-            random_numbers = np.random.uniform(
+            random_numbers = sampler_rng.uniform(
                 low=0.0,
                 high=1.0,
                 size=(1, canvas_length, args.max_top_k),
             ).astype(np.float32)
             out = dec_session.run(_session_feed(dec_session, {
                 "decoder_input_ids": canvas,
+                "execution_mode": np.array([2 if step == 0 else 3], dtype=np.int64),
                 "temperature": np.array([[[temperature]]], dtype=np.float32),
                 "random_numbers": random_numbers,
                 "prev_tokens": prev_tokens,
             }))
             denoiser = out["denoiser_tokens"].astype(np.int64)
             ent = out["token_entropy"].astype(np.float32)[0]
+            order = np.argsort(ent)
+            sel = (np.cumsum(ent[order]) - ent[order]) <= entropy_bound
+            new_acc = np.zeros(canvas_length, dtype=bool)
+            new_acc[order[sel]] = True
+            final_canvas = np.where(new_acc[None, :], denoiser, canvas)
+            accepted_mask = accepted_mask | new_acc[None, :]
+            canvas = np.where(
+                ~accepted_mask,
+                sampler_rng.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
+                final_canvas,
+            )
+            prev_tokens = denoiser.copy()
+            accepted_count = int(accepted_mask.sum())
+            mean_entropy = float(ent.mean())
+            should_stop = accepted_count >= canvas_length
+            stop_reason = "full-acceptance" if should_stop else None
+            trace_acceptance_mask = accepted_mask
+            argmax_tokens = None
+            step_logits_sample = None
         else:
             out = dec_session.run(_session_feed(dec_session, {
                 "decoder_input_ids": canvas,
                 "self_conditioning_logits": sc,
+                "execution_mode": np.array([2 if step == 0 else 3], dtype=np.int64),
             }))
             canvas_logits = out["canvas_logits"].astype(np.float32)
-            sc = canvas_logits
-            lt = canvas_logits / temperature
-            gumbel = -np.log(-np.log(np.random.uniform(size=lt.shape).astype(np.float32) + 1e-20) + 1e-20)
-            denoiser = (lt + gumbel).argmax(-1).astype(np.int64)
-            shifted = lt - lt.max(-1, keepdims=True)
-            log_softmax = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
-            ent = -(np.exp(log_softmax) * log_softmax).sum(-1)[0]
-        order = np.argsort(ent)
-        sel = (np.cumsum(ent[order]) - ent[order]) <= entropy_bound
-        new_acc = np.zeros(canvas_length, dtype=bool)
-        new_acc[order[sel]] = True
-        new_canvas = np.where(new_acc[None, :], denoiser, canvas)
-        accepted_mask = accepted_mask | new_acc[None, :]
-        canvas = np.where(
-            ~accepted_mask,
-            np.random.randint(0, vocab_size, size=(1, canvas_length), dtype=np.int64),
-            new_canvas,
+            sample = sampler.step(canvas_logits, canvas, step, diffusion_steps)
+            sc = sample.self_conditioning_logits
+            denoiser = sample.denoiser_canvas
+            canvas = sample.next_canvas
+            final_canvas = sample.final_canvas
+            accepted_count = sample.accepted_count
+            mean_entropy = sample.mean_entropy
+            should_stop = sample.should_stop
+            stop_reason = sample.stop_reason
+            trace_acceptance_mask = sample.accepted_mask
+            argmax_tokens = sample.argmax_canvas
+            step_logits_sample = logits_sample(canvas_logits)
+        reported_temperature = sample.temperature if not args.fuse_sampler else float(temperature)
+        trace.event(
+            "denoise_step",
+            block=block_index,
+            step=step,
+            decoder_phase="first" if step == 0 else "later",
+            self_conditioning=(
+                "disabled" if step == 0 else ("prev_tokens" if args.fuse_sampler else "previous_canvas_logits")
+            ),
+            execution_mode=2 if step == 0 else 3,
+            temperature=reported_temperature,
+            canvas_input=array_summary(canvas_input, include_values=True),
+            denoiser_tokens=array_summary(denoiser, include_values=True),
+            argmax_tokens=(array_summary(argmax_tokens, include_values=True) if argmax_tokens is not None else None),
+            logits_sample=step_logits_sample,
+            pre_sampling_logits=(
+                array_summary(canvas_logits) if step == 0 and not args.fuse_sampler else None
+            ),
+            pre_sampling_argmax=(
+                array_summary(canvas_logits.argmax(-1).astype(np.int64), include_values=True)
+                if step == 0 and not args.fuse_sampler
+                else None
+            ),
+            acceptance_mask=array_summary(trace_acceptance_mask, include_values=True),
+            accepted_count=accepted_count,
+            mean_entropy=mean_entropy,
+            adaptive_stop=should_stop,
+            stop_reason=stop_reason,
         )
-        prev_tokens = denoiser.copy() if args.fuse_sampler else new_canvas.copy()
-        accepted_count = int(accepted_mask.sum())
         if args.verbose_steps:
-            preview = processor.tokenizer.decode(new_canvas[0].tolist(), skip_special_tokens=True)
+            preview = processor.tokenizer.decode(final_canvas[0].tolist(), skip_special_tokens=True)
             print(
                 f"  block {block_index + 1:2d} step {step + 1:2d} "
-                f"t={temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}"
+                f"t={reported_temperature:.2f} acc={accepted_count}/{canvas_length} :: {preview[:60]!r}"
             )
         else:
-            print(f"  block {block_index + 1:2d} step {step + 1:2d} t={temperature:.2f} acc={accepted_count}/{canvas_length}")
-        if accepted_count >= canvas_length:
+            print(
+                f"  block {block_index + 1:2d} step {step + 1:2d} "
+                f"t={reported_temperature:.2f} acc={accepted_count}/{canvas_length}"
+            )
+        if should_stop:
             break
-    return new_canvas, step + 1, time.perf_counter() - t0, int(accepted_mask.sum())
+    return final_canvas, step + 1, time.perf_counter() - t0, accepted_count
 
 
 def _pad_commit_inputs(tokens, cursor):
@@ -561,6 +712,16 @@ for block in range(num_blocks):
     total_canvas_time += canvas_time
     old_cursor = cursor
     cursor += block_tokens.shape[1]
+    trace.event(
+        "canvas_final",
+        block=block,
+        steps=steps_run,
+        accepted_count=accepted_count,
+        final_token_ids=array_summary(block_tokens, include_values=True),
+        eos_hit=hit_eos,
+        eos_offset=eos_pos,
+        generated_length=sum(part.shape[1] for part in generated),
+    )
     print(
         f"  block {block + 1:2d} done: {steps_run} steps, {canvas_time:.1f}s, "
         f"accepted={accepted_count}/{canvas_length}, finalized={block_tokens.shape[1]}, cursor={cursor}"
@@ -570,6 +731,14 @@ for block in range(num_blocks):
         break
     if block + 1 < num_blocks and block_tokens.shape[1] > 0:
         commit_inputs = _pad_commit_inputs(block_tokens, old_cursor)
+        trace.event(
+            "commit",
+            cursor=old_cursor,
+            token_ids=array_summary(block_tokens, include_values=True),
+            position_ids=array_summary(commit_inputs[1], include_values=True),
+            attention_mask=None,
+            kv_behavior="host KV from prior encoder call fed to encoder QPC; returned KV replaces host copy",
+        )
         kv_host = _run_encoder_commit(*commit_inputs, past=kv_host)
 
 dec_session.deactivate()
@@ -583,3 +752,11 @@ output_text = _clean_diffusion_text(raw_output, truncate_first_sentence=(execute
 print(f"\nCanvas: {total_steps} steps across {executed_blocks} blocks, {total_canvas_time:.1f}s, "
       f"{total_steps * canvas_length / total_canvas_time:.1f} tok/s")
 print(f"\nOutput:\n{output_text}")
+trace.event(
+    "run_final",
+    generated_length=all_tokens.shape[1],
+    final_token_ids=array_summary(all_tokens, include_values=True),
+    blocks=executed_blocks,
+    total_steps=total_steps,
+)
+trace.close()
