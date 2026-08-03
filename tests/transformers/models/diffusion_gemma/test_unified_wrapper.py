@@ -383,3 +383,25 @@ def test_full_logit_comparison_reports_mad_and_argmax():
     assert metrics["mean_abs"] == pytest.approx(0.1875)
     assert metrics["max_abs"] == pytest.approx(0.5)
     assert metrics["argmax_agreement"] == 1.0
+
+
+def test_decoder_pad_mask_marks_empty_encoder_slots(unified_wrapper):
+    from QEfficient.transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        _build_diffusion_decoder_additive_mask,
+    )
+
+    _, cfg = unified_wrapper
+    width = cfg.text_config.sliding_window
+    encoder_mask = torch.zeros((1, width), dtype=torch.int64)
+    encoder_mask[:, :3] = 1
+    additive = _build_diffusion_decoder_additive_mask(
+        canvas_length=4,
+        encoder_kv_length=width,
+        dtype=torch.float32,
+        batch_size=1,
+        device=torch.device("cpu"),
+        encoder_attention_mask=encoder_mask,
+    )
+    assert torch.equal(additive[0, 0, 0, :3], torch.zeros(3))
+    assert torch.all(additive[0, 0, 0, 3:width] < -1e30)
+    assert torch.equal(additive[0, 0, 0, width:], torch.zeros(4))

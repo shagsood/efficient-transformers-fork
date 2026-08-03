@@ -731,9 +731,10 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
         # Gather on the key tensor), which the compiler resolves to sliding_window
         # vs ctx_len correctly per specialization.
         #
-        # Caller-supplied encoder_attention_mask is ignored: slicing it per-type at
-        # runtime traces as `aicdynamicrawslice`, which is not on-chip mappable at
-        # unified-graph scale.
+        # Keep the caller's pad mask live. A fixed-index gather is used only for
+        # sliding KV, so ONNX receives a constant Gather rather than the unsupported
+        # dynamic raw slice that previously dead-elided the mask input. Full-attention
+        # KV has the fixed context width and uses the mask directly.
         mask_mapping = {}
         for layer_type in self.unique_layer_types:
             rep_layer_key = None
@@ -745,7 +746,17 @@ class QEffDiffusionGemmaDecoderModel(DiffusionGemmaDecoderModel):
                             rep_layer_key = candidate
                             break
 
-            if rep_layer_key is not None:
+            if encoder_attention_mask is not None:
+                if layer_type == "sliding_attention":
+                    sliding_indices = torch.arange(
+                        self.config.sliding_window,
+                        dtype=torch.int64,
+                        device=encoder_attention_mask.device,
+                    )
+                    per_type_mask = torch.index_select(encoder_attention_mask, 1, sliding_indices)
+                else:
+                    per_type_mask = encoder_attention_mask
+            elif rep_layer_key is not None:
                 # ones_like on a [B, 1, KV, 1] slice reshaped to [B, KV] — KV axis
                 # tracks rep_layer_key's dynamic dim -2 (sliding_window or ctx_len).
                 kv_proj = rep_layer_key[:, 0:1, :, 0:1].reshape(rep_layer_key.shape[0], -1)
@@ -952,10 +963,18 @@ class QEffDiffusionGemmaUnifiedWrapper(nn.Module):
         vocab = self.text_config.vocab_size
         canvas_length = getattr(self.config, "canvas_length", 256)
         seq_len = enc_di["input_ids"].shape[1]
+        cache_mask_len = max(seq_len, self.text_config.sliding_window)
+        # The decoder's static sliding-mask Gather needs a cache-width mask even
+        # when the encoder export dummy itself uses a short prompt.
+        merged["past_key_values"] = self.model.get_dummy_pkv_cache(
+            config=self.text_config,
+            batch_size=bs,
+            seq_len=cache_mask_len,
+        )
         merged["decoder_input_ids"] = torch.zeros((bs, canvas_length), dtype=torch.int64)
         merged["decoder_position_ids"] = torch.arange(canvas_length, dtype=torch.int64).view(1, canvas_length).repeat(bs, 1)
         merged["self_conditioning_logits"] = torch.zeros((bs, canvas_length, vocab), dtype=torch.float32)
-        merged["encoder_attention_mask"] = torch.ones((bs, seq_len), dtype=torch.int64)
+        merged["encoder_attention_mask"] = torch.ones((bs, cache_mask_len), dtype=torch.int64)
         merged["execution_mode"] = torch.zeros(1, dtype=torch.int64)
         return merged
 
@@ -1335,7 +1354,11 @@ class QEffDiffusionGemmaCanvasDecodeWrapper(nn.Module):
         text_cfg = self.config.text_config
         canvas_length = getattr(self.config, "canvas_length", 256)
         # KV is sized to ctx so the decoder cross-attends the full encoder cache.
-        seq_len = max(constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN, self.model._get_mm_tokens_per_image() + 32)
+        seq_len = max(
+            constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN,
+            self.model._get_mm_tokens_per_image() + 32,
+            text_cfg.sliding_window,
+        )
         # encoder_attention_mask: per-slot 1=real / 0=pad over the encoder KV cache.
         # Dummy marks all ctx slots real (worst case for graph liveness); the runner
         # feeds the true mask (1 up to the real prompt length, 0 beyond) at inference.
