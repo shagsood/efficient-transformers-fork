@@ -171,6 +171,13 @@ from transformers.models.mllama.modeling_mllama import (
     MllamaTextSelfAttention,
     MllamaVisionModel,
 )
+from transformers.models.muse_glimmer.modeling_muse_glimmer import (
+    MuseGlimmerForConditionalGeneration,
+    MuseGlimmerModel,
+    MuseGlimmerTextAttention,
+    MuseGlimmerTextDecoderLayer,
+    MuseGlimmerTextModel,
+)
 from transformers.models.mpt.modeling_mpt import MptAttention, MptBlock, MptForCausalLM, MptModel
 from transformers.models.olmo2.modeling_olmo2 import (
     Olmo2Attention,
@@ -511,6 +518,13 @@ from QEfficient.transformers.models.molmo.modeling_molmo import (
     QEffMolmoSequentialBlock,
     QEffMultiHeadDotProductAttention,
 )
+from QEfficient.transformers.models.muse_glimmer.modeling_muse_glimmer import (
+    QEffMuseGlimmerForConditionalGeneration,
+    QEffMuseGlimmerModel,
+    QEffMuseGlimmerTextAttention,
+    QEffMuseGlimmerTextDecoderLayer,
+    QEffMuseGlimmerTextModel,
+)
 from QEfficient.transformers.models.mpt.modeling_mpt import (
     QEffMptAttention,
     QEffMptBlock,
@@ -827,6 +841,12 @@ class KVCacheTransform(ModuleMappingTransform):
         MllamaTextModel: QEffMllamaTextModel,
         MllamaForCausalLM: QEffMllamaForCausalLM,
         MllamaForConditionalGeneration: QEffMllamaForConditionalGeneration,
+        # MuseGlimmer
+        MuseGlimmerTextAttention: QEffMuseGlimmerTextAttention,
+        MuseGlimmerTextDecoderLayer: QEffMuseGlimmerTextDecoderLayer,
+        MuseGlimmerTextModel: QEffMuseGlimmerTextModel,
+        MuseGlimmerModel: QEffMuseGlimmerModel,
+        MuseGlimmerForConditionalGeneration: QEffMuseGlimmerForConditionalGeneration,
         # Mistral
         MistralAttention: QEffMistralAttention,
         MistralDecoderLayer: QEffMistralDecoderLayer,
