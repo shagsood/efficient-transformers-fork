@@ -6,7 +6,11 @@
 # -----------------------------------------------------------------------------
 
 
+from pathlib import Path
+
+import onnx
 import torch
+import yaml
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -15,17 +19,42 @@ from transformers.models.muse_glimmer.modeling_muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
     MuseGlimmerModel,
     MuseGlimmerModelOutputWithPast,
+    MuseGlimmerRMSNorm,
     MuseGlimmerTextAttention,
+    MuseGlimmerTextCenteredRMSNorm,
     MuseGlimmerTextDecoderLayer,
     MuseGlimmerTextModel,
     repeat_kv,
 )
 
+from QEfficient.customop.rms_norm import CustomRMSNormFunc
 from QEfficient.transformers.cache_utils import QEffSlidingWindowCache
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
 from QEfficient.utils import constants
 from QEfficient.utils._utils import IOInfo
 from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
+
+
+class QEffMuseGlimmerRMSNormAIC(MuseGlimmerRMSNorm):
+    """Export Muse RMSNorm through the compiler's numerically stable custom op."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not torch.onnx.is_in_onnx_export():
+            return super().forward(hidden_states)
+        if self.with_scale:
+            weight = self.weight
+        else:
+            weight = hidden_states.new_ones(hidden_states.shape[-1])
+        return CustomRMSNormFunc.apply(hidden_states, weight, self.eps).to(hidden_states.dtype)
+
+
+class QEffMuseGlimmerTextCenteredRMSNormAIC(MuseGlimmerTextCenteredRMSNorm):
+    """Preserve Muse's centered RMSNorm scale while using the custom-op export."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not torch.onnx.is_in_onnx_export():
+            return super().forward(hidden_states)
+        return CustomRMSNormFunc.apply(hidden_states, self.weight + 1.0, self.eps).to(hidden_states.dtype)
 
 
 class QEffMuseGlimmerTextAttention(MuseGlimmerTextAttention):
@@ -252,6 +281,24 @@ class QEffMuseGlimmerModel(MuseGlimmerModel):
 class QEffMuseGlimmerForConditionalGeneration(MuseGlimmerForConditionalGeneration):
     def __qeff_init__(self):
         self.language_model = self.model.language_model
+
+    def generate_npi_file(self, onnx_path: str | Path, model_name: str | None = None) -> str:
+        """Keep numerically sensitive Muse operators in FP32 on AI 100."""
+        del model_name
+        onnx_path = Path(onnx_path)
+        model = onnx.load(str(onnx_path), load_external_data=False)
+        fp32_ops = {"CustomRMSNorm", "Sigmoid", "Softmax"}
+        fp32_names = [
+            output_name
+            for node in [*model.graph.node, *(node for function in model.functions for node in function.node)]
+            if node.op_type in fp32_ops
+            for output_name in node.output
+            if output_name
+        ]
+        npi_path = onnx_path.with_name(f"{onnx_path.stem}_muse_glimmer_npi.yaml")
+        with open(npi_path, "w") as fp:
+            yaml.safe_dump({"FP32NodeInstanceNames": list(dict.fromkeys(fp32_names))}, fp, sort_keys=False)
+        return str(npi_path)
 
     def forward(
         self,

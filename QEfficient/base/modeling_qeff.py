@@ -1006,6 +1006,11 @@ class QEFFBaseModel(ABC):
                     ]
                 )
             )
+        if not (qpc_path / "programqpc.bin").is_file():
+            raise RuntimeError(
+                "Compilation exited successfully but did not produce a loadable QPC: "
+                f"{qpc_path}/programqpc.bin is missing"
+            )
         # Dump JSON file with hashed parameters
         hashed_compile_params_path = compile_dir / "hashed_compile_params.json"
         create_json(hashed_compile_params_path, compile_hash_params)

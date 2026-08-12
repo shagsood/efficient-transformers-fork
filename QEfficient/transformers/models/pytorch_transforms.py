@@ -174,7 +174,9 @@ from transformers.models.mllama.modeling_mllama import (
 from transformers.models.muse_glimmer.modeling_muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
     MuseGlimmerModel,
+    MuseGlimmerRMSNorm,
     MuseGlimmerTextAttention,
+    MuseGlimmerTextCenteredRMSNorm,
     MuseGlimmerTextDecoderLayer,
     MuseGlimmerTextModel,
 )
@@ -521,7 +523,9 @@ from QEfficient.transformers.models.molmo.modeling_molmo import (
 from QEfficient.transformers.models.muse_glimmer.modeling_muse_glimmer import (
     QEffMuseGlimmerForConditionalGeneration,
     QEffMuseGlimmerModel,
+    QEffMuseGlimmerRMSNormAIC,
     QEffMuseGlimmerTextAttention,
+    QEffMuseGlimmerTextCenteredRMSNormAIC,
     QEffMuseGlimmerTextDecoderLayer,
     QEffMuseGlimmerTextModel,
 )
@@ -693,6 +697,8 @@ class CustomOpsTransform(ModuleMappingTransform):
         Qwen3VLMoeTextRMSNorm: CustomRMSNormAIC,
         Qwen3VLTextRMSNorm: CustomRMSNormAIC,
         Glm4MoeRMSNorm: CustomRMSNormAIC,
+        MuseGlimmerRMSNorm: QEffMuseGlimmerRMSNormAIC,
+        MuseGlimmerTextCenteredRMSNorm: QEffMuseGlimmerTextCenteredRMSNormAIC,
         Wav2Vec2Encoder: QEffWav2Vec2Encoder,
         Wav2Vec2EncoderStableLayerNorm: QEffWav2Vec2EncoderStableLayerNorm,
         # BERT-family: replace _create_attention_masks (uses create_bidirectional_mask,

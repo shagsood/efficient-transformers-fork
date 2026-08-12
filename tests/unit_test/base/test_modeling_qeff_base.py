@@ -11,6 +11,8 @@ CPU-only tests that do NOT require QAIC hardware.
 Run with: pytest tests/unit_test/base/ -n auto -v
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from transformers import GPT2Config, GPT2LMHeadModel, LlamaConfig, LlamaForCausalLM
@@ -250,6 +252,24 @@ class TestQEFFBaseModelHashParams:
         qeff = QEFFAutoModelForCausalLM(model, pretrained_model_name_or_path="test-model")
         assert "pretrained_model_name_or_path" in qeff.hash_params
         assert qeff.hash_params["pretrained_model_name_or_path"] == "test-model"
+
+
+@pytest.mark.cpu_only
+class TestQEFFBaseModelCompilePackageValidation:
+    """The compile boundary must not return an unloadable QPC directory."""
+
+    def test_compile_rejects_successful_compiler_without_programqpc(self, tmp_path):
+        model, _ = make_tiny_gpt2()
+        qeff = QEFFAutoModelForCausalLM(model)
+        onnx_path = tmp_path / "model.onnx"
+        onnx_path.touch()
+
+        with patch("QEfficient.base.modeling_qeff.subprocess.run") as run:
+            with pytest.raises(RuntimeError, match="programqpc.bin"):
+                qeff._compile(onnx_path=str(onnx_path), compile_dir=str(tmp_path))
+
+        run.assert_called_once()
+        assert qeff.qpc_path is None
 
 
 @pytest.mark.cpu_only

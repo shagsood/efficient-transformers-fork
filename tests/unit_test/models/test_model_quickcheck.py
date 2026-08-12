@@ -23,6 +23,7 @@ import os
 import shutil
 import tempfile
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from copy import deepcopy
 from io import StringIO
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -99,7 +100,100 @@ VLM_EXPORT_MODEL_IDS = {
     "gemma3": "tiny-random/gemma-3",
     "qwen2_5_vl": "optimum-intel-internal-testing/tiny-random-qwen2.5-vl",
     "internvl2": "optimum-intel-internal-testing/tiny-random-internvl2",
+    "muse_glimmer": None,
 }
+
+
+def _tiny_muse_glimmer_model():
+    from transformers.models.muse_glimmer.configuration_muse_glimmer import (
+        MuseGlimmerConfig,
+        MuseGlimmerTextConfig,
+        MuseGlimmerVisionConfig,
+    )
+    from transformers.models.muse_glimmer.modeling_muse_glimmer import MuseGlimmerForConditionalGeneration
+
+    text_config = MuseGlimmerTextConfig(
+        vocab_size=500,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=32,
+        sliding_window=16,
+        layer_types=["sliding_attention", "full_attention"],
+        layer_rope_theta=[500000.0, 0],
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    vision_config = MuseGlimmerVisionConfig(
+        patch_size=2,
+        pos_emb_height=2,
+        pos_emb_width=2,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        hidden_size=32,
+        intermediate_size=64,
+        max_position_embeddings=16,
+        patch_temporal=1,
+        merge_size=2,
+        layer_types=["window_attention", "full_attention"],
+    )
+    config = MuseGlimmerConfig(
+        text_config=text_config,
+        vision_config=vision_config,
+        image_token_id=10,
+        video_token_id=11,
+        out_hidden_size=128,
+        projector_hidden_size=32,
+    )
+    return MuseGlimmerForConditionalGeneration(config).eval(), config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.onnx
+def test_muse_glimmer_rms_norms_use_compiler_custom_op(tmp_path):
+    """Keep both Muse RMSNorm variants on the compiler-recognized export path."""
+    from transformers.models.muse_glimmer.modeling_muse_glimmer import (
+        MuseGlimmerRMSNorm,
+        MuseGlimmerTextCenteredRMSNorm,
+    )
+
+    hf_model, _ = _tiny_muse_glimmer_model()
+    qeff_model = QEFFAutoModelForImageTextToText(
+        deepcopy(hf_model),
+        kv_offload=False,
+        pretrained_model_name_or_path="tiny-muse-glimmer",
+    )
+
+    generic_norms = [
+        module
+        for module in qeff_model.model.modules()
+        if type(module) in {MuseGlimmerRMSNorm, MuseGlimmerTextCenteredRMSNorm}
+    ]
+    assert not generic_norms
+
+    onnx_path = _exported_onnx_path(
+        qeff_model.export(tmp_path / "muse-glimmer-rms", prefill_seq_len=16, ctx_len=16, offload_pt_weights=False)
+    )
+    onnx_model = onnx.load(str(onnx_path), load_external_data=False)
+    assert any(node.domain == "com.qti.aisw.onnx" and node.op_type == "CustomRMSNorm" for node in onnx_model.graph.node)
+
+    import yaml
+
+    npi_path = qeff_model.model.generate_npi_file(onnx_path)
+    npi_data = yaml.safe_load(Path(npi_path).read_text())
+    expected_outputs = {
+        output_name
+        for node in [*onnx_model.graph.node, *(node for function in onnx_model.functions for node in function.node)]
+        if node.op_type in {"CustomRMSNorm", "Sigmoid", "Softmax"}
+        for output_name in node.output
+        if output_name
+    }
+    assert npi_data["FP32NodeInstanceNames"] == list(dict.fromkeys(npi_data["FP32NodeInstanceNames"]))
+    assert set(npi_data["FP32NodeInstanceNames"]) == expected_outputs
 TINY_TEXT_EMBEDDING_MODEL_ID = "hf-internal-testing/tiny-random-BertModel"
 TINY_AUDIO_CTC_MODEL_ID = "hf-internal-testing/tiny-random-wav2vec2"
 TINY_WHISPER_MODEL_ID = "hf-internal-testing/tiny-random-WhisperForConditionalGeneration"
@@ -484,13 +578,233 @@ def test_vlm_text_side_runtime_parity_and_full_export(tmp_path):
 
 
 @pytest.mark.llm_model
+def test_muse_glimmer_tiny_image_text_runtime_and_export_parity(tmp_path):
+    from QEfficient.transformers.models.muse_glimmer.modeling_muse_glimmer import (
+        QEffMuseGlimmerForConditionalGeneration,
+        QEffMuseGlimmerTextAttention,
+    )
+
+    torch.manual_seed(0)
+    hf_model, config = _tiny_muse_glimmer_model()
+    qeff_model = QEFFAutoModelForImageTextToText(
+        deepcopy(hf_model), kv_offload=False, pretrained_model_name_or_path="tiny-muse-glimmer"
+    )
+    assert isinstance(qeff_model.model, QEffMuseGlimmerForConditionalGeneration)
+    assert any(isinstance(module, QEffMuseGlimmerTextAttention) for module in qeff_model.model.modules())
+
+    seq_len = 16
+    grid_h = grid_w = 4
+    vision_tokens = grid_h * grid_w // config.vision_config.merge_size**2
+    input_ids = torch.arange(20, 20 + seq_len).view(1, -1)
+    input_ids[:, 2 : 2 + vision_tokens] = config.image_token_id
+    pixel_values = torch.randn(
+        grid_h * grid_w,
+        config.vision_config.patch_temporal * 3 * config.vision_config.patch_size**2,
+    )
+    image_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.int64)
+    position_ids = torch.arange(seq_len, dtype=torch.int64).view(1, -1)
+    injected_embeds = {}
+
+    def capture_injected_embeds(name):
+        def hook(_module, _args, kwargs):
+            injected_embeds[name] = kwargs["inputs_embeds"].detach().clone()
+
+        return hook
+
+    hf_hook = hf_model.model.language_model.register_forward_pre_hook(
+        capture_injected_embeds("hf"), with_kwargs=True
+    )
+    qeff_hook = qeff_model.model.model.language_model.register_forward_pre_hook(
+        capture_injected_embeds("qeff"), with_kwargs=True
+    )
+    with torch.no_grad():
+        hf_logits = hf_model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            position_ids=position_ids,
+            use_cache=False,
+        ).logits
+        qeff_logits = qeff_model.model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            position_ids=position_ids,
+            use_cache=False,
+        ).logits
+    hf_hook.remove()
+    qeff_hook.remove()
+    assert torch.equal(hf_logits, qeff_logits)
+    assert torch.equal(injected_embeds["hf"], injected_embeds["qeff"])
+
+    multimodal_mask = input_ids == config.image_token_id
+    text_embeds = hf_model.model.get_input_embeddings()(torch.where(multimodal_mask, 0, input_ids))
+    assert torch.equal(injected_embeds["hf"][~multimodal_mask], text_embeds[~multimodal_mask])
+    assert not torch.equal(injected_embeds["hf"][multimodal_mask], text_embeds[multimodal_mask])
+
+    dummy = qeff_model.model.get_dummy_inputs(prefill_seq_len=seq_len, ctx_len=seq_len)
+    dummy["input_ids"] = input_ids
+    with torch.no_grad():
+        qeff_outputs = qeff_model.model(**dummy)
+    onnx_path = _exported_onnx_path(
+        qeff_model.export(tmp_path / "muse-glimmer", prefill_seq_len=seq_len, ctx_len=seq_len, offload_pt_weights=False)
+    )
+    onnx_model = onnx.load(str(onnx_path), load_external_data=False)
+    assert any(node.op_type == "Where" for node in onnx_model.graph.node)
+    session = _ort_session(onnx_path)
+    ort_inputs = {}
+    for item in session.get_inputs():
+        name = item.name
+        if name.startswith("past_key."):
+            tensor = dummy["past_key_values"][int(name.rsplit(".", 1)[1])][0]
+        elif name.startswith("past_value."):
+            tensor = dummy["past_key_values"][int(name.rsplit(".", 1)[1])][1]
+        else:
+            tensor = dummy[name]
+        ort_inputs[name] = tensor.detach().numpy()
+    ort_outputs = session.run(None, ort_inputs)
+    assert np.allclose(qeff_outputs.logits.detach().numpy(), ort_outputs[0], atol=1e-5)
+    assert np.array_equal(qeff_outputs.logits.detach().numpy().argmax(-1), ort_outputs[0].argmax(-1))
+    for layer, (key, value) in enumerate(qeff_outputs.past_key_values):
+        assert np.allclose(key.detach().numpy(), ort_outputs[1 + 2 * layer], atol=1e-5)
+        assert np.allclose(value.detach().numpy(), ort_outputs[2 + 2 * layer], atol=1e-5)
+
+
+@pytest.mark.on_qaic
+def test_muse_glimmer_tiny_local_hardware_parity(tmp_path):
+    """Exercise the canonical local HF -> QEff -> ORT -> QPC tiny gate."""
+    if os.environ.get("MUSE_GLIMMER_TINY_HW") != "1":
+        pytest.skip("set MUSE_GLIMMER_TINY_HW=1 to run the local AI 100 gate")
+
+    device = int(os.environ.get("MUSE_GLIMMER_TINY_HW_DEVICE", "0"))
+    if not os.path.exists(f"/dev/accel/accel{device}"):
+        pytest.skip(f"local AI 100 device {device} is unavailable")
+
+    from QEfficient.generation.cloud_infer import QAICInferenceSession, is_retained_state_name
+
+    torch.manual_seed(0)
+    hf_model, config = _tiny_muse_glimmer_model()
+    qeff_model = QEFFAutoModelForImageTextToText(
+        deepcopy(hf_model),
+        kv_offload=False,
+        pretrained_model_name_or_path="tiny-muse-glimmer",
+    )
+
+    seq_len = 16
+    pixel_values = torch.randn(
+        16,
+        config.vision_config.patch_temporal * 3 * config.vision_config.patch_size**2,
+    )
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int64)
+    input_ids = torch.arange(20, 20 + seq_len).view(1, -1)
+    input_ids[:, 2:6] = config.image_token_id
+    position_ids = torch.arange(seq_len, dtype=torch.int64).view(1, -1)
+    cpu_inputs = {
+        "input_ids": input_ids,
+        "pixel_values": pixel_values,
+        "image_grid_thw": image_grid_thw,
+        "position_ids": position_ids,
+    }
+
+    with torch.no_grad():
+        hf_logits = hf_model(**cpu_inputs, use_cache=False).logits
+        qeff_logits = qeff_model.model(**cpu_inputs, use_cache=False).logits
+    assert torch.equal(hf_logits, qeff_logits)
+    print("HF==QEff logits max_abs: 0.0 PASS")
+
+    qeff_dummy = qeff_model.model.get_dummy_inputs(prefill_seq_len=seq_len, ctx_len=seq_len)
+    qeff_dummy["input_ids"] = input_ids
+    with torch.no_grad():
+        qeff_outputs = qeff_model.model(**qeff_dummy)
+
+    onnx_path = _exported_onnx_path(
+        qeff_model.export(
+            tmp_path / "muse-glimmer-hw",
+            prefill_seq_len=seq_len,
+            ctx_len=seq_len,
+            offload_pt_weights=False,
+        )
+    )
+    ort_session = _ort_session(onnx_path)
+    ort_inputs = {}
+    for item in ort_session.get_inputs():
+        name = item.name
+        if name.startswith("past_key."):
+            tensor = qeff_dummy["past_key_values"][int(name.rsplit(".", 1)[1])][0]
+        elif name.startswith("past_value."):
+            tensor = qeff_dummy["past_key_values"][int(name.rsplit(".", 1)[1])][1]
+        else:
+            tensor = qeff_dummy[name]
+        ort_inputs[name] = tensor.detach().numpy()
+    ort_values = ort_session.run(None, ort_inputs)
+    ort_outputs = dict(zip((item.name for item in ort_session.get_outputs()), ort_values))
+    assert np.allclose(qeff_outputs.logits.detach().numpy(), ort_outputs["logits"], atol=1e-5)
+    for layer, (key, value) in enumerate(qeff_outputs.past_key_values):
+        assert np.allclose(key.detach().numpy(), ort_outputs[f"past_key.{layer}_RetainedState"], atol=1e-5)
+        assert np.allclose(value.detach().numpy(), ort_outputs[f"past_value.{layer}_RetainedState"], atol=1e-5)
+    print("QEff==ORT logits and retained KV max_abs <= 1e-5 PASS")
+
+    qpc_path = qeff_model.compile(
+        compile_dir=str(tmp_path / "muse-glimmer-hw-compile"),
+        num_cores=14,
+        num_devices=1,
+        mxfp6_matmul=False,
+        mxint8_kv_cache=False,
+        node_precision_info=True,
+        batch_size=1,
+        prefill_seq_len=seq_len,
+        ctx_len=seq_len,
+        height=8,
+        width=8,
+    )
+    session = QAICInferenceSession(qpc_path, device_ids=[device])
+    input_retained = [name for name in session.input_names if is_retained_state_name(name)]
+    session.skip_buffers(input_retained)
+    qpc_outputs = session.run({name: ort_inputs[name] for name in session.input_names if name not in input_retained})
+    session.deactivate()
+
+    qpc_logits = qpc_outputs["logits"]
+    ort_logits = ort_outputs["logits"]
+    cosine = float(
+        np.dot(ort_logits.reshape(-1), qpc_logits.reshape(-1))
+        / (np.linalg.norm(ort_logits) * np.linalg.norm(qpc_logits))
+    )
+    logits_max_abs = float(np.max(np.abs(ort_logits - qpc_logits)))
+    assert np.array_equal(ort_logits.argmax(), qpc_logits.argmax())
+    assert cosine >= 0.999
+    print(f"ORT==QPC logits max_abs: {logits_max_abs} cosine: {cosine} PASS")
+
+    for layer in range(config.text_config.num_hidden_layers):
+        for kind in ("key", "value"):
+            name = f"past_{kind}.{layer}_RetainedState"
+            reference = ort_outputs[name]
+            candidate = qpc_outputs[name]
+            if candidate.shape != reference.shape:
+                candidate = candidate[..., : reference.shape[-1]]
+            max_abs = float(np.max(np.abs(reference - candidate)))
+            assert max_abs <= 0.05
+            print(f"ORT==QPC {name} max_abs: {max_abs} PASS")
+
+
+@pytest.mark.llm_model
 @pytest.mark.parametrize(
     ("vlm_name", "model_id"),
     sorted(VLM_EXPORT_MODEL_IDS.items()),
     ids=sorted(VLM_EXPORT_MODEL_IDS),
 )
 def test_vlm_export_smoke_additional_models(vlm_name, model_id, tmp_path):
-    vlm_onnx_path = _export_vlm_with_text_fallback(model_id, tmp_path / f"vlm-{vlm_name}")
+    if vlm_name == "muse_glimmer":
+        hf_model, _ = _tiny_muse_glimmer_model()
+        vlm_model = QEFFAutoModelForImageTextToText(
+            hf_model,
+            kv_offload=False,
+            pretrained_model_name_or_path="tiny-muse-glimmer",
+        )
+        vlm_onnx_path = _exported_onnx_path(
+            vlm_model.export(tmp_path / "vlm-muse_glimmer", prefill_seq_len=16, ctx_len=16)
+        )
+    else:
+        vlm_onnx_path = _export_vlm_with_text_fallback(model_id, tmp_path / f"vlm-{vlm_name}")
     assert vlm_onnx_path.name.endswith(".onnx")
 
 
