@@ -191,6 +191,11 @@ class QEffMuseGlimmerTextModel(MuseGlimmerTextModel):
 
 
 class QEffMuseGlimmerModel(MuseGlimmerModel):
+    def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: torch.LongTensor, **kwargs):
+        outputs = super().get_image_features(pixel_values, image_grid_thw, **kwargs)
+        outputs.pooler_output = tuple(features.clamp(-60000.0, 60000.0) for features in outputs.pooler_output)
+        return outputs
+
     def forward(
         self,
         input_ids=None,
