@@ -11,6 +11,8 @@ CPU-only tests that do NOT require QAIC hardware.
 Run with: pytest tests/unit_test/base/ -n auto -v
 """
 
+import shutil
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +24,23 @@ from QEfficient.transformers.models.modeling_auto import QEFFAutoModelForCausalL
 VOCAB_SIZE = 500
 CTX_LEN = 32
 SEQ_LEN = 8
+
+
+@pytest.mark.cpu_only
+def test_qeff_models_cleanup_preserves_non_temp_cache_by_default(monkeypatch):
+    """Pytest hooks must not wipe a user's global QEff cache by default."""
+    from tests.conftest import _ALLOW_GLOBAL_QEFF_CLEANUP_ENV, qeff_models_clean_up
+
+    guarded_dir = Path.cwd() / ".pytest-qeff-cleanup-guard"
+    guarded_dir.mkdir(exist_ok=True)
+    marker = guarded_dir / "programqpc.bin"
+    marker.write_text("do not delete")
+    monkeypatch.delenv(_ALLOW_GLOBAL_QEFF_CLEANUP_ENV, raising=False)
+    try:
+        qeff_models_clean_up(guarded_dir)
+        assert marker.exists()
+    finally:
+        shutil.rmtree(guarded_dir, ignore_errors=True)
 
 
 def make_tiny_gpt2():

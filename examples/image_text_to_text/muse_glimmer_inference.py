@@ -11,9 +11,11 @@ Example:
     python examples/image_text_to_text/muse_glimmer_inference.py \
         --device-ids 4,5,6,7 --precision mxfp6
 
-Use ``--precision fp16`` as the control path and ``--precision
-mxfp6+mxint8_kv`` to debug the MXINT8 KV-cache path. The printed timing values
-are single-request measurements, intended as deployment telemetry rather than a
+Use ``--precision fp16`` as the control path. ``--precision mxfp6`` enables
+MXFP6 matmuls with FP16 KV cache. ``--precision mxfp6+mxint8-kv`` is exposed for
+debugging the MXINT8 KV-cache path and should not be treated as validated unless
+the model's parity evidence covers it. The printed timing values are
+single-request measurements, intended as deployment telemetry rather than a
 benchmark claim.
 """
 
@@ -37,6 +39,7 @@ DEFAULT_IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-i
 PRECISION_FLAGS = {
     "fp16": {"mxfp6_matmul": False, "mxint8_kv_cache": False},
     "mxfp6": {"mxfp6_matmul": True, "mxint8_kv_cache": False},
+    "mxfp6+mxint8-kv": {"mxfp6_matmul": True, "mxint8_kv_cache": True},
     "mxfp6+mxint8_kv": {"mxfp6_matmul": True, "mxint8_kv_cache": True},
 }
 
@@ -52,6 +55,13 @@ def parse_device_ids(value):
     if not device_ids:
         raise argparse.ArgumentTypeError("--device-ids must contain at least one QID")
     return device_ids
+
+
+def validate_image_size(image_size, patch_size):
+    if image_size <= 0:
+        raise ValueError("--image-size must be positive")
+    if image_size % patch_size:
+        raise ValueError(f"--image-size {image_size} must be divisible by Muse patch size {patch_size}")
 
 
 def load_image(path, url, image_size):
@@ -123,9 +133,17 @@ def next_token(logits):
     return int(logits[0].argmax())
 
 
+def decode_generated_tokens(tokenizer, generated):
+    text = tokenizer.decode(generated, skip_special_tokens=True)
+    # Muse's chat template can leave routing fragments in raw greedy output when
+    # decoding only the newly generated tokens. Keep the raw token ids above and
+    # present a cleaner user-facing string here.
+    return text.replace("to=self", "").strip()
+
+
 def compile_or_load(model, args):
     if args.qpc_path:
-        qpc_path = Path(args.qpc_path)
+        qpc_path = Path(args.qpc_path).expanduser()
         if not (qpc_path / "programqpc.bin").is_file():
             raise FileNotFoundError(f"No programqpc.bin under --qpc-path: {qpc_path}")
         return qpc_path, 0.0
@@ -154,24 +172,31 @@ def main():
     parser.add_argument("--prefill-seq-len", type=int, default=640)
     parser.add_argument("--ctx-len", type=int, default=1024)
     parser.add_argument("--generation-len", type=int, default=32)
+    parser.add_argument("--warmup-runs", type=int, default=0, help="Extra prefill runs before measured inference")
     parser.add_argument("--num-cores", type=int, default=16)
     parser.add_argument("--device-ids", type=parse_device_ids, required=True, help="Comma-separated Cloud AI 100 QIDs")
     parser.add_argument("--precision", choices=PRECISION_FLAGS, default="mxfp6")
     parser.add_argument("--qpc-path", help="Reuse an existing QPC instead of compiling")
+    parser.add_argument("--compile-only", action="store_true", help="Compile or validate --qpc-path and exit before runtime")
     args = parser.parse_args()
 
     if args.generation_len < 1:
         parser.error("--generation-len must be at least 1")
+    if args.warmup_runs < 0:
+        parser.error("--warmup-runs must be non-negative")
 
     print(f"Loading {args.model_name}")
     model = QEFFAutoModelForImageTextToText.from_pretrained(args.model_name, kv_offload=False)
     processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
     tokenizer = getattr(processor, "tokenizer", processor)
+    validate_image_size(args.image_size, model.model.config.vision_config.patch_size)
 
     qpc_path, compile_seconds = compile_or_load(model, args)
     print(f"QPC: {qpc_path}")
     if compile_seconds:
         print(f"Compile time: {compile_seconds:.2f} s")
+    if args.compile_only:
+        return
 
     prefill, valid_len = prepare_prefill(processor, tokenizer, args)
     session_started = time.perf_counter()
@@ -180,6 +205,9 @@ def main():
 
     try:
         prefill.update(zero_past_inputs(session.input_names, model.model.config, args.ctx_len))
+        for _ in range(args.warmup_runs):
+            session_run(session, prefill)
+
         prefill_started = time.perf_counter()
         outputs = session_run(session, prefill)
         prefill_seconds = time.perf_counter() - prefill_started
@@ -209,16 +237,20 @@ def main():
     finally:
         session.deactivate()
 
-    decoded = tokenizer.decode(generated, skip_special_tokens=True)
+    decoded = decode_generated_tokens(tokenizer, generated)
     decode_tokens = max(len(generated) - 1, 0)
+    total_runtime_seconds = prefill_seconds + decode_seconds
     print(f"Generated token ids: {generated}")
     print(f"Generated text: {decoded!r}")
     print("Performance (single request):")
+    if args.warmup_runs:
+        print(f"  Warmup prefill runs: {args.warmup_runs}")
     print(f"  QPC load: {session_load_seconds * 1000:.1f} ms")
     print(f"  Prefill: {prefill_seconds * 1000:.1f} ms ({valid_len} input tokens)")
     if decode_tokens:
         print(f"  Decode: {decode_seconds * 1000:.1f} ms ({decode_tokens} tokens)")
         print(f"  Decode throughput: {decode_tokens / decode_seconds:.2f} tokens/s")
+    print(f"  End-to-end measured runtime: {total_runtime_seconds * 1000:.1f} ms")
 
 
 if __name__ == "__main__":

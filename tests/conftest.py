@@ -7,6 +7,7 @@
 
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from QEfficient.utils.cache import QEFF_HOME
 from QEfficient.utils.logging_utils import logger
 
 _QUICKCHECK_FILE = "tests/unit_test/models/test_model_quickcheck.py"
+_ALLOW_GLOBAL_QEFF_CLEANUP_ENV = "QEFF_PYTEST_ALLOW_GLOBAL_CACHE_CLEANUP"
 _QUICKCHECK_SUMMARY = {}
 _QUICKCHECK_META = {
     "test_causal_lm_cpu_runtime_parity_with_api_runner": (
@@ -82,6 +84,30 @@ def _is_nightly_pipeline_session(session):
     return False
 
 
+def _env_truthy(name):
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _cleanup_target(path_str):
+    path = Path(path_str).expanduser()
+    if path.is_file():
+        return path.parent
+    return path
+
+
+def _is_safe_cleanup_target(path_str):
+    if _env_truthy(_ALLOW_GLOBAL_QEFF_CLEANUP_ENV):
+        return True
+
+    target = _cleanup_target(path_str).resolve(strict=False)
+    temp_root = Path(tempfile.gettempdir()).resolve(strict=False)
+    try:
+        target.relative_to(temp_root)
+    except ValueError:
+        return False
+    return True
+
+
 def qeff_models_clean_up(qeff_dir=QEFF_HOME):
     """
     Clean up QEFF models and cache.
@@ -98,15 +124,17 @@ def qeff_models_clean_up(qeff_dir=QEFF_HOME):
     for path in paths:
         try:
             path_str = str(path)
-            if os.path.isfile(path_str):
-                dir_to_delete = os.path.dirname(path_str)
-                if os.path.exists(dir_to_delete):
-                    shutil.rmtree(dir_to_delete)
-                    print(f"\n.............Cleaned up {dir_to_delete}")
-            elif os.path.isdir(path_str):
-                if os.path.exists(path_str):
-                    shutil.rmtree(path_str)
-                    print(f"\n.............Cleaned up {path_str}")
+            if not _is_safe_cleanup_target(path_str):
+                print(
+                    f"\n.............Skipped cleanup for non-temporary QEff cache {path_str}. "
+                    f"Set {_ALLOW_GLOBAL_QEFF_CLEANUP_ENV}=1 to override."
+                )
+                continue
+
+            dir_to_delete = _cleanup_target(path_str)
+            if dir_to_delete.exists():
+                shutil.rmtree(dir_to_delete)
+                print(f"\n.............Cleaned up {dir_to_delete}")
         except Exception as e:
             print(f"\n.............Error cleaning up {path}: {e}")
 
