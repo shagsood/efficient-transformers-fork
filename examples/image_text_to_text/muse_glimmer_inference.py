@@ -121,9 +121,13 @@ def main():
         device_ids=args.device_ids,
         generation_len=args.generation_len,
     )
-    print(output.generated_ids)
     print(decode_response(processor.tokenizer, output.generated_ids))
-    print(output.perf_metrics)
+    print(
+        "Performance: "
+        f"prefill={output.perf_metrics.prefill_time:.3f}s, "
+        f"decode={output.perf_metrics.decode_perf:.2f} tok/s, "
+        f"end-to-end={output.perf_metrics.total_perf:.2f} tok/s"
+    )
 
 
 if __name__ == "__main__":
