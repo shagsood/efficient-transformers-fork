@@ -8,12 +8,13 @@
 """Muse Glimmer image-text and text-only inference on Cloud AI 100."""
 
 import argparse
+import re
 from io import BytesIO
 
 import requests
 import torch
 from PIL import Image
-from transformers import AutoProcessor, TextStreamer
+from transformers import AutoProcessor
 
 from QEfficient import QEFFAutoModelForImageTextToText
 
@@ -35,8 +36,15 @@ def load_image(image_url, image_size):
 
 
 def prepare_inputs(processor, model, mode, prompt, image_url, image_size, prefill_seq_len, ctx_len):
-    image_marker = "<|patch|>" if mode == "image" else ""
-    text = f"<|begin_of_text|><|start|>user<|message|>{image_marker}{prompt}<|eot|><|start|>assistant"
+    content = [{"type": "text", "text": prompt}]
+    if mode == "image":
+        content.insert(0, {"type": "image"})
+    text = processor.apply_chat_template(
+        [{"role": "user", "content": content}],
+        tokenize=False,
+        add_generation_prompt=True,
+        reasoning_strength="low",
+    )
     images = load_image(image_url, image_size) if mode == "image" else None
     inputs = processor(text=text, images=images, return_tensors="pt")
 
@@ -57,6 +65,14 @@ def prepare_inputs(processor, model, mode, prompt, image_url, image_size, prefil
     inputs["pixel_values"] = inputs["pixel_values"].to(torch.float32)
     inputs["image_grid_thw"] = inputs["image_grid_thw"].to(torch.int64)
     return inputs
+
+
+def decode_response(tokenizer, generated_ids):
+    raw_text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)
+    match = re.search(r"to=user<\|message\|>(.*?)(?:<\|eot\|>|$)", raw_text, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return "No final user response was generated; increase --generation-len."
 
 
 def main():
@@ -100,15 +116,13 @@ def main():
         node_precision_info=True,
     )
 
-    streamer = TextStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
     output = model.generate(
         inputs=inputs,
-        streamer=streamer,
         device_ids=args.device_ids,
         generation_len=args.generation_len,
     )
     print(output.generated_ids)
-    print(processor.tokenizer.batch_decode(output.generated_ids, skip_special_tokens=True))
+    print(decode_response(processor.tokenizer, output.generated_ids))
     print(output.perf_metrics)
 
 
