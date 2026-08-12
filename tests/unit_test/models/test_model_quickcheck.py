@@ -152,6 +152,55 @@ def _tiny_muse_glimmer_model():
     return MuseGlimmerForConditionalGeneration(config).eval(), config
 
 
+def _tiny_muse_glimmer_inputs(config, with_image):
+    seq_len = 16
+    input_ids = torch.arange(20, 20 + seq_len).view(1, -1)
+    inputs = {
+        "input_ids": input_ids,
+        "position_ids": torch.arange(seq_len, dtype=torch.int64).view(1, -1),
+    }
+    if with_image:
+        grid_h = grid_w = 4
+        vision_tokens = grid_h * grid_w // config.vision_config.merge_size**2
+        input_ids[:, 2 : 2 + vision_tokens] = config.image_token_id
+        inputs.update(
+            {
+                "pixel_values": torch.randn(
+                    grid_h * grid_w,
+                    config.vision_config.patch_temporal * 3 * config.vision_config.patch_size**2,
+                    generator=torch.Generator().manual_seed(1),
+                ),
+                "image_grid_thw": torch.tensor([[1, grid_h, grid_w]], dtype=torch.int64),
+            }
+        )
+    return inputs
+
+
+def _tiny_muse_glimmer_export_inputs(model, cpu_inputs):
+    seq_len = cpu_inputs["input_ids"].shape[1]
+    inputs = model.get_dummy_inputs(prefill_seq_len=seq_len, ctx_len=seq_len)
+    inputs["input_ids"] = cpu_inputs["input_ids"]
+    inputs["position_ids"] = cpu_inputs["position_ids"]
+    if "pixel_values" in cpu_inputs:
+        inputs["pixel_values"] = cpu_inputs["pixel_values"]
+        inputs["image_grid_thw"] = cpu_inputs["image_grid_thw"]
+    return inputs
+
+
+def _tiny_muse_glimmer_ort_inputs(session, inputs):
+    ort_inputs = {}
+    for item in session.get_inputs():
+        name = item.name
+        if name.startswith("past_key."):
+            tensor = inputs["past_key_values"][int(name.rsplit(".", 1)[1])][0]
+        elif name.startswith("past_value."):
+            tensor = inputs["past_key_values"][int(name.rsplit(".", 1)[1])][1]
+        else:
+            tensor = inputs[name]
+        ort_inputs[name] = tensor.detach().numpy()
+    return ort_inputs
+
+
 @pytest.mark.cpu_only
 @pytest.mark.onnx
 def test_muse_glimmer_rms_norms_use_compiler_custom_op(tmp_path):
@@ -578,7 +627,7 @@ def test_vlm_text_side_runtime_parity_and_full_export(tmp_path):
 
 
 @pytest.mark.llm_model
-def test_muse_glimmer_tiny_image_text_runtime_and_export_parity(tmp_path):
+def test_muse_glimmer_tiny_image_text_and_text_only_runtime_parity(tmp_path):
     from QEfficient.transformers.models.muse_glimmer.modeling_muse_glimmer import (
         QEffMuseGlimmerForConditionalGeneration,
         QEffMuseGlimmerTextAttention,
@@ -592,17 +641,7 @@ def test_muse_glimmer_tiny_image_text_runtime_and_export_parity(tmp_path):
     assert isinstance(qeff_model.model, QEffMuseGlimmerForConditionalGeneration)
     assert any(isinstance(module, QEffMuseGlimmerTextAttention) for module in qeff_model.model.modules())
 
-    seq_len = 16
-    grid_h = grid_w = 4
-    vision_tokens = grid_h * grid_w // config.vision_config.merge_size**2
-    input_ids = torch.arange(20, 20 + seq_len).view(1, -1)
-    input_ids[:, 2 : 2 + vision_tokens] = config.image_token_id
-    pixel_values = torch.randn(
-        grid_h * grid_w,
-        config.vision_config.patch_temporal * 3 * config.vision_config.patch_size**2,
-    )
-    image_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.int64)
-    position_ids = torch.arange(seq_len, dtype=torch.int64).view(1, -1)
+    image_inputs = _tiny_muse_glimmer_inputs(config, with_image=True)
     injected_embeds = {}
 
     def capture_injected_embeds(name):
@@ -618,56 +657,47 @@ def test_muse_glimmer_tiny_image_text_runtime_and_export_parity(tmp_path):
         capture_injected_embeds("qeff"), with_kwargs=True
     )
     with torch.no_grad():
-        hf_logits = hf_model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            position_ids=position_ids,
-            use_cache=False,
-        ).logits
-        qeff_logits = qeff_model.model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            position_ids=position_ids,
-            use_cache=False,
-        ).logits
+        hf_logits = hf_model(**image_inputs, use_cache=False).logits
+        qeff_logits = qeff_model.model(**image_inputs, use_cache=False).logits
     hf_hook.remove()
     qeff_hook.remove()
     assert torch.equal(hf_logits, qeff_logits)
     assert torch.equal(injected_embeds["hf"], injected_embeds["qeff"])
 
-    multimodal_mask = input_ids == config.image_token_id
-    text_embeds = hf_model.model.get_input_embeddings()(torch.where(multimodal_mask, 0, input_ids))
+    multimodal_mask = image_inputs["input_ids"] == config.image_token_id
+    text_embeds = hf_model.model.get_input_embeddings()(
+        torch.where(multimodal_mask, 0, image_inputs["input_ids"])
+    )
     assert torch.equal(injected_embeds["hf"][~multimodal_mask], text_embeds[~multimodal_mask])
     assert not torch.equal(injected_embeds["hf"][multimodal_mask], text_embeds[multimodal_mask])
 
-    dummy = qeff_model.model.get_dummy_inputs(prefill_seq_len=seq_len, ctx_len=seq_len)
-    dummy["input_ids"] = input_ids
+    text_inputs = _tiny_muse_glimmer_inputs(config, with_image=False)
     with torch.no_grad():
-        qeff_outputs = qeff_model.model(**dummy)
+        hf_text_logits = hf_model(**text_inputs, use_cache=False).logits
+        qeff_text_logits = qeff_model.model(**text_inputs, use_cache=False).logits
+    assert torch.equal(hf_text_logits, qeff_text_logits)
+
+    seq_len = image_inputs["input_ids"].shape[1]
+    parity_cases = []
+    for cpu_inputs in (image_inputs, text_inputs):
+        export_inputs = _tiny_muse_glimmer_export_inputs(qeff_model.model, cpu_inputs)
+        with torch.no_grad():
+            qeff_outputs = qeff_model.model(**export_inputs)
+        parity_cases.append((export_inputs, qeff_outputs))
+
     onnx_path = _exported_onnx_path(
         qeff_model.export(tmp_path / "muse-glimmer", prefill_seq_len=seq_len, ctx_len=seq_len, offload_pt_weights=False)
     )
     onnx_model = onnx.load(str(onnx_path), load_external_data=False)
     assert any(node.op_type == "Where" for node in onnx_model.graph.node)
     session = _ort_session(onnx_path)
-    ort_inputs = {}
-    for item in session.get_inputs():
-        name = item.name
-        if name.startswith("past_key."):
-            tensor = dummy["past_key_values"][int(name.rsplit(".", 1)[1])][0]
-        elif name.startswith("past_value."):
-            tensor = dummy["past_key_values"][int(name.rsplit(".", 1)[1])][1]
-        else:
-            tensor = dummy[name]
-        ort_inputs[name] = tensor.detach().numpy()
-    ort_outputs = session.run(None, ort_inputs)
-    assert np.allclose(qeff_outputs.logits.detach().numpy(), ort_outputs[0], atol=1e-5)
-    assert np.array_equal(qeff_outputs.logits.detach().numpy().argmax(-1), ort_outputs[0].argmax(-1))
-    for layer, (key, value) in enumerate(qeff_outputs.past_key_values):
-        assert np.allclose(key.detach().numpy(), ort_outputs[1 + 2 * layer], atol=1e-5)
-        assert np.allclose(value.detach().numpy(), ort_outputs[2 + 2 * layer], atol=1e-5)
+    for export_inputs, qeff_outputs in parity_cases:
+        ort_outputs = session.run(None, _tiny_muse_glimmer_ort_inputs(session, export_inputs))
+        assert np.allclose(qeff_outputs.logits.detach().numpy(), ort_outputs[0], atol=1e-5)
+        assert np.array_equal(qeff_outputs.logits.detach().numpy().argmax(-1), ort_outputs[0].argmax(-1))
+        for layer, (key, value) in enumerate(qeff_outputs.past_key_values):
+            assert np.allclose(key.detach().numpy(), ort_outputs[1 + 2 * layer], atol=1e-5)
+            assert np.allclose(value.detach().numpy(), ort_outputs[2 + 2 * layer], atol=1e-5)
 
 
 @pytest.mark.on_qaic
@@ -680,7 +710,7 @@ def test_muse_glimmer_tiny_local_hardware_parity(tmp_path):
     if not os.path.exists(f"/dev/accel/accel{device}"):
         pytest.skip(f"local AI 100 device {device} is unavailable")
 
-    from QEfficient.generation.cloud_infer import QAICInferenceSession, is_retained_state_name
+    from QEfficient.generation.cloud_infer import QAICInferenceSession
 
     torch.manual_seed(0)
     hf_model, config = _tiny_muse_glimmer_model()
@@ -691,31 +721,23 @@ def test_muse_glimmer_tiny_local_hardware_parity(tmp_path):
     )
 
     seq_len = 16
-    pixel_values = torch.randn(
-        16,
-        config.vision_config.patch_temporal * 3 * config.vision_config.patch_size**2,
-    )
-    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int64)
-    input_ids = torch.arange(20, 20 + seq_len).view(1, -1)
-    input_ids[:, 2:6] = config.image_token_id
-    position_ids = torch.arange(seq_len, dtype=torch.int64).view(1, -1)
-    cpu_inputs = {
-        "input_ids": input_ids,
-        "pixel_values": pixel_values,
-        "image_grid_thw": image_grid_thw,
-        "position_ids": position_ids,
+    modes = {
+        "image+text": _tiny_muse_glimmer_inputs(config, with_image=True),
+        "text-only": _tiny_muse_glimmer_inputs(config, with_image=False),
     }
 
-    with torch.no_grad():
-        hf_logits = hf_model(**cpu_inputs, use_cache=False).logits
-        qeff_logits = qeff_model.model(**cpu_inputs, use_cache=False).logits
-    assert torch.equal(hf_logits, qeff_logits)
-    print("HF==QEff logits max_abs: 0.0 PASS")
+    parity_cases = {}
+    for mode, cpu_inputs in modes.items():
+        with torch.no_grad():
+            hf_logits = hf_model(**cpu_inputs, use_cache=False).logits
+            qeff_logits = qeff_model.model(**cpu_inputs, use_cache=False).logits
+        assert torch.equal(hf_logits, qeff_logits)
+        print(f"{mode} HF==QEff logits max_abs: 0.0 PASS")
 
-    qeff_dummy = qeff_model.model.get_dummy_inputs(prefill_seq_len=seq_len, ctx_len=seq_len)
-    qeff_dummy["input_ids"] = input_ids
-    with torch.no_grad():
-        qeff_outputs = qeff_model.model(**qeff_dummy)
+        export_inputs = _tiny_muse_glimmer_export_inputs(qeff_model.model, cpu_inputs)
+        with torch.no_grad():
+            qeff_outputs = qeff_model.model(**export_inputs)
+        parity_cases[mode] = (export_inputs, qeff_outputs)
 
     onnx_path = _exported_onnx_path(
         qeff_model.export(
@@ -726,23 +748,17 @@ def test_muse_glimmer_tiny_local_hardware_parity(tmp_path):
         )
     )
     ort_session = _ort_session(onnx_path)
-    ort_inputs = {}
-    for item in ort_session.get_inputs():
-        name = item.name
-        if name.startswith("past_key."):
-            tensor = qeff_dummy["past_key_values"][int(name.rsplit(".", 1)[1])][0]
-        elif name.startswith("past_value."):
-            tensor = qeff_dummy["past_key_values"][int(name.rsplit(".", 1)[1])][1]
-        else:
-            tensor = qeff_dummy[name]
-        ort_inputs[name] = tensor.detach().numpy()
-    ort_values = ort_session.run(None, ort_inputs)
-    ort_outputs = dict(zip((item.name for item in ort_session.get_outputs()), ort_values))
-    assert np.allclose(qeff_outputs.logits.detach().numpy(), ort_outputs["logits"], atol=1e-5)
-    for layer, (key, value) in enumerate(qeff_outputs.past_key_values):
-        assert np.allclose(key.detach().numpy(), ort_outputs[f"past_key.{layer}_RetainedState"], atol=1e-5)
-        assert np.allclose(value.detach().numpy(), ort_outputs[f"past_value.{layer}_RetainedState"], atol=1e-5)
-    print("QEff==ORT logits and retained KV max_abs <= 1e-5 PASS")
+    parity_inputs = {}
+    for mode, (export_inputs, qeff_outputs) in parity_cases.items():
+        ort_inputs = _tiny_muse_glimmer_ort_inputs(ort_session, export_inputs)
+        ort_values = ort_session.run(None, ort_inputs)
+        ort_outputs = dict(zip((item.name for item in ort_session.get_outputs()), ort_values))
+        assert np.allclose(qeff_outputs.logits.detach().numpy(), ort_outputs["logits"], atol=1e-5)
+        for layer, (key, value) in enumerate(qeff_outputs.past_key_values):
+            assert np.allclose(key.detach().numpy(), ort_outputs[f"past_key.{layer}_RetainedState"], atol=1e-5)
+            assert np.allclose(value.detach().numpy(), ort_outputs[f"past_value.{layer}_RetainedState"], atol=1e-5)
+        print(f"{mode} QEff==ORT logits and retained KV max_abs <= 1e-5 PASS")
+        parity_inputs[mode] = (ort_inputs, ort_outputs)
 
     qpc_path = qeff_model.compile(
         compile_dir=str(tmp_path / "muse-glimmer-hw-compile"),
@@ -758,32 +774,51 @@ def test_muse_glimmer_tiny_local_hardware_parity(tmp_path):
         width=8,
     )
     session = QAICInferenceSession(qpc_path, device_ids=[device])
-    input_retained = [name for name in session.input_names if is_retained_state_name(name)]
-    session.skip_buffers(input_retained)
-    qpc_outputs = session.run({name: ort_inputs[name] for name in session.input_names if name not in input_retained})
-    session.deactivate()
+    try:
+        for mode, (ort_inputs, ort_outputs) in parity_inputs.items():
+            qpc_inputs = {name: ort_inputs[name] for name in session.input_names}
+            for name, value in qpc_inputs.items():
+                if name.startswith(("past_key.", "past_value.")):
+                    qpc_inputs[name] = value.astype(np.float16)
+            qpc_outputs = session.run(qpc_inputs)
+            qpc_logits = qpc_outputs["logits"]
+            ort_logits = ort_outputs["logits"]
+            cosine = float(
+                np.dot(ort_logits.reshape(-1), qpc_logits.reshape(-1))
+                / (np.linalg.norm(ort_logits) * np.linalg.norm(qpc_logits))
+            )
+            logits_max_abs = float(np.max(np.abs(ort_logits - qpc_logits)))
+            assert np.array_equal(ort_logits.argmax(), qpc_logits.argmax())
+            assert cosine >= 0.999
+            print(f"{mode} ORT==QPC logits max_abs: {logits_max_abs} cosine: {cosine} PASS")
 
-    qpc_logits = qpc_outputs["logits"]
-    ort_logits = ort_outputs["logits"]
-    cosine = float(
-        np.dot(ort_logits.reshape(-1), qpc_logits.reshape(-1))
-        / (np.linalg.norm(ort_logits) * np.linalg.norm(qpc_logits))
-    )
-    logits_max_abs = float(np.max(np.abs(ort_logits - qpc_logits)))
-    assert np.array_equal(ort_logits.argmax(), qpc_logits.argmax())
-    assert cosine >= 0.999
-    print(f"ORT==QPC logits max_abs: {logits_max_abs} cosine: {cosine} PASS")
+            for layer in range(config.text_config.num_hidden_layers):
+                for kind in ("key", "value"):
+                    name = f"past_{kind}.{layer}_RetainedState"
+                    reference = ort_outputs[name]
+                    candidate = qpc_outputs[name]
+                    if candidate.shape != reference.shape:
+                        candidate = candidate[..., : reference.shape[-1]]
+                    max_abs = float(np.max(np.abs(reference - candidate)))
+                    assert max_abs <= 0.05
+                    print(f"{mode} ORT==QPC {name} max_abs: {max_abs} PASS")
+    finally:
+        session.deactivate()
 
-    for layer in range(config.text_config.num_hidden_layers):
-        for kind in ("key", "value"):
-            name = f"past_{kind}.{layer}_RetainedState"
-            reference = ort_outputs[name]
-            candidate = qpc_outputs[name]
-            if candidate.shape != reference.shape:
-                candidate = candidate[..., : reference.shape[-1]]
-            max_abs = float(np.max(np.abs(reference - candidate)))
-            assert max_abs <= 0.05
-            print(f"ORT==QPC {name} max_abs: {max_abs} PASS")
+    for mode, cpu_inputs in modes.items():
+        generation_inputs = _tiny_muse_glimmer_export_inputs(qeff_model.model, cpu_inputs)
+        generation_inputs = {
+            "input_ids": generation_inputs["input_ids"][:, :8],
+            "attention_mask": torch.ones((1, 8), dtype=torch.int64),
+            "pixel_values": generation_inputs["pixel_values"].to(torch.float32),
+        }
+        generation_output = qeff_model.generate(
+            inputs=generation_inputs,
+            device_ids=[device],
+            generation_len=2,
+        )
+        assert generation_output.generated_ids.shape == (1, 3)
+        print(f"{mode} standard QEff generate PASS")
 
 
 @pytest.mark.llm_model

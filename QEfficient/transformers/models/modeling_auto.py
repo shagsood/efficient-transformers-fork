@@ -2966,6 +2966,7 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         qpc_session = QAICInferenceSession(
             self.qpc_path, device_ids, enable_debug_logs=enable_debug_logs, activate=False
         )
+        uses_image_idx = "image_idx" in qpc_session.input_names and "image_idx_output" in qpc_session.output_names
         batch_size, ctx_len, fbs = get_compilation_dims(self.qpc_path)
         pad_token_id = 1
         # Skip inputs/outputs
@@ -3021,7 +3022,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             inputs["pixel_values"] = inputs["pixel_values"].astype("float16")
 
         inputs["position_ids"] = np.where(inputs.pop("attention_mask"), np.arange(padded_len), -1)
-        inputs["image_idx"] = np.array([[0]])
+        if uses_image_idx:
+            inputs["image_idx"] = np.array([[0]])
 
         if self.comp_ctx_lengths_prefill is not None:
             list_of_comp_ctx_lengths_prefill = [
@@ -3050,7 +3052,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             if self._write_io_dir is not None:
                 write_io_files(chunk_inputs, outputs, self._write_io_dir, "prefill", "aic_batch_io", True, False)
 
-            chunk_inputs["image_idx"] = outputs["image_idx_output"]
+            if uses_image_idx:
+                chunk_inputs["image_idx"] = outputs["image_idx_output"]
 
         prefill_time = perf_counter() - prefill_start
         # Get first token
