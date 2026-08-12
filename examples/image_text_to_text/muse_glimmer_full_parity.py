@@ -38,6 +38,23 @@ def parse_device_ids(value):
     return device_ids
 
 
+def resolve_qpc_path(path):
+    qpc_path = Path(path).expanduser()
+    if (qpc_path / 'programqpc.bin').is_file():
+        return qpc_path
+    if qpc_path.exists():
+        matches = sorted(qpc_path.rglob('programqpc.bin'))
+        if matches:
+            return matches[0].parent
+        raise FileNotFoundError(
+            f'No programqpc.bin found under --qpc-path: {qpc_path}. '
+            'The directory exists, but it is not a complete compiled QPC.'
+        )
+    raise FileNotFoundError(
+        f'--qpc-path does not exist: {qpc_path}. Re-run compile/inference or pass the current QPC directory.'
+    )
+
+
 def load_image(path, url, image_size):
     if path:
         image = Image.open(path).convert('RGB')
@@ -220,9 +237,7 @@ def main():
     parser.add_argument('--report-path', help='Optional markdown report path')
     args = parser.parse_args()
 
-    qpc_path = Path(args.qpc_path).expanduser()
-    if not (qpc_path / 'programqpc.bin').is_file():
-        raise FileNotFoundError(f'No programqpc.bin under --qpc-path: {qpc_path}')
+    qpc_path = resolve_qpc_path(args.qpc_path)
     args.qpc_path = str(qpc_path)
 
     print(f'Loading processor: {args.model_name}')
