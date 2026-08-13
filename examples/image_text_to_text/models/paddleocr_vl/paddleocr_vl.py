@@ -138,7 +138,22 @@ def run(
     image = resize_and_pad(image, target_height, target_width)
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image"}]}]
     chat = processor.apply_chat_template(messages, add_generation_prompt=True)
-    inputs = processor(images=image, text=chat, return_tensors="pt")
+    target_pixels = target_height * target_width
+    inputs = processor(
+        images=image,
+        text=chat,
+        return_tensors="pt",
+        min_pixels=target_pixels,
+        max_pixels=target_pixels,
+    )
+    patch_size = qeff_model.model.config.vision_config.patch_size
+    expected_patches = (target_height // patch_size) * (target_width // patch_size)
+    actual_patches = inputs["pixel_values"].shape[0]
+    if actual_patches != expected_patches:
+        raise ValueError(
+            f"Processor produced {actual_patches} patches, but the {target_height}x{target_width} QPC expects "
+            f"{expected_patches}."
+        )
     real_len = inputs["input_ids"].shape[1]
 
     pos_4d = build_4d_position_ids(qeff_model, inputs, prefill_seq_len)
