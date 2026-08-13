@@ -32,7 +32,6 @@ from transformers.modeling_utils import PreTrainedModel
 
 from QEfficient.utils import constants
 from QEfficient.utils._utils import IOInfo, get_padding_shape_from_config
-from QEfficient.utils.logging_utils import logger
 
 from .configuration_deepseek_vl_v2 import DeepseekVLV2Config
 from .modeling_deepseek_vl_v2 import QEffDeepseekVLV2ForCausalLM
@@ -166,8 +165,9 @@ class QEffDeepseekVLV2ForConditionalGeneration(PreTrainedModel):
         if img_size is None:
             img_size = getattr(self.config, "image_size", constants.DEEPSEEK_VL_V2_IMG_SIZE)
         if img_size != constants.DEEPSEEK_VL_V2_IMG_SIZE:
-            logger.warning(
-                f"Only img_size={constants.DEEPSEEK_VL_V2_IMG_SIZE} is validated for deepseek_vl_v2; got {img_size}."
+            raise ValueError(
+                f"deepseek_vl_v2 supports only img_size={constants.DEEPSEEK_VL_V2_IMG_SIZE}; got {img_size}. "
+                "Its SAM vision encoder is exported with a fixed 1024x1024 image grid."
             )
         vision_size = batch_size * constants.DEEPSEEK_VL_V2_FEATURE_SIZE
 
