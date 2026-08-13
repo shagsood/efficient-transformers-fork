@@ -72,7 +72,7 @@ def decode_response(tokenizer, generated_ids):
     match = re.search(r"to=user<\|message\|>(.*?)(?:<\|eot\|>|$)", raw_text, flags=re.DOTALL)
     if match:
         return match.group(1).strip()
-    return "No final user response was generated; increase --generation-len."
+    return "No final user response was generated before the context limit."
 
 
 def main():
@@ -84,7 +84,6 @@ def main():
     parser.add_argument("--image-size", type=int, default=56)
     parser.add_argument("--prefill-seq-len", type=int, default=640)
     parser.add_argument("--ctx-len", type=int, default=1024)
-    parser.add_argument("--generation-len", type=int, default=256)
     parser.add_argument("--num-cores", type=int, default=16)
     parser.add_argument("--device-ids", type=parse_device_ids, default=parse_device_ids("0,1,2,3"))
     parser.add_argument("--precision", choices=("fp16", "mxfp6"), default="mxfp6")
@@ -112,14 +111,13 @@ def main():
         num_cores=args.num_cores,
         num_devices=len(args.device_ids),
         mxfp6_matmul=args.precision == "mxfp6",
-        mxint8_kv_cache=False,
+        mxint8_kv_cache=True,
         node_precision_info=True,
     )
 
     output = model.generate(
         inputs=inputs,
         device_ids=args.device_ids,
-        generation_len=args.generation_len,
     )
     print(decode_response(processor.tokenizer, output.generated_ids))
     print(
