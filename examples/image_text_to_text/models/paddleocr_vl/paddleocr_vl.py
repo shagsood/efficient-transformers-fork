@@ -139,12 +139,14 @@ def run(
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image"}]}]
     chat = processor.apply_chat_template(messages, add_generation_prompt=True)
     target_pixels = target_height * target_width
+    # PaddleOCRVLProcessor.__call__ currently drops image kwargs before invoking
+    # its image processor, so set the per-call bounds on that processor directly.
+    processor.image_processor.min_pixels = target_pixels
+    processor.image_processor.max_pixels = target_pixels
     inputs = processor(
         images=image,
         text=chat,
         return_tensors="pt",
-        min_pixels=target_pixels,
-        max_pixels=target_pixels,
     )
     patch_size = qeff_model.model.config.vision_config.patch_size
     expected_patches = (target_height // patch_size) * (target_width // patch_size)
