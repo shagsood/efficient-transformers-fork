@@ -2270,6 +2270,9 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         prefill_seq_len: Optional[int] = None,
         prefill_only: bool = False,
         enable_chunking: bool = False,
+        img_size: Optional[int] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
         **kwargs,
     ) -> str:
         """
@@ -2299,7 +2302,18 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             self.hash_params["prefill_only"] = False
             self.__update_prefill_transform(False, retain_full_kv=kwargs.get("retain_full_kv", False))
 
-        inputs = self.model.get_dummy_inputs(comp_ctx_lengths=self.comp_ctx_lengths_decode)
+        dummy_inputs_kwargs = {"comp_ctx_lengths": self.comp_ctx_lengths_decode}
+        if img_size is not None or height is not None or width is not None:
+            dummy_inputs_kwargs.update({"img_size": img_size, "height": height, "width": width})
+            # _export() hashes the model parameters rather than public export
+            # arguments. Persist the static image contract so a cached ONNX from a
+            # different resolution cannot be selected.
+            self.hash_params["vision_export_shape"] = {
+                "img_size": img_size,
+                "height": height,
+                "width": width,
+            }
+        inputs = self.model.get_dummy_inputs(**dummy_inputs_kwargs)
         dynamic_axes = self.model.get_onnx_dynamic_axes(comp_ctx_lengths=self.comp_ctx_lengths_decode)
         output_names = self.model.get_output_names()
         return self._export(
@@ -2314,6 +2328,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
         self,
         onnx_path: Optional[str] = None,
         img_size: Optional[int] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
         compile_dir: Optional[str] = None,
         *,
         prefill_seq_len: Optional[int] = None,
@@ -2413,6 +2429,19 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             aic_num_cores=num_cores,
         )
 
+        # Image dimensions determine constants in the exported vision graph. Export
+        # them explicitly before _compile() so its fallback cannot rebuild a default
+        # ONNX graph while compiling a different specialization.
+        if onnx_path is None:
+            onnx_path = self.export(
+                use_onnx_subfunctions=use_onnx_subfunctions,
+                prefill_seq_len=prefill_seq_len,
+                img_size=img_size,
+                height=height,
+                width=width,
+                retain_full_kv=compiler_options.get("retain_full_kv", False),
+            )
+
         # Get specializations from modelling file
         # TODO: expose this via the auto class as well
         specializations, compiler_options = self.model.get_specializations(
@@ -2423,6 +2452,8 @@ class _QEFFAutoModelForImageTextToTextSingleQPC(QEFFTransformersBase, Multimodal
             comp_ctx_lengths_decode=self.comp_ctx_lengths_decode,
             kv_cache_batch_size=kv_cache_batch_size,
             img_size=img_size,
+            height=height,
+            width=width,
             **compiler_options,
         )
 

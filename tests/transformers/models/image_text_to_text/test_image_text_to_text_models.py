@@ -194,10 +194,11 @@ def check_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100(
         if model_name == "mistralai/Mistral-Small-3.1-24B-Instruct-2503":
             image = image.resize((1540, 1540))
         if model_name == "PaddlePaddle/PaddleOCR-VL":
-            # NaViT dynamic-resolution encoder: without a fixed resize, smart_resize derives the
-            # patch grid from the natural image size, producing far more vision tokens than the
-            # single-QPC compile's static img_size-derived specialization (V9) allows.
-            image = image.resize((img_size, img_size))
+            scale = min(img_size / image.width, img_size / image.height)
+            resized = image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS)
+            padded = Image.new("RGB", (img_size, img_size), "white")
+            padded.paste(resized, ((img_size - resized.width) // 2, (img_size - resized.height) // 2))
+            image = padded
         conversation = [
             {
                 "role": "user",
@@ -245,7 +246,10 @@ def check_image_text_to_text_pytorch_vs_kv_vs_ort_vs_ai100(
     #     "Tokens don't match for pytorch HF output and pytorch KV output"
     # )
 
-    _ = qeff_model.export()
+    if model_name == "PaddlePaddle/PaddleOCR-VL":
+        _ = qeff_model.export(img_size=img_size)
+    else:
+        _ = qeff_model.export()
     # ort_tokens = api_runner.run_vlm_kv_model_on_ort(onnx_model_path)
     # assert (pytorch_hf_tokens == ort_tokens).all(), "Tokens don't match for pytorch HF output and ORT output"
 

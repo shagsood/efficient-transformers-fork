@@ -48,6 +48,33 @@ _SEQ_LEN = 512
 _CTX_LEN = 1024
 
 
+def _resolve_vision_grid(
+    vision_config, img_size: Optional[int] = None, height: Optional[int] = None, width: Optional[int] = None
+) -> Tuple[int, int]:
+    """Return the static patch grid used by both ONNX export and QPC specialization."""
+    if img_size is not None and (height is not None or width is not None):
+        raise ValueError("Pass either img_size or both height and width, not both.")
+    if (height is None) != (width is None):
+        raise ValueError("height and width must be provided together.")
+
+    height = img_size if height is None else height
+    width = img_size if width is None else width
+    if height is None:
+        height = width = _TEST_GRID * vision_config.patch_size
+
+    patch_size = vision_config.patch_size
+    merge_size = vision_config.spatial_merge_size
+    if height <= 0 or width <= 0 or height % patch_size or width % patch_size:
+        raise ValueError(f"Image dimensions must be positive multiples of patch_size={patch_size}; got {height}x{width}.")
+
+    grid_h, grid_w = height // patch_size, width // patch_size
+    if grid_h % merge_size or grid_w % merge_size:
+        raise ValueError(
+            f"Patch grid must be divisible by spatial_merge_size={merge_size}; got {grid_h}x{grid_w}."
+        )
+    return grid_h, grid_w
+
+
 def qeff_prepare_mrope_cos_sin(
     cos: torch.Tensor,
     sin: torch.Tensor,
@@ -672,15 +699,18 @@ class QEffPaddleOCRVLForConditionalGeneration(PaddleOCRVLForConditionalGeneratio
         comp_ctx_lengths: Optional[List[int]] = None,
         kv_offload: bool = False,
         continuous_batching: bool = False,
+        img_size: Optional[int] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
         **kwargs,
     ) -> Dict:
         bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
         fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
 
         vision_cfg = self.config.vision_config
-        patch_size = vision_cfg.patch_size
         spatial_merge_size = vision_cfg.spatial_merge_size
-        grid_h = grid_w = _TEST_GRID
+        patch_size = vision_cfg.patch_size
+        grid_h, grid_w = _resolve_vision_grid(vision_cfg, img_size, height, width)
         n_patches = grid_h * grid_w
         vision_size = n_patches // (spatial_merge_size**2)
 
@@ -747,12 +777,7 @@ class QEffPaddleOCRVLForConditionalGeneration(PaddleOCRVLForConditionalGeneratio
         patch_size = vision_cfg.patch_size
         spatial_merge_size = vision_cfg.spatial_merge_size
 
-        if height is not None and width is not None:
-            grid_h, grid_w = height // patch_size, width // patch_size
-        elif img_size is not None:
-            grid_h = grid_w = img_size // patch_size
-        else:
-            grid_h = grid_w = _TEST_GRID
+        grid_h, grid_w = _resolve_vision_grid(vision_cfg, img_size, height, width)
 
         n_patches = grid_h * grid_w
         vision_size = n_patches // (spatial_merge_size**2)
