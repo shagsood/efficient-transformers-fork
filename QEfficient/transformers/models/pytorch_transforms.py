@@ -102,6 +102,7 @@ from transformers.models.granitemoe.modeling_granitemoe import (
     GraniteMoeRMSNorm,
     GraniteMoeRotaryEmbedding,
 )
+
 try:
     from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeParallelExperts,
@@ -110,6 +111,8 @@ try:
 except ImportError:
     from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeExperts as GraniteMoeParallelExperts,
+    )
+    from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeTopKRouter as GraniteMoeTopKGating,
     )
 from transformers.models.llama.modeling_llama import (
@@ -284,6 +287,14 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     Qwen3VLMoeVisionModel,
 )
 from transformers.models.roberta.modeling_roberta import RobertaModel
+from transformers.models.smollm3.modeling_smollm3 import (
+    SmolLM3Attention,
+    SmolLM3DecoderLayer,
+    SmolLM3ForCausalLM,
+    SmolLM3Model,
+    SmolLM3RMSNorm,
+    SmolLM3RotaryEmbedding,
+)
 from transformers.models.starcoder2.modeling_starcoder2 import (
     Starcoder2Attention,
     Starcoder2DecoderLayer,
@@ -631,6 +642,13 @@ from QEfficient.transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
     QEffQwen3VLMoeVisionAttention,
     QEffQwen3VLMoeVisionModel,
 )
+from QEfficient.transformers.models.smollm3.modeling_smollm3 import (
+    QEffSmolLM3Attention,
+    QEffSmolLM3DecoderLayer,
+    QEffSmolLM3ForCausalLM,
+    QEffSmolLM3Model,
+    QEffSmolLM3RotaryEmbedding,
+)
 from QEfficient.transformers.models.starcoder2.modeling_starcoder2 import (
     QEffStarcoder2Attention,
     QEFFStarcoder2DecoderLayer,
@@ -692,6 +710,7 @@ class CustomOpsTransform(ModuleMappingTransform):
         PixtralRMSNorm: CustomRMSNormAIC,
         GraniteMoeRMSNorm: CustomRMSNormAIC,
         Qwen3MoeRMSNorm: CustomRMSNormAIC,
+        SmolLM3RMSNorm: CustomRMSNormAIC,
         Gemma3RMSNorm: QEffGemma3CustomRMSNormAIC,
         Gemma4RMSNorm: QEffGemma4CustomRMSNormAIC,
         Olmo2RMSNorm: CustomRMSNormAIC,
@@ -891,6 +910,12 @@ class KVCacheTransform(ModuleMappingTransform):
         Qwen3DecoderLayer: QEffQwen3DecoderLayer,
         Qwen3Model: QEffQwen3Model,
         Qwen3ForCausalLM: QEffQwen3ForCausalLM,
+        # SmolLM3
+        SmolLM3Attention: QEffSmolLM3Attention,
+        SmolLM3DecoderLayer: QEffSmolLM3DecoderLayer,
+        SmolLM3Model: QEffSmolLM3Model,
+        SmolLM3ForCausalLM: QEffSmolLM3ForCausalLM,
+        SmolLM3RotaryEmbedding: QEffSmolLM3RotaryEmbedding,
         # Qwen3_5
         Qwen3_5GatedDeltaNet: QEffQwen3_5GatedDeltaNet,
         Qwen3_5DecoderLayer: QEffQwen3_5DecoderLayer,
@@ -1173,6 +1198,7 @@ class SpDTransform:
         QEffLlamaForCausalLM,
         QEffQwen2ForCausalLM,
         QEffQwen3ForCausalLM,
+        QEffSmolLM3ForCausalLM,
     }
 
     @classmethod
@@ -1240,6 +1266,7 @@ class SamplerTransform:
         QEffQwen2ForCausalLM,
         QEffQwen_2_5_vl_DecoderWrapper,
         QEffQwen3ForCausalLM,
+        QEffSmolLM3ForCausalLM,
     }
 
     @classmethod
