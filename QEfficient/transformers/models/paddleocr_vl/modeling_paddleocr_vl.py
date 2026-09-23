@@ -807,6 +807,8 @@ class QEffPaddleOCRVLForConditionalGeneration(PaddleOCRVLForConditionalGeneratio
                 "vision_batch_size": batch_size,
                 "grid_height": grid_height,
                 "grid_width": grid_width,
+                "grid_h": grid_h,
+                "grid_w": grid_w,
             }
             if continuous_batching:
                 spec["full_batch_size"] = kv_cache_batch_size
@@ -827,6 +829,8 @@ class QEffPaddleOCRVLForConditionalGeneration(PaddleOCRVLForConditionalGeneratio
                 "vision_batch_size": batch_size,
                 "grid_height": grid_height,
                 "grid_width": grid_width,
+                "grid_h": grid_h,
+                "grid_w": grid_w,
             }
             if continuous_batching:
                 spec["full_batch_size"] = kv_cache_batch_size
