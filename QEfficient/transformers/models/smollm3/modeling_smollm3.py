@@ -126,16 +126,17 @@ class QEffSmolLM3Attention(SmolLM3Attention):
                 past_seen_tokens=past_seen_tokens,
             )
         else:
-            key_states, value_states, attention_mask, _ = past_key_value_update(
-                module=self,
-                key=key_states,
-                value=value_states,
-                attention_mask=attention_mask,
-                past_key_value=past_key_values,
-                comp_ctx_lengths=comp_ctx_lengths,
-                batch_index=batch_index,
-                position_ids=position_ids,
-            )
+            if past_key_values is not None:
+                key_states, value_states, attention_mask, _ = past_key_value_update(
+                    module=self,
+                    key=key_states,
+                    value=value_states,
+                    attention_mask=attention_mask,
+                    past_key_value=past_key_values,
+                    comp_ctx_lengths=comp_ctx_lengths,
+                    batch_index=batch_index,
+                    position_ids=position_ids,
+                )
             attn_output, attn_weights = eager_attention_forward(
                 self,
                 query_states,
@@ -313,7 +314,8 @@ class QEffSmolLM3ForCausalLM(SmolLM3ForCausalLM):
         )
 
         logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
-        hidden_states = outputs.last_hidden_state[torch.arange(position_ids.shape[0]).view(-1, 1), logit_index]
+        batch_indices = torch.arange(position_ids.shape[0]).view(position_ids.shape[0], 1)
+        hidden_states = outputs.last_hidden_state[batch_indices, logit_index]
         logits = self.lm_head(hidden_states).float()
 
         return CausalLMOutputWithPast(
