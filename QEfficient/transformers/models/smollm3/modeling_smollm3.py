@@ -236,8 +236,7 @@ class QEffSmolLM3Model(SmolLM3Model):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        target_length = attention_mask.shape[-1] if isinstance(attention_mask, torch.Tensor) else past_seen_tokens
-        causal_mask = _create_causal_mask(position_ids=position_ids, target_length=target_length)
+        causal_mask = _create_causal_mask(position_ids=position_ids, target_length=past_seen_tokens)
 
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
