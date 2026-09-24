@@ -95,6 +95,7 @@ CAUSAL_RUNTIME_MODEL_IDS = {
     "granite": "hf-internal-testing/tiny-random-GraniteForCausalLM",
     "olmo2": "hf-internal-testing/tiny-random-Olmo2ForCausalLM",
     "gpt_oss": "tiny-random/gpt-oss-bf16",
+    "smollm3": "yujiepan/smollm3-tiny-random",
 }
 
 #   In PyTorch ≤2.3 (used with transformers v4.57.3), torch.onnx.export with
