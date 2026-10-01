@@ -20,12 +20,21 @@ from transformers.models.granitemoe.modeling_granitemoe import (
     GraniteMoeForCausalLM,
     GraniteMoeModel,
     GraniteMoeMoE,
-    GraniteMoeParallelExperts,
     GraniteMoeRotaryEmbedding,
-    GraniteMoeTopKGating,
     repeat_kv,
     rotate_half,
 )
+
+try:
+    from transformers.models.granitemoe.modeling_granitemoe import (
+        GraniteMoeParallelExperts,
+        GraniteMoeTopKGating,
+    )
+except ImportError:
+    from transformers.models.granitemoe.modeling_granitemoe import (
+        GraniteMoeExperts as GraniteMoeParallelExperts,
+        GraniteMoeTopKRouter as GraniteMoeTopKGating,
+    )
 
 from QEfficient.blocking.attention_blocking import (
     AttentionBlockingConfig,
@@ -519,10 +528,13 @@ class QEffGraniteMoeTopKGating(GraniteMoeTopKGating):
 
         """
 
-        logits = self.layer(hidden_states).float()
+        if hasattr(self, "layer"):
+            logits = self.layer(hidden_states).float()
+        else:
+            logits = torch.nn.functional.linear(hidden_states, self.weight).float()
 
-        top_k_logits, top_k_indices = torch.topk(logits, self.top_k, dim=1)  # [B, K]
-        top_k_gates = torch.softmax(top_k_logits, dim=1).to(hidden_states.dtype)  # [B, K]
+        top_k_logits, top_k_indices = torch.topk(logits, self.top_k, dim=1)  # [num_tokens, top_k]
+        top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)  # [num_tokens, top_k]
 
         B, K = top_k_indices.shape
         E = int(self.num_experts)
@@ -548,9 +560,15 @@ class QEffGraniteMoeMoE(QEffMoEBlockMixin, GraniteMoeMoE):
     def transform_weights(self) -> MoEWeights:
         if getattr(self, "weights_transformed", False):
             return self.moe_weights
+        if hasattr(self, "input_linear"):
+            gate_up = self.input_linear.weight
+            down = self.output_linear.weight
+        else:
+            gate_up = self.experts.gate_up_proj
+            down = self.experts.down_proj
         self.moe_weights = build_canonical_expert_weights(
-            gate_up=self.input_linear.weight,
-            down=self.output_linear.weight,
+            gate_up=gate_up,
+            down=down,
             fused=True,
             fused_split_dim=1,
             transpose_gate_up=True,
@@ -563,7 +581,8 @@ class QEffGraniteMoeMoE(QEffMoEBlockMixin, GraniteMoeMoE):
 
     @property
     def moe_profile(self) -> MoEProfile:
-        return MoEProfile(expert_mlp=partial(silu_glu_mlp, act_fn=self.activation))
+        activation = self.activation if hasattr(self, "activation") else self.experts.act_fn
+        return MoEProfile(expert_mlp=partial(silu_glu_mlp, act_fn=activation))
 
     def route(self, x: torch.Tensor):
         topk_gates, expert_mask, router_logits, _ = self.router(x)
@@ -572,7 +591,7 @@ class QEffGraniteMoeMoE(QEffMoEBlockMixin, GraniteMoeMoE):
 
 
 class QEffGraniteMoeParallelExperts(GraniteMoeParallelExperts):
-    def forward(self, inputs, expert_size):
+    def forward(self, inputs, expert_size, top_k_weights=None):
         """
         Forward pass of the QEffGraniteMoeParallelExperts module.
         Args:
@@ -584,8 +603,20 @@ class QEffGraniteMoeParallelExperts(GraniteMoeParallelExperts):
             Tensor: Output tensor.
         """
 
-        results = torch.matmul(inputs, self.weight[expert_size].T)
-        return results
+        if top_k_weights is not None:
+            final_hidden_states = torch.zeros_like(inputs)
+            expert_mask = torch.nn.functional.one_hot(expert_size, num_classes=self.num_experts).permute(2, 1, 0)
+            for expert_idx in range(self.num_experts):
+                top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+                current_state = inputs[token_idx]
+                gate, up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+                current_hidden_states = self.act_fn(gate) * up
+                current_hidden_states = torch.nn.functional.linear(current_hidden_states, self.down_proj[expert_idx])
+                current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+                final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+            return final_hidden_states
+
+        return torch.matmul(inputs, self.weight[expert_size].T)
 
 
 class QEffGraniteMoeForCausalLM(GraniteMoeForCausalLM):

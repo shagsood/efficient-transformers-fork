@@ -161,6 +161,11 @@ class ApiRunner:
                 model_type = getattr(getattr(model, "config", None), "model_type", "")
                 if model_type.startswith("gpt_oss"):
                     return past_key_values
+                if model_type == "hy_v4":
+                    # HYV4 retains compressed MLA and RoPE caches with an
+                    # asymmetric (key, value) shape. Let the QEff HYV4
+                    # boundary construct its cache object from the pairs.
+                    return past_key_values
                 if model_type.startswith("gemma3"):
                     return DynamicCache(past_key_values)
                 return QEffDynamicCache.from_legacy_cache(past_key_values)

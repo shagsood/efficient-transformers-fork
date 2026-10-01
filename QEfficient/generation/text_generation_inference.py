@@ -565,9 +565,27 @@ class QEffTextGenerationBase:
             else "logits"
         )
         if self._session.allowed_shapes:
-            return [x[self._session.binding_index_map[key]] for x in self._session.allowed_shapes][0][1][2]
+            shape = [x[self._session.binding_index_map[key]] for x in self._session.allowed_shapes][0][1]
+            return shape[2] if len(shape) > 2 else shape[-1]
 
-        return self._session.bindings[self._session.binding_index_map[key]].dims[2]
+        dims = self._session.bindings[self._session.binding_index_map[key]].dims
+        return dims[2] if len(dims) > 2 else dims[-1]
+
+    def _fetch_output_rank(self, key: str) -> int:
+        """Fetch the compiled rank for an output binding."""
+        binding_index = self._session.binding_index_map[key]
+        if self._session.allowed_shapes:
+            return len(self._session.allowed_shapes[0][binding_index][1])
+        return len(self._session.bindings[binding_index].dims)
+
+    def _add_traced_gather_indices(self, inputs: Dict[str, np.ndarray]) -> None:
+        """Supply shape-faithful indices for exporter-created Gather inputs."""
+        gather_inputs = [name for name in self._session.input_names if name.startswith("onnx::Gather_")]
+        if not gather_inputs or "position_ids" not in inputs:
+            return
+        gather_indices = np.argmax(inputs["position_ids"], axis=1).astype(np.int64)
+        for name in gather_inputs:
+            inputs.setdefault(name, gather_indices)
 
     def _fetch_generation_len(self, generation_len, max_gen_len):
         """
@@ -743,12 +761,27 @@ class QEffTextGenerationBase:
         """
         if self.include_sampler:
             if self.return_pdfs:
-                probs_out_placeholder = np.zeros((batch_size, sequence_length, self._vocab_size), dtype=np.float32)
+                probs_shape = (
+                    (batch_size, self._vocab_size)
+                    if self._fetch_output_rank("probs") == 2
+                    else (batch_size, sequence_length, self._vocab_size)
+                )
+                probs_out_placeholder = np.zeros(probs_shape, dtype=np.float32)
                 self._session.set_buffers({"probs": probs_out_placeholder})
-            next_tokens_out_placeholder = np.zeros((batch_size, sequence_length, 1), dtype=np.int64)
+            next_tokens_shape = (
+                (batch_size, 1)
+                if self._fetch_output_rank("next_tokens") == 2
+                else (batch_size, sequence_length, 1)
+            )
+            next_tokens_out_placeholder = np.zeros(next_tokens_shape, dtype=np.int64)
             self._session.set_buffers({"next_tokens": next_tokens_out_placeholder})
         else:
-            logits_out_placeholder = np.zeros((batch_size, sequence_length, self._vocab_size), dtype=np.float32)
+            logits_shape = (
+                (batch_size, self._vocab_size)
+                if self._fetch_output_rank("logits") == 2
+                else (batch_size, sequence_length, self._vocab_size)
+            )
+            logits_out_placeholder = np.zeros(logits_shape, dtype=np.float32)
             self._session.set_buffers({"logits": logits_out_placeholder})
 
     def run_prefill(self, prompt, generation_len, prefill_logit_bs=1, decode_batch_id=None, block_table=None):
@@ -827,6 +860,7 @@ class QEffTextGenerationBase:
             if self.include_sampler:
                 chunk_inputs["last_accepted_output_tokens"] = chunk_inputs["input_ids"]
 
+            self._add_traced_gather_indices(chunk_inputs)
             outputs = self._session.run(chunk_inputs)
 
         return (
@@ -886,6 +920,7 @@ class QEffTextGenerationBase:
             decode_inputs["comp_ctx_lengths"] = self.list_of_comp_ctx_lengths_decode[ccl_id]
 
         while prompt_queue or current_decode_ongoing.any():
+            self._add_traced_gather_indices(decode_inputs)
             outputs = self._session.run(decode_inputs)
 
             # Prepare inputs for next iteration
@@ -1000,6 +1035,7 @@ class QEffTextGenerationBase:
 
             if streamer:
                 streamer.put(decode_inputs["input_ids"][0])
+            self._add_traced_gather_indices(decode_inputs)
             outputs = self._session.run(decode_inputs)
 
             # Prepare inputs for next iteration
@@ -1034,6 +1070,7 @@ class QEffTextGenerationBase:
         finished_sequences = decode_inputs["input_ids"] == self.tokenizer.eos_token_id
         for num_token in range(1, generation_len):
             yield decode_inputs["input_ids"]
+            self._add_traced_gather_indices(decode_inputs)
             outputs = self._session.run(decode_inputs)
 
             # Prepare inputs for next iteration

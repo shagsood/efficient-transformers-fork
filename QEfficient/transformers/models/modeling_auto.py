@@ -4085,6 +4085,9 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
         )
         kwargs["enable_chunking"] = enable_chunking
         qaic_config = kwargs.pop("qaic_config", getattr(self.model, "qaic_config", None))
+        qeff_ctx_len = kwargs.pop("_qeff_ctx_len", None)
+        if qeff_ctx_len is not None and hasattr(self.model, "set_qeff_export_context"):
+            self.model.set_qeff_export_context(ctx_len=qeff_ctx_len)
         # Weight-free export always uses the dynamo (torch.export) path.
         # Must be set here — @export_wrapper reads dynamo from kwargs before _export() body runs.
         dynamo = dynamo or self._weight_free
@@ -4141,6 +4144,11 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
 
         bs: int = constants.ONNX_EXPORT_EXAMPLE_BATCH_SIZE
         seq_len: int = constants.ONNX_EXPORT_EXAMPLE_SEQ_LEN
+        if qeff_ctx_len is None and hasattr(self.model, "set_qeff_export_context"):
+            qeff_ctx_len = seq_len
+            self.model.set_qeff_export_context(ctx_len=qeff_ctx_len)
+        if hasattr(self.model, "get_qeff_export_seq_len"):
+            seq_len = self.model.get_qeff_export_seq_len(seq_len)
         fbs: int = constants.ONNX_EXPORT_EXAMPLE_FBS
 
         supports_paged_attention = False
@@ -4306,12 +4314,16 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 self.model.config, fbs if self.continuous_batching else bs, seq_len
             )
             for i in range(self.num_layers):
-                for kv in ["key", "value"]:
-                    example_inputs["past_key_values"][i].append(
-                        torch.zeros(pkv_cache[0][0].shape, dtype=self.model.config.torch_dtype)
-                    )
-                    dynamic_axes[f"past_{kv}.{i}"] = pkv_dynamic_axes
-                    output_names.append(f"past_{kv}.{i}_RetainedState")
+                example_inputs["past_key_values"][i].append(
+                    torch.zeros(pkv_cache[i][0].shape, dtype=self.model.config.torch_dtype)
+                )
+                dynamic_axes[f"past_key.{i}"] = pkv_dynamic_axes
+                output_names.append(f"past_key.{i}_RetainedState")
+                example_inputs["past_key_values"][i].append(
+                    torch.zeros(pkv_cache[i][1].shape, dtype=self.model.config.torch_dtype)
+                )
+                dynamic_axes[f"past_value.{i}"] = pkv_dynamic_axes
+                output_names.append(f"past_value.{i}_RetainedState")
 
         else:
             # HACK: create common function for this including above if condition code

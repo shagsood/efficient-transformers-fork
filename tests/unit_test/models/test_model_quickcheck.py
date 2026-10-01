@@ -100,6 +100,8 @@ CAUSAL_RUNTIME_MODEL_IDS = {
     "granite": "hf-internal-testing/tiny-random-GraniteForCausalLM",
     "olmo2": "hf-internal-testing/tiny-random-Olmo2ForCausalLM",
     "gpt_oss": "tiny-random/gpt-oss-bf16",
+    # Local fallback until an exact HYV4 tiny-random checkpoint is uploaded.
+    "hy_v4": "/prj/qct/aisyssol_scratch/users/shagsood/.cache/qeff_models/dummy/hy_v4",
 }
 
 #   In PyTorch ≤2.3 (used with transformers v4.57.3), torch.onnx.export with

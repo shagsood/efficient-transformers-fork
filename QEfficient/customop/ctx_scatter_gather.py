@@ -29,7 +29,12 @@ def CtxScatter(data: onnxscript.FLOAT, position_ids: onnxscript.INT32, updates: 
     # Create indices
     batch_idx = ops.Expand(ops.Unsqueeze(ops.Range(zero, batch_size, one), [1, 2, 3]), exp_shape)
     head_idx = ops.Expand(ops.Unsqueeze(ops.Range(zero, num_heads, one), [0, 2, 3]), exp_shape)
-    ctx_idx = ops.Expand(ops.Unsqueeze(position_ids, [1, 3]), exp_shape)
+    # Position IDs are INT32 by contract.  ONNX Runtime's ScatterND shape
+    # inference accepts INT64 indices, so widen every index component before
+    # concatenating them.
+    batch_idx = ops.Cast(batch_idx, to=onnxscript.INT64.dtype)
+    head_idx = ops.Cast(head_idx, to=onnxscript.INT64.dtype)
+    ctx_idx = ops.Cast(ops.Expand(ops.Unsqueeze(position_ids, [1, 3]), exp_shape), to=onnxscript.INT64.dtype)
     indices = ops.Concat(batch_idx, head_idx, ctx_idx, axis=3)
 
     return ops.ScatterND(data, indices, updates)
@@ -120,9 +125,9 @@ def CtxScatter3D(data: onnxscript.FLOAT, position_ids: onnxscript.INT32, updates
     # Create indices
     batch_idx = ops.Expand(ops.Unsqueeze(ops.Range(zero, batch_size, one), [1, 2]), exp_shape)
 
-    # keep index tensor types aligned for backend that require exact dtype match
-    batch_idx = ops.Cast(batch_idx, to=onnxscript.INT32.dtype)
-    ctx_idx = ops.Expand(ops.Unsqueeze(position_ids, [2]), exp_shape)
+    # ONNX Runtime's ScatterND shape inference accepts INT64 indices.
+    batch_idx = ops.Cast(batch_idx, to=onnxscript.INT64.dtype)
+    ctx_idx = ops.Cast(ops.Expand(ops.Unsqueeze(position_ids, [2]), exp_shape), to=onnxscript.INT64.dtype)
     indices = ops.Concat(batch_idx, ctx_idx, axis=2)
 
     return ops.ScatterND(data, indices, updates)
@@ -220,7 +225,7 @@ def CtxGather3D(data: onnxscript.FLOAT, ctx_indices: onnxscript.INT32) -> onnxsc
     idx_seq_len = ops.Slice(ops.Shape(ctx_indices), starts=[1], ends=[2], axes=[0])
     expand_shape = ops.Concat(batch_size, idx_seq_len, axis=0)
     ctx_indices = ops.Expand(ctx_indices, expand_shape)
-    ctx_indices = ops.Unsqueeze(ctx_indices, [-1])
+    ctx_indices = ops.Unsqueeze(ops.Cast(ctx_indices, to=onnxscript.INT64.dtype), [-1])
     return ops.GatherND(data, ctx_indices, batch_dims=1)
 
 
@@ -274,7 +279,7 @@ def CtxGather(
 
     # Directly use the shape tensor without validation
     ctx_indices = ops.Expand(ctx_indices, shape_tensor)
-    ctx_indices = ops.Unsqueeze(ctx_indices, [-1])
+    ctx_indices = ops.Unsqueeze(ops.Cast(ctx_indices, to=onnxscript.INT64.dtype), [-1])
     return ops.GatherND(data, ctx_indices, batch_dims=2)
 
 
@@ -303,7 +308,7 @@ class CtxGatherFunc(torch.autograd.Function):
 
 @qeff_custom_op("com.qualcomm.cloud", 1)
 def CtxGatherBlockedKV(data: onnxscript.FLOAT, ctx_indices: onnxscript.INT32) -> onnxscript.FLOAT:
-    ctx_indices = ops.Unsqueeze(ctx_indices, [-1])
+    ctx_indices = ops.Unsqueeze(ops.Cast(ctx_indices, to=onnxscript.INT64.dtype), [-1])
     return ops.GatherND(data, ctx_indices, batch_dims=2)
 
 

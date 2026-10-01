@@ -52,6 +52,13 @@ from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
     GPTBigCodeModel,
 )
 from transformers.models.gptj.modeling_gptj import GPTJAttention, GPTJForCausalLM, GPTJModel
+from transformers.models.hy_v4.modeling_hy_v4 import (
+    HYV4Attention,
+    HYV4DecoderLayer,
+    HYV4ForCausalLM,
+    HYV4Model,
+    HYV4RotaryEmbedding,
+)
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     LlamaDecoderLayer,
@@ -140,6 +147,13 @@ from .models.gpt_bigcode.modeling_gpt_bigcode import (
     QEffGPTBigCodeModel,
 )
 from .models.gptj.modeling_gptj import QEffGPTJAttention, QEffGPTJForCausalLM, QEffGPTJModel
+from .models.hy_v4.modeling_hy_v4 import (
+    QEffHYV4Attention,
+    QEffHYV4DecoderLayer,
+    QEffHYV4ForCausalLM,
+    QEffHYV4Model,
+    QEffHYV4RotaryEmbedding,
+)
 from .models.llama.modeling_llama import (
     QEffLlamaAttention,
     QEffLlamaDecoderLayer,
@@ -207,12 +221,20 @@ qeff_supported_architectures = ModelArchitectures(
         GPTBigCodeForCausalLM.__name__,
         MllamaForCausalLM.__name__,
         WhisperForConditionalGeneration.__name__,
+        HYV4ForCausalLM.__name__,
     ]
 )
 
 
 # This is for supporting different seq_len for different layers for Sliding window attn, chunked attn etc.
-DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH = {"gemma3", "gemma3_text", "gemma4_text", "llama4", "llama4_text"}
+DYNAMIC_SEQ_LEN_SUPPORTED_MODEL_ARCH = {
+    "gemma3",
+    "gemma3_text",
+    "gemma4_text",
+    "llama4",
+    "llama4_text",
+    "hy_v4",
+}
 
 # This is for supporting different modelling classes specially written for prefill-only model
 SPECIALIZED_DISAGG_SERVING_MODEL_ARCH = {"gpt_oss", "qwen3_moe", "glm4_moe", "kimi_k2", "kimi_k25", "gemma4"}
@@ -329,6 +351,12 @@ TransformersToQEffModulesDict: Dict[Type[nn.Module], Type[nn.Module]] = {
     Starcoder2DecoderLayer: QEFFStarcoder2DecoderLayer,
     # Gpt_bigcode model layers
     GPTBigCodeForCausalLM: QEffGPTBigCodeForCausalLM,
+    # HYV4
+    HYV4Attention: QEffHYV4Attention,
+    HYV4DecoderLayer: QEffHYV4DecoderLayer,
+    HYV4Model: QEffHYV4Model,
+    HYV4ForCausalLM: QEffHYV4ForCausalLM,
+    HYV4RotaryEmbedding: QEffHYV4RotaryEmbedding,
     GPTBigCodeAttention: QEffGPTBigCodeAttention,
     GPTBigCodeBlock: QEffGPTBigCodeBlock,
     GPTBigCodeModel: QEffGPTBigCodeModel,

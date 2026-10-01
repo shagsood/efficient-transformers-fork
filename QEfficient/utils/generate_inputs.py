@@ -100,6 +100,16 @@ class InputHandler:
         batch = self.full_batch_size if self.full_batch_size else self.padding_shape[0]
         return [batch, n_heads, ctx_len, d_head]
 
+    def _get_layer_cache_shapes(self, layer_idx):
+        if getattr(self.config, "model_type", "") == "hy_v4":
+            batch = self.full_batch_size if self.full_batch_size else self.padding_shape[0]
+            return (
+                [batch, 1, self.ctx_len, self.config.kv_lora_rank],
+                [batch, 1, self.ctx_len, self.config.qk_rope_head_dim],
+            )
+        shape = self._get_layer_cache_shape(layer_idx)
+        return shape, shape
+
     def _is_paged_attention(self) -> bool:
         if self.qaic_config is None:
             return False
@@ -171,10 +181,11 @@ class InputHandler:
         for i in range(self.n_layer):
             if self._is_paged_attention() and num_kv_blocks and kv_block_size:
                 pad_shape = pad_shape_paged
+                key_shape = value_shape = pad_shape
             else:
-                pad_shape = self._get_layer_cache_shape(i)
-            past_key = torch.zeros((pad_shape), dtype=self.dtype)
-            past_value = torch.zeros((pad_shape), dtype=self.dtype)
+                key_shape, value_shape = self._get_layer_cache_shapes(i)
+            past_key = torch.zeros(key_shape, dtype=self.dtype)
+            past_value = torch.zeros(value_shape, dtype=self.dtype)
             pkv = (past_key, past_value)
             past_key_values.append(pkv)
         inputs["past_key_values"] = tuple(past_key_values)
@@ -270,10 +281,11 @@ class InputHandler:
         for i in range(self.n_layer):
             if self._is_paged_attention() and num_kv_blocks and kv_block_size:
                 pad_shape = pad_shape_paged
+                key_shape = value_shape = pad_shape
             else:
-                pad_shape = self._get_layer_cache_shape(i)
-            inputs["past_key." + str(i)] = np.zeros((pad_shape), dtype=np.float32)
-            inputs["past_value." + str(i)] = np.zeros((pad_shape), dtype=np.float32)
+                key_shape, value_shape = self._get_layer_cache_shapes(i)
+            inputs["past_key." + str(i)] = np.zeros(key_shape, dtype=np.float32)
+            inputs["past_value." + str(i)] = np.zeros(value_shape, dtype=np.float32)
         if self.full_batch_size:
             inputs["batch_index"] = np.arange(self.full_batch_size).reshape(-1, 1)
 

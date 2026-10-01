@@ -891,7 +891,6 @@ class QEFFBaseModel(ABC):
 
         if qaic_config is not None:
             kwargs["qaic_config"] = qaic_config
-
         # Transform before export
         if specializations is not None:
             bs = require_value(get_attr_or_key(specializations[0], ("batch_size", "batch")), "batch size")
@@ -901,6 +900,9 @@ class QEFFBaseModel(ABC):
             bs = None
             seq_len = None
             ctx_len = None
+
+        if ctx_len is not None and hasattr(self.model, "set_qeff_export_context"):
+            kwargs["_qeff_ctx_len"] = ctx_len
 
         self.transform(
             ctx_len=ctx_len,
@@ -1164,6 +1166,9 @@ class QEFFBaseModel(ABC):
         **compiler_options,
     ):
         # Apply the transformations that are dependent on compilation parameters
+        set_export_context = getattr(self.model, "set_qeff_export_context", None)
+        if set_export_context is not None:
+            set_export_context(ctx_len=ctx_len)
         moe_batch_size = compiler_options.pop("moe_batch_size", bs)
         model_config = getattr(self.model, "config", None) or getattr(
             getattr(self.model, "model", None), "config", None

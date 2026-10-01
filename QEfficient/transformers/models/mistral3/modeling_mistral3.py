@@ -17,7 +17,20 @@ from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3Model,
     Mistral3ModelOutputWithPast,
 )
-from transformers.models.pixtral.modeling_pixtral import PixtralVisionModel, position_ids_in_meshgrid
+from transformers.models.pixtral.modeling_pixtral import PixtralVisionModel
+
+try:
+    from transformers.models.pixtral.modeling_pixtral import position_ids_in_meshgrid
+except ImportError:
+
+    def position_ids_in_meshgrid(patch_embeds_list, max_width):
+        positions = []
+        for patch in patch_embeds_list:
+            height, width = patch.shape[-2:]
+            mesh = torch.meshgrid(torch.arange(height), torch.arange(width), indexing="ij")
+            h_grid, w_grid = torch.stack(mesh, dim=-1).reshape(-1, 2).chunk(2, -1)
+            positions.append((h_grid * max_width + w_grid)[:, 0])
+        return torch.cat(positions)
 
 from QEfficient.utils import constants
 from QEfficient.utils._utils import IOInfo, get_padding_shape_from_config
