@@ -111,7 +111,7 @@ def split_layer_graph(
         else:
             preferred_inputs = ["input_ids", "position_ids"]
     else:
-        preferred_inputs = ["inputs_embeds", "position_ids"]
+        preferred_inputs = ["inputs_embeds", "position_ids", "prev_topk_indices", "logits_to_keep"]
 
     cache_inputs = sorted(
         [
@@ -119,6 +119,7 @@ def split_layer_graph(
             for n in graph_inputs
             if n.startswith("past_key.")
             or n.startswith("past_value.")
+            or n.startswith("indexer_key.")
             or n.startswith("conv_state.")
             or n.startswith("recurrent_state.")
             or n == "vision_embeds"
@@ -477,14 +478,30 @@ def run_merge_pipeline(
         if selected_output is None:
             raise RuntimeError(f"No mergeable decoder output found in {m1_path}. Outputs: {graph_outputs}")
 
+        io_map = [
+            (selected_output, f"layer_{right}/inputs_embeds"),
+            (f"layer_{left}/position_ids", f"layer_{right}/position_ids"),
+        ]
+        left_topk = f"layer_{left}/topk_indices"
+        right_topk = f"layer_{right}/prev_topk_indices"
+        left_outputs = {output.name for output in m1_pref.graph.output}
+        right_inputs = {value.name for value in m2_pref.graph.input}
+        if left_topk in left_outputs and right_topk in right_inputs:
+            io_map.append((left_topk, right_topk))
+
         merged_model = merge_models(
             m1_pref,
             m2_pref,
-            io_map=[
-                (selected_output, f"layer_{right}/inputs_embeds"),
-                (f"layer_{left}/position_ids", f"layer_{right}/position_ids"),
-            ],
+            io_map=io_map,
         )
+
+        # ``topk_indices`` is an internal DSA handoff between adjacent
+        # windows. Remove the producer copy after io_map composition so the
+        # final graph has one unique output name per ABI edge.
+        if left_topk in {output.name for output in merged_model.graph.output}:
+            kept_outputs = [output for output in merged_model.graph.output if output.name != left_topk]
+            del merged_model.graph.output[:]
+            merged_model.graph.output.extend(kept_outputs)
 
         if idx == len(shard_starts) - 2:
             CustomOpTransform.apply(merged_model)

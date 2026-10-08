@@ -4314,16 +4314,30 @@ class QEFFAutoModelForCausalLM(QEFFBaseModel):
                 self.model.config, fbs if self.continuous_batching else bs, seq_len
             )
             for i in range(self.num_layers):
-                example_inputs["past_key_values"][i].append(
-                    torch.zeros(pkv_cache[i][0].shape, dtype=self.model.config.torch_dtype)
+                layer_states = pkv_cache[i]
+                state_names = (
+                    self.model.get_onnx_past_key_value_names(i, layer_states)
+                    if hasattr(self.model, "get_onnx_past_key_value_names")
+                    else [f"past_key.{i}", f"past_value.{i}"]
                 )
-                dynamic_axes[f"past_key.{i}"] = pkv_dynamic_axes
-                output_names.append(f"past_key.{i}_RetainedState")
-                example_inputs["past_key_values"][i].append(
-                    torch.zeros(pkv_cache[i][1].shape, dtype=self.model.config.torch_dtype)
-                )
-                dynamic_axes[f"past_value.{i}"] = pkv_dynamic_axes
-                output_names.append(f"past_value.{i}_RetainedState")
+                if len(state_names) != len(layer_states):
+                    raise ValueError(
+                        f"retained-state name count mismatch for layer {i}: "
+                        f"{len(state_names)} names for {len(layer_states)} tensors"
+                    )
+                for state_idx, (state_name, state_tensor) in enumerate(zip(state_names, layer_states)):
+                    example_inputs["past_key_values"][i].append(
+                        torch.zeros(state_tensor.shape, dtype=self.model.config.torch_dtype)
+                    )
+                    state_axes = (
+                        self.model.get_onnx_past_key_value_dynamic_axes(
+                            state_idx, continuous_batching=self.continuous_batching
+                        )
+                        if hasattr(self.model, "get_onnx_past_key_value_dynamic_axes")
+                        else pkv_dynamic_axes
+                    )
+                    dynamic_axes[state_name] = state_axes
+                    output_names.append(f"{state_name}_RetainedState")
 
         else:
             # HACK: create common function for this including above if condition code

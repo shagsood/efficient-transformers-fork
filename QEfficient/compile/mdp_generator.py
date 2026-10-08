@@ -8,7 +8,6 @@
 
 import bisect
 import logging
-import re
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -287,6 +286,21 @@ def _get_layer_num(node_name: str) -> Optional[int]:
     return None
 
 
+def _get_compiler_name_aliases(node_name: str) -> List[str]:
+    """Return compiler-visible aliases for layerwise merged ONNX nodes.
+
+    The AI 100 subfunction importer disambiguates repeated leaf names while
+    expanding HYV4's decoder body.  In the merged layerwise graph the ONNX
+    node is named ``.../mlp/experts/Squeeze``; the compiler's MDP validator
+    also expects the disambiguated ``.../Squeeze_1`` entry for MoE layers.
+    Keep this alias scoped to the layerwise naming convention so ordinary
+    non-layerwise graphs are unchanged.
+    """
+    if node_name.startswith("layer_") and node_name.endswith("/mlp/experts/Squeeze"):
+        return [f"{node_name}_1"]
+    return []
+
+
 def _get_layer_num_from_inputs(node_inputs: List[str]) -> Optional[int]:
     """Return a layer index from model parameter inputs on generic callsites.
 
@@ -531,6 +545,7 @@ def generate_disagg_mdp_partition_config(
             partitions[partition_idx].extend(sub_nodes)
         else:
             partitions[partition_idx].append(node.name)
+            partitions[partition_idx].extend(_get_compiler_name_aliases(node.name))
 
     for i, partition in enumerate(partitions):
         logger.info(f"Partition {i}: {len(partition)} nodes")

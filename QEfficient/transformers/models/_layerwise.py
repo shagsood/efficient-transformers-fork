@@ -9,7 +9,7 @@
 Layer-wise export/compile orchestration for selected MoE architectures.
 
 Provisional API. Scheduled for removal once first-class multi-window export lands.
-Today only ``qwen3_vl_moe``, ``qwen3_5_moe`` and ``qwen3_moe`` carry the
+Today only ``qwen3_vl_moe``, ``qwen3_5_moe``, ``qwen3_moe`` and ``hy_v4`` carry the
 windowing hooks (``_start``/``_end`` class attributes) that this driver relies
 on; calling :func:`run_layerwise` for any other architecture will raise.
 """
@@ -45,6 +45,7 @@ _LAYERWISE_SUPPORTED_MODEL_TYPES = frozenset(
         "qwen3_vl_moe_text",
         "qwen3_5_moe",
         "qwen3_moe",
+        "hy_v4",
     }
 )
 
@@ -443,6 +444,15 @@ def _set_layer_windows(text_start: int, text_end: int, text_total_layers: int) -
             cls._end = text_end
             cls._total_layers = text_total_layers
 
+    try:
+        from QEfficient.transformers.models.hy_v4.modeling_hy_v4 import QEffHYV4Model
+
+        QEffHYV4Model._start = text_start
+        QEffHYV4Model._end = text_end
+        QEffHYV4Model._total_layers = text_total_layers
+    except ImportError:
+        pass
+
     QEfficient.base.modeling_qeff.QEFFBaseModel._start = text_start
     QEfficient.base.modeling_qeff.QEFFBaseModel._end = text_end
     QEfficient.base.modeling_qeff.QEFFBaseModel._total_layers = text_total_layers
@@ -601,6 +611,11 @@ def _install_window_patches_for(model_type: str) -> None:
     if qwen3_moe_mod is not None and model_type in {"qwen3_moe"}:
         candidates.extend(
             cls for name in ("Qwen3MoeForCausalLM",) if (cls := getattr(qwen3_moe_mod, name, None)) is not None
+        )
+    hy4_mod = getattr(getattr(transformers.models, "hy_v4", None), "modeling_hy_v4", None)
+    if hy4_mod is not None and model_type == "hy_v4":
+        candidates.extend(
+            cls for name in ("HYV4ForCausalLM",) if (cls := getattr(hy4_mod, name, None)) is not None
         )
     for cls in candidates:
         _install_window_patch(cls)

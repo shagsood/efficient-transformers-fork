@@ -1039,6 +1039,10 @@ class QEFFBaseModel(ABC):
                     ]
                 )
 
+        extra_output_names = getattr(self.model, "get_layerwise_output_names", None)
+        if extra_output_names is not None:
+            output_name.extend(extra_output_names())
+
         # Inject the optional vLLM KV-cache prefix into the freshly built per-window output names
         # (past_key.3_RetainedState -> past_key.3_<prefix>_RetainedState), using the same helper the
         # non-layerwise paths use. The matching input buffers are renamed to pair with these outputs
@@ -1059,9 +1063,25 @@ class QEFFBaseModel(ABC):
             # float32/float16 mismatch when running through fp16 decoder layers.
             if embed_dtype is None:
                 embed_dtype = next(self.model.parameters()).dtype
-            inputs_embeds = torch.rand(z.shape[0], z.shape[1], hidden_size, device=z.device, dtype=embed_dtype)
+            build_inputs_embeds = getattr(self.model, "build_layerwise_inputs_embeds", None)
+            if build_inputs_embeds is not None:
+                inputs_embeds = build_inputs_embeds(z)
+            else:
+                inputs_embeds = torch.rand(z.shape[0], z.shape[1], hidden_size, device=z.device, dtype=embed_dtype)
             example_inputs["inputs_embeds"] = inputs_embeds
             dynamic_axes["inputs_embeds"] = dynamic_axes.pop("input_ids")
+
+        extra_input_tensors = getattr(self.model, "get_layerwise_input_tensors", None)
+        if extra_input_tensors is not None:
+            for name, tensor in extra_input_tensors(example_inputs).items():
+                example_inputs[name] = tensor
+                dynamic_axes[name] = getattr(self.model, "get_layerwise_dynamic_axes", lambda _: {})(name)
+
+        ignored_inputs_fn = getattr(self.model, "get_layerwise_ignored_inputs", None)
+        if ignored_inputs_fn is not None:
+            for name in ignored_inputs_fn():
+                example_inputs.pop(name, None)
+                dynamic_axes.pop(name, None)
 
         window_size = end_idx - idx
         if "compressed_kvs" in example_inputs:
@@ -1078,6 +1098,8 @@ class QEFFBaseModel(ABC):
                     )
                 example_inputs["past_key_values"] = [pkv_layers[idx]]
         # Create input_names from example_inputs
+        static_layerwise_inputs_fn = getattr(self.model, "get_layerwise_static_inputs", None)
+        static_layerwise_inputs = set(static_layerwise_inputs_fn() if static_layerwise_inputs_fn else ())
         input_names = []
         for param in inspect.signature(self.model.forward).parameters:
             if param in example_inputs:
@@ -1101,6 +1123,13 @@ class QEFFBaseModel(ABC):
                 else:
                     input_names.append(param)
         dynamic_axes = {k: v for k, v in dynamic_axes.items() if k in input_names}
+        layerwise_dynamic_axes_fn = getattr(self.model, "get_layerwise_dynamic_axes", None)
+        if layerwise_dynamic_axes_fn is not None:
+            for name in output_name:
+                output_axes = layerwise_dynamic_axes_fn(name)
+                if output_axes:
+                    dynamic_axes[name] = output_axes
+        export_dynamic_axes = {k: v for k, v in dynamic_axes.items() if k not in static_layerwise_inputs}
 
         layerwise_dir = export_dir / "onnx_layerwise_tmp"
         start_time = time.time()
@@ -1128,7 +1157,7 @@ class QEFFBaseModel(ABC):
                     kwargs=example_inputs,
                     input_names=input_names,
                     output_names=output_names,
-                    dynamic_axes=dynamic_axes,
+                    dynamic_axes=export_dynamic_axes,
                     opset_version=constants.ONNX_LEGACY_EXPORT_OPSET,
                     dynamo=False,
                     **export_kwargs,
@@ -1137,6 +1166,38 @@ class QEFFBaseModel(ABC):
             print(f"\nTotal export time: {total_end - start_time:.2f} seconds")
 
         model = onnx.load(layer_onnx_path_tmp, load_external_data=False)
+
+        # TorchScript may expose a static integer input under an auto-generated
+        # ``onnx::`` name when it is first consumed by Cast. Restore the
+        # architecture-declared layerwise ABI before stitching windows.
+        graph_input_names = {value.name for value in model.graph.input}
+        for expected_name in static_layerwise_inputs:
+            if expected_name in graph_input_names:
+                continue
+            expected_tensor = example_inputs.get(expected_name)
+            expected_rank = len(expected_tensor.shape) if expected_tensor is not None else None
+            candidates = [
+                value
+                for value in model.graph.input
+                if value.name.startswith("onnx::")
+                and (expected_rank is None or len(value.type.tensor_type.shape.dim) == expected_rank)
+            ]
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    f"Could not normalize layerwise input {expected_name!r}; "
+                    f"auto-named candidates={[value.name for value in candidates]}"
+                )
+            old_name = candidates[0].name
+            for value in list(model.graph.input) + list(model.graph.output) + list(model.graph.value_info):
+                if value.name == old_name:
+                    value.name = expected_name
+            for node in model.graph.node:
+                for i, name in enumerate(node.input):
+                    if name == old_name:
+                        node.input[i] = expected_name
+                for i, name in enumerate(node.output):
+                    if name == old_name:
+                        node.output[i] = expected_name
         transform_kwargs = {
             "onnx_base_dir": str(current_layer_dir),
             "model_name": self.model_name,
