@@ -6,8 +6,8 @@
 # -----------------------------------------------------------------------------
 
 import warnings
+from collections.abc import Callable
 from types import MethodType
-from typing import Callable, Optional, Tuple, Union
 
 from torch import nn
 from transformers.models.codegen.modeling_codegen import (
@@ -15,6 +15,17 @@ from transformers.models.codegen.modeling_codegen import (
     CodeGenBlock,
     CodeGenForCausalLM,
     CodeGenModel,
+)
+from transformers.models.cohere2_moe.modeling_cohere2_moe import (
+    Cohere2MoeAttention,
+    Cohere2MoeDecoderLayer,
+    Cohere2MoeExperts,
+    Cohere2MoeForCausalLM,
+    Cohere2MoeModel,
+    Cohere2MoeRMSNorm,
+    Cohere2MoeRotaryEmbedding,
+    Cohere2MoeSparseMoeBlock,
+    Cohere2MoeTopKRouter,
 )
 from transformers.models.deberta_v2.modeling_deberta_v2 import (
     DisentangledSelfAttention,
@@ -102,6 +113,7 @@ from transformers.models.granitemoe.modeling_granitemoe import (
     GraniteMoeRMSNorm,
     GraniteMoeRotaryEmbedding,
 )
+
 try:
     from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeParallelExperts,
@@ -110,6 +122,8 @@ try:
 except ImportError:
     from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeExperts as GraniteMoeParallelExperts,
+    )
+    from transformers.models.granitemoe.modeling_granitemoe import (
         GraniteMoeTopKRouter as GraniteMoeTopKGating,
     )
 from transformers.models.llama.modeling_llama import (
@@ -327,6 +341,18 @@ from QEfficient.transformers.models.codegen.modeling_codegen import (
     QEffCodeGenBlock,
     QEffCodeGenForCausalLM,
     QEffCodeGenModel,
+)
+from QEfficient.transformers.models.cohere2_moe.modeling_cohere2_moe import (
+    QEffCohere2MoeAttention,
+    QEffCohere2MoeDecoderLayer,
+    QEffCohere2MoeExperts,
+    QEffCohere2MoeForCausalLM,
+    QEffCohere2MoeModel,
+    QEffCohere2MoePrefillChunkedMoeMLP,
+    QEffCohere2MoePrefillOnlyMoeMLP,
+    QEffCohere2MoeRotaryEmbedding,
+    QEffCohere2MoeSparseMoeBlock,
+    QEffCohere2MoeTopKRouter,
 )
 from QEfficient.transformers.models.deberta_v2.modeling_deberta_v2 import (
     QEffDisentangledSelfAttention,
@@ -676,6 +702,7 @@ SPD_TARGET = "target"
 class CustomOpsTransform(ModuleMappingTransform):
     _module_mapping = {
         GemmaRMSNorm: GemmaCustomRMSNormAIC,
+        Cohere2MoeRMSNorm: CustomRMSNormAIC,
         Gemma2RMSNorm: GemmaCustomRMSNormAIC,
         GptOssRMSNorm: CustomRMSNormAIC,
         LlamaRMSNorm: CustomRMSNormAIC,
@@ -722,6 +749,15 @@ class KVCacheTransform(ModuleMappingTransform):
         Glm4MoeRotaryEmbedding: QEffGlm4MoeRotaryEmbedding,
         Glm4MoeMoE: QEffGlm4MoeMoE,
         Glm4MoeTopkRouter: QEffGlm4MoeTopkRouter,
+        # Cohere2-MoE hybrid attention
+        Cohere2MoeForCausalLM: QEffCohere2MoeForCausalLM,
+        Cohere2MoeModel: QEffCohere2MoeModel,
+        Cohere2MoeAttention: QEffCohere2MoeAttention,
+        Cohere2MoeDecoderLayer: QEffCohere2MoeDecoderLayer,
+        Cohere2MoeRotaryEmbedding: QEffCohere2MoeRotaryEmbedding,
+        Cohere2MoeExperts: QEffCohere2MoeExperts,
+        Cohere2MoeSparseMoeBlock: QEffCohere2MoeSparseMoeBlock,
+        Cohere2MoeTopKRouter: QEffCohere2MoeTopKRouter,
         # CodeGen
         CodeGenAttention: QEffCodeGenAttention,
         CodeGenBlock: QEffCodeGenBlock,
@@ -948,7 +984,7 @@ class KVCacheTransform(ModuleMappingTransform):
     }
 
     @classmethod
-    def apply(cls, model: nn.Module) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module) -> tuple[nn.Module, bool]:
         model, transformed = super().apply(model)
         return model, transformed
 
@@ -958,6 +994,7 @@ class PrefillOnlyTransform(ModuleMappingTransform):
         QEffGptOssModel: QEffPrefillOnlyGptOssModel,
         QEffGptOssAttention: QEffPrefillOnlyGptOssAttention,
         QEffGptOssMLP: QEffPrefillOnlyGptOssMLP,
+        QEffCohere2MoeSparseMoeBlock: QEffCohere2MoePrefillOnlyMoeMLP,
         QEffGlm4MoeMoE: QEffPrefillChunkedGlm4MoeMoE,
         QEffQwen3MoeSparseMoeBlock: QEffPrefillChunkedQwen3MoeSparseMoeBlock,
         QEffQwen3VLMoeTextSparseMoeBlock: QEffPrefillChunkedQwen3VLMoeTextSparseMoeBlock,
@@ -971,6 +1008,7 @@ class PrefillOnlyChunkedTransform(ModuleMappingTransform):
         QEffGptOssModel: QEffPrefillOnlyGptOssModel,
         QEffGptOssAttention: QEffPrefillOnlyChunkedGptOssAttention,
         QEffGptOssMLP: QEffPrefillOnlyChunkedGptOssMLP,
+        QEffCohere2MoeSparseMoeBlock: QEffCohere2MoePrefillChunkedMoeMLP,
         # Qwen3Moe
         QEffQwen3MoeSparseMoeBlock: QEffPrefillChunkedQwen3MoeSparseMoeBlock,
         # Qwen3 VL Moe
@@ -992,6 +1030,7 @@ class RevertPrefillKeepAttentionTransform(ModuleMappingTransform):
         QEffGptOssAttention: QEffPrefillOnlyChunkedGptOssAttention,
         QEffPrefillOnlyGptOssMLP: QEffGptOssMLP,
         QEffPrefillOnlyChunkedGptOssMLP: QEffGptOssMLP,
+        QEffCohere2MoePrefillChunkedMoeMLP: QEffCohere2MoeSparseMoeBlock,
         # Qwen3Moe
         QEffPrefillChunkedQwen3MoeSparseMoeBlock: QEffQwen3MoeSparseMoeBlock,
         # GLM4 Moe
@@ -1022,7 +1061,7 @@ class ReplicateKVHeadTransform(ModuleMutatorTransform):
     def mutate(
         cls,
         original_module: nn.Module,
-        parent_module: nn.Module,  # noqa: ARG003
+        parent_module: nn.Module,
         n_repeat: int,
         orig_kv_heads: int,
         new_kv_heads: int,
@@ -1064,7 +1103,7 @@ class ReplicateKVHeadTransform(ModuleMutatorTransform):
         return original_module
 
     @classmethod
-    def apply(cls, model: nn.Module, num_replicate_kv_heads: Optional[int] = None, **kwargs) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, num_replicate_kv_heads: int | None = None, **kwargs) -> tuple[nn.Module, bool]:
         """
         Replicates KV heads in attention modules based on provided multiplier.
 
@@ -1176,7 +1215,7 @@ class SpDTransform:
     }
 
     @classmethod
-    def apply(cls, model: nn.Module, qaic_config: Optional[dict] = None, **kwargs) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, qaic_config: dict | None = None, **kwargs) -> tuple[nn.Module, bool]:
         transformed = False
         pretrained_model_name_or_path_temp = kwargs.pop("pretrained_model_name_or_path", None)
         if qaic_config is None or (speculative_model_type := qaic_config.get("speculative_model_type")) is None:
@@ -1243,7 +1282,7 @@ class SamplerTransform:
     }
 
     @classmethod
-    def apply(cls, model: nn.Module, qaic_config: Optional[dict] = None, **kwargs) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, qaic_config: dict | None = None, **kwargs) -> tuple[nn.Module, bool]:
         transformed = False
         if qaic_config is None or not qaic_config.get("include_sampler", False):
             return model, transformed
@@ -1425,7 +1464,7 @@ class PoolingTransform:
     """
 
     @classmethod
-    def apply(cls, model: nn.Module, pooling: Union[str, Callable]) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, pooling: str | Callable) -> tuple[nn.Module, bool]:
         transformed = False
         pooling_method = (
             POOLING_MAP[pooling]
@@ -1467,7 +1506,7 @@ class BlockingAttentionTransform:
     _skip_classes = {}
 
     @classmethod
-    def apply(cls, model: nn.Module, attn_blocking_config) -> Tuple[nn.Module, bool]:
+    def apply(cls, model: nn.Module, attn_blocking_config) -> tuple[nn.Module, bool]:
         transformed = False
         model_config = getattr(model, "config", None) or getattr(getattr(model, "model", None), "config", None)
         model_architectures = getattr(model_config, "architectures", None) or []
