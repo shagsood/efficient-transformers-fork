@@ -43,9 +43,12 @@ def main():
         num_cores=16, aic_hw_version="ai100", num_devices=half,
         mxfp6_matmul=True, mxint8_kv_cache=True,
         batch_size=1, full_batch_size=1, prefill_seq_len=1, ctx_len=args.ctx_len,
+        # Decode-BMM replicates all 128 experts per SoC (~58 GB/SoC). Pack
+        # experts across the four decode SoCs so the QPC fits 32 GB devices.
+        qaic_config={"moe_config": {"flavour": "expert_parallel", "expert_parallel_chunk_size": 1}},
         mos=1, aic_enable_depth_first=True,
         offload_pt_weights=False, split_retained_state_io=True,
-        retain_full_kv=True, use_onnx_subfunctions=True,
+        retain_full_kv=True, use_onnx_subfunctions=False,
     )
 
     prefill_qpc = model.compile(
