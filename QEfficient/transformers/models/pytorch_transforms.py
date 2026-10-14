@@ -18,6 +18,17 @@ from transformers.models.codegen.modeling_codegen import (
     CodeGenForCausalLM,
     CodeGenModel,
 )
+from transformers.models.cohere2_moe.modeling_cohere2_moe import (
+    Cohere2MoeAttention,
+    Cohere2MoeDecoderLayer,
+    Cohere2MoeExperts,
+    Cohere2MoeForCausalLM,
+    Cohere2MoeModel,
+    Cohere2MoeRMSNorm,
+    Cohere2MoeRotaryEmbedding,
+    Cohere2MoeSparseMoeBlock,
+    Cohere2MoeTopKRouter,
+)
 from transformers.models.deberta_v2.modeling_deberta_v2 import (
     DisentangledSelfAttention,
 )
@@ -322,6 +333,18 @@ from QEfficient.transformers.models.codegen.modeling_codegen import (
     QEffCodeGenBlock,
     QEffCodeGenForCausalLM,
     QEffCodeGenModel,
+)
+from QEfficient.transformers.models.cohere2_moe.modeling_cohere2_moe import (
+    QEffCohere2MoeAttention,
+    QEffCohere2MoeDecoderLayer,
+    QEffCohere2MoeExperts,
+    QEffCohere2MoeForCausalLM,
+    QEffCohere2MoeModel,
+    QEffCohere2MoePrefillChunkedMoeMLP,
+    QEffCohere2MoePrefillOnlyMoeMLP,
+    QEffCohere2MoeRotaryEmbedding,
+    QEffCohere2MoeSparseMoeBlock,
+    QEffCohere2MoeTopKRouter,
 )
 from QEfficient.transformers.models.deberta_v2.modeling_deberta_v2 import (
     QEffDisentangledSelfAttention,
@@ -683,6 +706,7 @@ SPD_TARGET = "target"
 class CustomOpsTransform(ModuleMappingTransform):
     _module_mapping = {
         GemmaRMSNorm: GemmaCustomRMSNormAIC,
+        Cohere2MoeRMSNorm: CustomRMSNormAIC,
         Gemma2RMSNorm: GemmaCustomRMSNormAIC,
         GptOssRMSNorm: CustomRMSNormAIC,
         LlamaRMSNorm: CustomRMSNormAIC,
@@ -727,6 +751,12 @@ class KVCacheTransform(ModuleMappingTransform):
         Glm4MoeAttention: QEffGlm4MoeAttention,
         Glm4MoeDecoderLayer: QEffGlm4MoeDecoderLayer,
         Glm4MoeRotaryEmbedding: QEffGlm4MoeRotaryEmbedding,
+        # Cohere2-MoE hybrid attention
+        Cohere2MoeForCausalLM: QEffCohere2MoeForCausalLM,
+        Cohere2MoeModel: QEffCohere2MoeModel,
+        Cohere2MoeAttention: QEffCohere2MoeAttention,
+        Cohere2MoeDecoderLayer: QEffCohere2MoeDecoderLayer,
+        Cohere2MoeRotaryEmbedding: QEffCohere2MoeRotaryEmbedding,
         # CodeGen
         CodeGenAttention: QEffCodeGenAttention,
         CodeGenBlock: QEffCodeGenBlock,
@@ -943,6 +973,7 @@ class PrefillOnlyTransform(ModuleMappingTransform):
     _module_mapping = {
         QEffGptOssModel: QEffPrefillOnlyGptOssModel,
         QEffGptOssAttention: QEffPrefillOnlyGptOssAttention,
+        QEffCohere2MoeSparseMoeBlock: QEffCohere2MoePrefillOnlyMoeMLP,
     }
 
 
@@ -951,6 +982,7 @@ class PrefillOnlyChunkedTransform(ModuleMappingTransform):
         # GPT_OSS
         QEffGptOssModel: QEffPrefillOnlyGptOssModel,
         QEffGptOssAttention: QEffPrefillOnlyChunkedGptOssAttention,
+        QEffCohere2MoeSparseMoeBlock: QEffCohere2MoePrefillChunkedMoeMLP,
     }
 
 
@@ -960,6 +992,7 @@ class RevertPrefillKeepAttentionTransform(ModuleMappingTransform):
         QEffGptOssModel: QEffPrefillOnlyGptOssModel,
         QEffPrefillOnlyGptOssAttention: QEffPrefillOnlyChunkedGptOssAttention,
         QEffGptOssAttention: QEffPrefillOnlyChunkedGptOssAttention,
+        QEffCohere2MoePrefillChunkedMoeMLP: QEffCohere2MoeSparseMoeBlock,
     }
 
 
@@ -1659,6 +1692,10 @@ class OptimizedMoEMapperTransform(ModuleMappingTransform):
     """Replace in-tree MoE components with QEff implementations."""
 
     _module_mapping = {
+        # Cohere2-MoE
+        Cohere2MoeExperts: QEffCohere2MoeExperts,
+        Cohere2MoeSparseMoeBlock: QEffCohere2MoeSparseMoeBlock,
+        Cohere2MoeTopKRouter: QEffCohere2MoeTopKRouter,
         # GLM4-MoE
         Glm4MoeMoE: QEffGlm4MoeMoE,
         Glm4MoeTopkRouter: QEffGlm4MoeTopkRouter,

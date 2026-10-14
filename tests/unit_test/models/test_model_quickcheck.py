@@ -98,6 +98,7 @@ CAUSAL_RUNTIME_MODEL_IDS = {
     "granite": "hf-internal-testing/tiny-random-GraniteForCausalLM",
     "olmo2": "hf-internal-testing/tiny-random-Olmo2ForCausalLM",
     "gpt_oss": "tiny-random/gpt-oss-bf16",
+    "cohere2_moe": "hf-tiny-v2/tiny-random-Cohere2MoeForCausalLM",
 }
 
 #   In PyTorch ≤2.3 (used with transformers v4.57.3), torch.onnx.export with
@@ -112,6 +113,7 @@ CAUSAL_MULTI_SUBFUNCTION_MODEL_TYPES = {
     "phi",
     "starcoder2",
     "gpt_oss",
+    "cohere2_moe",
     # "granitemoe" is intentionally not listed in CAUSAL_RUNTIME_MODEL_IDS yet.
 }
 
