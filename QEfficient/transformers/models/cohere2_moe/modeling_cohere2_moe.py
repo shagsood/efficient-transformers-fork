@@ -226,7 +226,7 @@ class QEffCohere2MoeAttention(Cohere2MoeAttention):
                 "is_sliding": self.sliding_window is not None,
                 "sliding_window": self.sliding_window,
             }
-            if comp_ctx_lengths is not None:
+            if comp_ctx_lengths is not None and self.sliding_window is None:
                 attention_mask = attention_mask[:, :, :, : comp_ctx_lengths.shape[-1]]
                 cache_kwargs["CCL"] = attention_mask.shape[-1]
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
