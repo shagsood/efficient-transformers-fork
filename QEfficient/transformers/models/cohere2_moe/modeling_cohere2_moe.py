@@ -6,6 +6,8 @@
 # -----------------------------------------------------------------------------
 
 
+from functools import partial
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -27,6 +29,15 @@ from transformers.models.cohere2_moe.modeling_cohere2_moe import (
 
 from QEfficient.transformers.cache_utils import QEffGPTOSSHybridCache
 from QEfficient.transformers.modeling_attn_mask_utils import _create_causal_mask
+from QEfficient.transformers.moe import (
+    MoEFlavour,
+    MoEProfile,
+    MoEWeights,
+    QEffMoEBlockMixin,
+    build_canonical_expert_weights,
+    delete_module_attrs,
+    silu_glu_mlp,
+)
 from QEfficient.utils.constants import MIN_MASKED_ATTENTION_VALUE
 
 
@@ -82,53 +93,24 @@ def eager_attention_forward(
 
 
 class QEffCohere2MoeExperts(Cohere2MoeExperts):
-    """Weights-as-activation decode and all-expert prefill kernels."""
+    def __qeff_init__(self):
+        self.weights_transformed = False
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        top_k = top_k_index.shape[1]
-        selected_count = num_tokens * top_k
-        expert_index = top_k_index.reshape(selected_count)
-        expert_input = (
-            hidden_states.unsqueeze(1).expand(num_tokens, top_k, hidden_dim).reshape(selected_count, hidden_dim)
+    def transform_weights(self) -> MoEWeights:
+        if getattr(self, "weights_transformed", False):
+            return self.moe_weights
+        self.moe_weights = build_canonical_expert_weights(
+            gate_up=self.gate_up_proj,
+            down=self.down_proj,
+            fused=True,
+            fused_split_dim=1,
+            transpose_gate_up=True,
+            transpose_down=True,
+            clone=True,
         )
-
-        gate_up = torch.index_select(self.gate_up_proj, 0, expert_index)
-        gate_up = torch.bmm(expert_input.unsqueeze(1), gate_up.transpose(1, 2)).reshape(
-            num_tokens, top_k, 2 * self.intermediate_dim
-        )
-        gate, up = gate_up.chunk(2, dim=-1)
-        hidden = self.act_fn(gate) * up
-
-        down = torch.index_select(self.down_proj, 0, expert_index)
-        expert_outputs = torch.bmm(
-            hidden.reshape(selected_count, 1, self.intermediate_dim), down.transpose(1, 2)
-        ).reshape(num_tokens, top_k, hidden_dim)
-        return torch.einsum("bnd->bd", expert_outputs * top_k_weights.unsqueeze(-1))
-
-    def forward_all_experts(
-        self,
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor,
-    ) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        expert_input = hidden_states.unsqueeze(0).expand(self.num_experts, num_tokens, hidden_dim)
-        gate_up = torch.bmm(expert_input, self.gate_up_proj.transpose(1, 2))
-        gate, up = gate_up.chunk(2, dim=-1)
-        hidden = self.act_fn(gate) * up
-        expert_outputs = torch.bmm(hidden, self.down_proj.transpose(1, 2)).permute(1, 0, 2)
-
-        routing_weights = torch.zeros(
-            (num_tokens, self.num_experts), dtype=top_k_weights.dtype, device=top_k_weights.device
-        )
-        routing_weights.scatter_(1, top_k_index, top_k_weights)
-        return torch.einsum("bnd->bd", expert_outputs * routing_weights.unsqueeze(-1))
+        delete_module_attrs(self, "gate_up_proj", "down_proj")
+        self.weights_transformed = True
+        return self.moe_weights
 
 
 class QEffCohere2MoeTopKRouter(Cohere2MoeTopKRouter):
@@ -146,42 +128,52 @@ class QEffCohere2MoeTopKRouter(Cohere2MoeTopKRouter):
         return router_logits, router_scores.to(hidden_states.dtype), selected_experts
 
 
-class QEffCohere2MoeSparseMoeBlock(Cohere2MoeSparseMoeBlock):
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states_flat = hidden_states.reshape(batch_size * sequence_length, hidden_dim)
-        _, router_scores, selected_experts = self.gate(hidden_states_flat)
-        final_hidden_states = self.experts(hidden_states_flat, selected_experts, router_scores)
+class QEffCohere2MoeSparseMoeBlock(QEffMoEBlockMixin, Cohere2MoeSparseMoeBlock):
+    supported_moe_flavours = (
+        MoEFlavour.SIMPLE_LOOP,
+        MoEFlavour.DECODE_BMM,
+        MoEFlavour.EXPERT_PARALLEL,
+    )
+
+    def __qeff_init__(self):
+        super().__qeff_init__()
+        self.top_k = getattr(self.gate, "top_k", None)
+        self.norm_topk_prob = getattr(self.gate, "norm_topk_prob", False)
+        self.num_experts = getattr(self.gate, "num_experts", getattr(self.experts, "num_experts", None))
+
+    def transform_weights(self) -> MoEWeights:
+        if getattr(self, "weights_transformed", False):
+            return self.moe_weights
+        self.moe_weights = self.experts.transform_weights()
+        self.weights_transformed = True
+        return self.moe_weights
+
+    @property
+    def moe_profile(self) -> MoEProfile:
+        return MoEProfile(expert_mlp=partial(silu_glu_mlp, act_fn=self.experts.act_fn))
+
+    def route(self, x: torch.Tensor):
+        _, top_w, top_i = self.gate(x)
+        return (top_i, top_w.to(x.dtype)), None
+
+    def apply_shared_experts(self, out: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         if self.num_shared_experts > 0:
-            shared_output = self.shared_experts(hidden_states_flat)
+            shared_output = self.shared_experts(residual)
             if self.shared_expert_combination_strategy == "sum":
-                final_hidden_states = final_hidden_states + shared_output
+                return out + shared_output
             elif self.shared_expert_combination_strategy == "average":
-                final_hidden_states = (final_hidden_states + shared_output) / 2
+                return (out + shared_output) / 2
             else:
                 raise ValueError("`shared_expert_combination_strategy` can only be `sum` or `average`")
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return out
 
 
 class QEffCohere2MoePrefillOnlyMoeMLP(QEffCohere2MoeSparseMoeBlock):
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states_flat = hidden_states.reshape(batch_size * sequence_length, hidden_dim)
-        _, router_scores, selected_experts = self.gate(hidden_states_flat)
-        final_hidden_states = self.experts.forward_all_experts(hidden_states_flat, selected_experts, router_scores)
-        if self.num_shared_experts > 0:
-            shared_output = self.shared_experts(hidden_states_flat)
-            if self.shared_expert_combination_strategy == "sum":
-                final_hidden_states = final_hidden_states + shared_output
-            elif self.shared_expert_combination_strategy == "average":
-                final_hidden_states = (final_hidden_states + shared_output) / 2
-            else:
-                raise ValueError("`shared_expert_combination_strategy` can only be `sum` or `average`")
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+    supported_moe_flavours = QEffCohere2MoeSparseMoeBlock.supported_moe_flavours
 
 
 class QEffCohere2MoePrefillChunkedMoeMLP(QEffCohere2MoePrefillOnlyMoeMLP):
-    pass
+    supported_moe_flavours = QEffCohere2MoeSparseMoeBlock.supported_moe_flavours
 
 
 class QEffCohere2MoeAttention(Cohere2MoeAttention):
@@ -404,8 +396,9 @@ class QEffCohere2MoeForCausalLM(Cohere2MoeForCausalLM):
             **kwargs,
         )
         logit_index = position_ids.to(torch.int32).argmax(1, keepdim=True)
-        batch_indices = torch.arange(position_ids.shape[0], device=position_ids.device).view(position_ids.shape[0], 1)
-        hidden_states = outputs.last_hidden_state[batch_indices, logit_index]
+        hidden_states = outputs.last_hidden_state.gather(
+            1, logit_index.unsqueeze(-1).expand(-1, -1, outputs.last_hidden_state.shape[-1])
+        )
         logits = self.lm_head(hidden_states).float() * self.logit_scale
         return MoeCausalLMOutputWithPast(
             logits=logits,

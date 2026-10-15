@@ -55,6 +55,36 @@ def is_retained_state_name(name: str) -> bool:
     return name.startswith(("past_", "conv_state.", "recurrent_state.", "compressed_", "k_pe"))
 
 
+def _prepare_kv_handoff_buffer(binding_shape, buf, expected_dtype):
+    """Return the buffer to wire and an optional (temporary, destination) copy pair."""
+    binding_shape = tuple(binding_shape)
+    buf_shape = tuple(buf.shape)
+    shape_ok = (
+        len(binding_shape) == len(buf_shape)
+        and binding_shape[1:] == buf_shape[1:]
+        and 1 <= buf_shape[0] <= binding_shape[0]
+    )
+    if shape_ok:
+        return buf, None
+
+    # A decode QPC may retain a larger sliding-window buffer than prefill. The
+    # prefill result is a valid prefix; zero-fill the unused decode positions.
+    prefix_ok = (
+        len(binding_shape) == len(buf_shape) == 4
+        and binding_shape[0] >= buf_shape[0] >= 1
+        and binding_shape[1] == buf_shape[1]
+        and binding_shape[2] <= buf_shape[2]
+        and binding_shape[3] == buf_shape[3]
+    )
+    if prefix_ok:
+        temporary = np.zeros(binding_shape, dtype=expected_dtype)
+        return temporary, (temporary, buf)
+
+    raise ValueError(
+        f"KV buffer shape mismatch: expected {binding_shape} (or a smaller dim-0 slice of it), got {buf_shape}"
+    )
+
+
 class KvDmaHandoff:
     """Owns the DMA-based prefill->decode KV handoff state and runtime path for a
     ``QAICInferenceSession`` with ``kv_dma_share=True``.
@@ -85,6 +115,7 @@ class KvDmaHandoff:
         self.prefill_available_exec_objs: Queue = Queue()
         for i in range(self.decode_num_execObj, self.decode_num_execObj + self.prefill_num_execObj):
             self.prefill_available_exec_objs.put(i)
+        self._pending_handoff_copies: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {}
 
     def _build_kv_bindings(self) -> List[Tuple[str, int, int]]:
         """One canonical, validated ordering of KV retained-state bindings.
@@ -251,36 +282,31 @@ class KvDmaHandoff:
                 f"got {len(kv_cache_buffers)}"
             )
         slices = []
+        pending_copies = []
         for (name, binding_index), buf in zip(buff_map, kv_cache_buffers):
             binding = self.session.bindings[binding_index]
             binding_shape = tuple(binding.dims)
-            buf_shape = tuple(buf.shape)
-            # Dim 0 (batch) is sliced by "batch_index" in the DimSpec, so a buffer
-            # covering a single row (e.g. one prefill slot) legitimately has a
-            # smaller dim 0 than the binding's full compiled shape. Every other
-            # dim is written in full and must match exactly.
-            shape_ok = (
-                len(binding_shape) == len(buf_shape)
-                and binding_shape[1:] == buf_shape[1:]
-                and 1 <= buf_shape[0] <= binding_shape[0]
-            )
-            if not shape_ok:
-                raise ValueError(
-                    f"KV buffer shape mismatch for {name!r} (binding {binding_index}): "
-                    f"expected {binding_shape} (or a smaller dim-0 slice of it), got {buf_shape}"
-                )
             expected_dtype = self.session.aic_to_np_dtype_mapping[binding.type]
             if expected_dtype != buf.dtype:
                 raise ValueError(
                     f"KV buffer dtype mismatch for {name!r} (binding {binding_index}): "
                     f"expected {expected_dtype}, got {buf.dtype}"
                 )
-            slices.append((binding_index, buf))
+            try:
+                wire_buf, copy_pair = _prepare_kv_handoff_buffer(binding_shape, buf, expected_dtype)
+            except ValueError as exc:
+                raise ValueError(
+                    f"KV buffer shape mismatch for {name!r} (binding {binding_index}): {exc}"
+                ) from exc
+            slices.append((binding_index, wire_buf))
+            if copy_pair is not None:
+                pending_copies.append(copy_pair)
         status, _ = self.session.execObj[index].setDataWithSlices(
             slices, self.kv_slicing_spec_handle, slicing_parameters
         )
         if status != qaicrt.QStatus.QS_SUCCESS:
             raise RuntimeError("Failed to setDataWithSlices")
+        self._pending_handoff_copies[index] = pending_copies
         return kv_cache_buffers
 
     def np_run(self, inputs: Dict[str, np.ndarray], slicing_parameters=None, is_prefill: bool = True) -> int:
@@ -342,6 +368,9 @@ class KvDmaHandoff:
         session = self.session
         if session.execObj[index].waitForCompletion() != qaicrt.QStatus.QS_SUCCESS:
             raise ValueError(session._shape_mismatch_message(session.buf_dims[index]))
+        for temporary, destination in self._pending_handoff_copies.pop(index, []):
+            destination[...] = 0
+            destination[..., : temporary.shape[2], :] = temporary
         if is_prefill:
             self.prefill_available_exec_objs.put(index)
 
