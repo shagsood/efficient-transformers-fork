@@ -61,8 +61,8 @@ def main():
             device_group = _parse_qids(args.device_group, "--device-group")
             if len(device_group) < 4 or len(device_group) % 2:
                 raise ValueError("--device-group must contain an even number of at least four QIDs")
-            half = len(device_group) // 2
-            prefill_devices, decode_devices = device_group[:half], device_group[half:]
+            prefill_count = 8 if len(device_group) >= 12 else len(device_group) // 2
+            prefill_devices, decode_devices = device_group[:prefill_count], device_group[prefill_count:]
         if set(prefill_devices) & set(decode_devices):
             raise ValueError("prefill and decode QID groups must be disjoint")
     except ValueError as error:
@@ -76,13 +76,23 @@ def main():
         decode_qpc = _validate_qpc(args.decode_qpc_path, "decode")
     else:
         assert model is not None
+        decode_moe_config = {
+            "flavour": "expert_parallel",
+            "expert_parallel_chunk_size": 32,
+        }
+        if len(decode_devices) >= 8:
+            # Qwen-style wide decode: use two cores per expert once the decode
+            # partition is wide enough to keep the extra parallelism occupied.
+            decode_moe_config["cores_per_expert"] = 2
         decode_qpc = model.compile(
             num_cores=16, aic_hw_version="ai100", num_devices=len(decode_devices),
             mxfp6_matmul=True, mxint8_kv_cache=True,
             batch_size=1, full_batch_size=1, prefill_seq_len=1, ctx_len=args.ctx_len,
             # Decode-BMM replicates all 128 experts per SoC (~58 GB/SoC). Pack
-            # experts across the decode SoCs so the QPC fits 32 GB devices.
-            qaic_config={"moe_config": {"flavour": "expert_parallel", "expert_parallel_chunk_size": 1}},
+            # experts across the decode SoCs so the QPC fits 32 GB devices. One
+            # packed chunk removes the singleton dispatch-loop overhead while
+            # remaining valid for runtime seq_len=1.
+            qaic_config={"moe_config": decode_moe_config},
             mos=1, aic_enable_depth_first=True,
             offload_pt_weights=False, split_retained_state_io=True,
             retain_full_kv=True, use_onnx_subfunctions=False,
