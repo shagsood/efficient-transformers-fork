@@ -21,6 +21,24 @@ Reuse QPCs without recompiling by passing both `--prefill-qpc-path` and
 vLLM dependency. Earlier Transformers releases do not expose the required
 `transformers.models.cohere2_moe` module.
 
+### Serve precompiled QPCs with `qaic_disagg`
+
+`qaic_disagg` is a vLLM-QAIC service runtime, so it requires the Qualcomm
+vLLM-QAIC environment and a vLLM core that recognizes `cohere2_moe`. It does
+not recompile the QPCs below:
+
+```bash
+python3 examples/disagg_serving/cohere2_moe_ai200_qaic_disagg.py \
+  --prefill-qpc-path /absolute/path/to/prefill/qpc \
+  --decode-qpc-path /absolute/path/to/decode/qpc
+```
+
+The launcher uses QIDs `0-7` for prefill and `8-11` for decode by default. It
+requires the two QPCs to have been compiled with the same 8+4 topology, AI200,
+MXFP6 weights, MXINT8 KV cache, and `ctx_len`. It starts the API server at
+`http://localhost:18000`; prefill and decode child processes receive disjoint
+`QAIC_VISIBLE_DEVICES` values automatically.
+
 # Prefill-only model
 ## Blocking default behviour when `prefill_only=True` in compile API
  - NUM_Q_BLOCKS=<int> set number of Q blocks in attention 
