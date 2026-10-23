@@ -3,6 +3,22 @@
  - We use read all experts only once always strategy in prefill-only model
  - And we treat weights activtions meaning read only chosen experts for decode-only model
 
+## Cohere2-MoE on AI200 (8 prefill + 4 decode devices)
+
+`cohere2_moe_ai200_disagg.py` compiles separate MXFP6/MXINT8-KV QPCs for
+`CohereLabs/North-Mini-Code-1.0`, hands off retained KV state through DMA, and
+greedily generates 32 tokens. It requires 12 ready, disjoint AI200 QIDs:
+
+```bash
+python3 examples/disagg_serving/cohere2_moe_ai200_disagg.py \
+  --prefill-device-group 0,1,2,3,4,5,6,7 \
+  --decode-device-group 8,9,10,11
+```
+
+Reuse QPCs without recompiling by passing both `--prefill-qpc-path` and
+`--decode-qpc-path`. This is a direct QEff/QAIC runtime example; it has no
+vLLM dependency.
+
 # Prefill-only model
 ## Blocking default behviour when `prefill_only=True` in compile API
  - NUM_Q_BLOCKS=<int> set number of Q blocks in attention 
