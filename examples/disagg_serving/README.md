@@ -10,6 +10,7 @@
 greedily generates 32 tokens. It requires 12 ready, disjoint AI200 QIDs:
 
 ```bash
+python -m pip install --upgrade "transformers==5.9.0"
 python3 examples/disagg_serving/cohere2_moe_ai200_disagg.py \
   --prefill-device-group 0,1,2,3,4,5,6,7 \
   --decode-device-group 8,9,10,11
@@ -17,7 +18,8 @@ python3 examples/disagg_serving/cohere2_moe_ai200_disagg.py \
 
 Reuse QPCs without recompiling by passing both `--prefill-qpc-path` and
 `--decode-qpc-path`. This is a direct QEff/QAIC runtime example; it has no
-vLLM dependency.
+vLLM dependency. Earlier Transformers releases do not expose the required
+`transformers.models.cohere2_moe` module.
 
 # Prefill-only model
 ## Blocking default behviour when `prefill_only=True` in compile API
