@@ -8,7 +8,8 @@
 """Cohere2-MoE AI200 8-prefill/4-decode disaggregated inference.
 
 Compiles separate prefill and decode QPCs and passes KV through QEff's
-retained-state DMA handoff. The two QPCs use disjoint device groups.
+retained-state DMA handoff. The two QPCs use disjoint device groups. Defaults: 16K context and PP2
+prefill; decode uses PP1. Reused QPCs must match these compile settings.
 """
 
 import argparse
@@ -16,7 +17,6 @@ import os
 from time import perf_counter
 
 import numpy as np
-
 from transformers import AutoTokenizer
 
 from QEfficient import QEFFAutoModelForCausalLM
@@ -43,11 +43,12 @@ def main():
     parser = argparse.ArgumentParser(description="Cohere2-MoE AI200 QEff disaggregated inference")
     parser.add_argument("--model-id", default=MODEL_ID)
     parser.add_argument("--prompt", default="The future of AI is")
-    parser.add_argument("--ctx-len", type=int, default=1024)
+    parser.add_argument("--ctx-len", type=int, default=16384)
     parser.add_argument("--prefill-device-group", default=os.environ.get("PREFILL_DEVICE_GROUP", "0,1,2,3,4,5,6,7"))
     parser.add_argument("--decode-device-group", default=os.environ.get("DECODE_DEVICE_GROUP", "8,9,10,11"))
     parser.add_argument("--prefill-qpc-path", default=os.environ.get("QEFF_PREFILL_QPC_PATH"))
     parser.add_argument("--decode-qpc-path", default=os.environ.get("QEFF_DECODE_QPC_PATH"))
+    parser.add_argument("--prefill-pp", type=int, default=2, help="Pipeline partitions within the prefill QPC")
     parser.add_argument("--generation-len", type=int, default=32)
     args = parser.parse_args()
     try:
@@ -59,6 +60,22 @@ def main():
             raise ValueError("prefill and decode QID groups must be disjoint")
     except ValueError as error:
         parser.error(str(error))
+
+    if args.prefill_pp < 1 or len(prefill_devices) % args.prefill_pp:
+        parser.error("--prefill-pp must be positive and divide the prefill device count")
+    if args.ctx_len < 128 or args.ctx_len % 128 or args.generation_len < 1:
+        parser.error("--ctx-len must be a positive multiple of 128; --generation-len must be positive")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    prompt_len = int(tokenizer(args.prompt, return_tensors="np")["input_ids"].shape[1])
+    padded_len = ((prompt_len + 128 - 1) // 128) * 128
+    if prompt_len < 1 or padded_len > args.ctx_len or prompt_len + args.generation_len > args.ctx_len:
+        parser.error("prompt plus generation must fit --ctx-len, including the padded prefill chunk")
+    print(
+        f"Prefill: PP{args.prefill_pp} TS{len(prefill_devices) // args.prefill_pp} "
+        f"({len(prefill_devices)} devices); decode: PP1 TS{len(decode_devices)} "
+        f"({len(decode_devices)} devices); context: {args.ctx_len}"
+    )
 
     model = None
     if not (args.prefill_qpc_path and args.decode_qpc_path):
@@ -73,14 +90,24 @@ def main():
             "expert_parallel_chunk_size": 32,
         }
         decode_qpc = model.compile(
-            num_cores=4, aic_hw_version="ai200", num_devices=len(decode_devices),
-            mxfp6_matmul=True, mxint8_kv_cache=True,
-            batch_size=1, full_batch_size=1, prefill_seq_len=1, ctx_len=args.ctx_len,
+            num_cores=4,
+            aic_hw_version="ai200",
+            num_devices=len(decode_devices),
+            mxfp6_matmul=True,
+            mxint8_kv_cache=True,
+            batch_size=1,
+            full_batch_size=1,
+            prefill_seq_len=1,
+            ctx_len=args.ctx_len,
             # Expert-parallel decode distributes the 128 experts across four AI200s.
             qaic_config={"moe_config": decode_moe_config},
-            mos=1, aic_enable_depth_first=True,
-            offload_pt_weights=False, split_retained_state_io=True,
-            retain_full_kv=True, use_onnx_subfunctions=False,
+            mdp_num_partitions=1,
+            mos=1,
+            aic_enable_depth_first=True,
+            offload_pt_weights=False,
+            split_retained_state_io=True,
+            retain_full_kv=True,
+            use_onnx_subfunctions=False,
         )
 
     if args.prefill_qpc_path:
@@ -88,19 +115,27 @@ def main():
     else:
         assert model is not None
         prefill_qpc = model.compile(
-            num_cores=4, aic_hw_version="ai200", num_devices=len(prefill_devices),
-            mxfp6_matmul=True, mxint8_kv_cache=True,
-            batch_size=1, full_batch_size=1, prefill_seq_len=128, ctx_len=args.ctx_len,
+            num_cores=4,
+            aic_hw_version="ai200",
+            num_devices=len(prefill_devices),
+            mxfp6_matmul=True,
+            mxint8_kv_cache=True,
+            batch_size=1,
+            full_batch_size=1,
+            prefill_seq_len=128,
+            ctx_len=args.ctx_len,
             qaic_config={"moe_config": {"flavour": "expert_parallel", "expert_parallel_chunk_size": 128}},
-            mdp_num_partitions=1, split_retained_state_io=True, retain_full_kv=True,
-            mos=1, aic_enable_depth_first=False, prefill_only=True,
-            enable_chunking=True, use_onnx_subfunctions=True,
+            mdp_num_partitions=args.prefill_pp,
+            mdp_strategy="onnx",
+            split_retained_state_io=True,
+            retain_full_kv=True,
+            mos=1,
+            aic_enable_depth_first=False,
+            prefill_only=True,
+            enable_chunking=True,
+            use_onnx_subfunctions=True,
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    encoded = tokenizer(args.prompt, return_tensors="np")
-    prompt_len = int(encoded["input_ids"].shape[1])
-    padded_len = ((prompt_len + 128 - 1) // 128) * 128
     encoded = tokenizer(args.prompt, return_tensors="np", padding="max_length", max_length=padded_len)
     inputs = {
         "input_ids": encoded["input_ids"],
@@ -109,13 +144,24 @@ def main():
     }
 
     prefill_session = QAICInferenceSession(
-        prefill_qpc, device_ids=prefill_devices, kv_dma_share=True,
-        stages=1, full_batch_size=1, cluster_id="prefill",
+        prefill_qpc,
+        device_ids=prefill_devices,
+        kv_dma_share=True,
+        stages=args.prefill_pp,
+        full_batch_size=1,
+        cluster_id="prefill",
     )
     decode_session = QAICInferenceSession(
-        decode_qpc, device_ids=decode_devices, kv_dma_share=True,
-        full_batch_size=1, cluster_id="decode",
+        decode_qpc,
+        device_ids=decode_devices,
+        kv_dma_share=True,
+        full_batch_size=1,
+        cluster_id="decode",
     )
+    if prefill_session.kv_cache_info != decode_session.kv_cache_info:
+        raise ValueError("prefill/decode QPC retained KV shapes and dtypes must match")
+    if any(shape[2] != args.ctx_len for shape, _ in decode_session.kv_cache_info):
+        raise ValueError("QPC KV context differs from --ctx-len; recompile both packages")
     kv_caches = [np.zeros(shape, dtype=dtype) for shape, dtype in decode_session.kv_cache_info]
     decode_kv_map = decode_session.decode_buff_map + decode_session.decode_rs_kv_only_buff_map
 
@@ -126,7 +172,8 @@ def main():
         chunk["input_ids"] = inputs["input_ids"][:, offset : offset + 128]
         chunk["position_ids"] = inputs["position_ids"][:, offset : offset + 128]
         exec_idx = prefill_session.np_run_pipeline(
-            chunk, last_chunk=offset + 128 == padded_len,
+            chunk,
+            last_chunk=offset + 128 == padded_len,
             kv_cache_buffers=kv_caches if offset + 128 == padded_len else None,
         )
         prefill_session.complete_inf(exec_idx, is_prefill=True)
@@ -143,8 +190,10 @@ def main():
     decode_start = perf_counter()
     for _ in range(decode_steps):
         decode_session.set_data_for_kv_handoff(
-            kv_caches + kv_caches, [("batch_index", 0), ("ctx_start", 0)],
-            index=decode_session.decode_execObj_idx, buff_map=decode_kv_map,
+            kv_caches + kv_caches,
+            [("batch_index", 0), ("ctx_start", 0)],
+            index=decode_session.decode_execObj_idx,
+            buff_map=decode_kv_map,
         )
         exec_idx = decode_session.np_run(decode_inputs, is_prefill=False)
         decode_session.complete_inf(exec_idx, is_prefill=False)

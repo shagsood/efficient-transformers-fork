@@ -41,7 +41,8 @@ def main() -> None:
     parser.add_argument("--decode-qpc-path", required=True)
     parser.add_argument("--prefill-device-group", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--decode-device-group", default="8,9,10,11")
-    parser.add_argument("--ctx-len", type=int, default=1024)
+    parser.add_argument("--ctx-len", type=int, default=16384)
+    parser.add_argument("--prefill-pp", type=int, default=2, help="Must match the prefill QPC pipeline partitions")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--prefill-port", type=int, default=18001)
@@ -54,22 +55,23 @@ def main() -> None:
         decode_qids = parse_qids(args.decode_device_group, "--decode-device-group", 4)
         if set(prefill_qids) & set(decode_qids):
             raise ValueError("prefill and decode device groups must be disjoint")
+        if args.prefill_pp < 1 or len(prefill_qids) % args.prefill_pp:
+            raise ValueError("--prefill-pp must be positive and divide the prefill device count")
+        if args.ctx_len < 128 or args.ctx_len % 128:
+            raise ValueError("--ctx-len must be a positive multiple of 128")
         prefill_qpc = qpc_path(args.prefill_qpc_path, "--prefill-qpc-path")
         decode_qpc = qpc_path(args.decode_qpc_path, "--decode-qpc-path")
     except ValueError as error:
         parser.error(str(error))
 
     try:
-        from vllm.platforms import current_platform
         from vllm.model_executor.models.cohere2_moe import Cohere2MoeForCausalLM  # noqa: F401
+        from vllm.platforms import current_platform
 
         current_platform.package_root = "vllm_qaic"
         import qaic_disagg.__main__ as disagg
     except ImportError as error:
-        parser.error(
-            "qaic_disagg requires the Qualcomm vLLM-QAIC environment with Cohere2-MoE vLLM support: "
-            f"{error}"
-        )
+        parser.error(f"qaic_disagg requires the Qualcomm vLLM-QAIC environment with Cohere2-MoE vLLM support: {error}")
 
     site_dir = Path(__file__).with_name("cohere2_moe_qaic_site")
     real_popen = disagg.subprocess.Popen
@@ -133,7 +135,9 @@ def main() -> None:
         "--decode-device-group",
         args.decode_device_group,
         "--prefill-pipeline-parallel-size",
-        "1",
+        str(args.prefill_pp),
+        "--prefill-tensor-parallel-size",
+        str(len(prefill_qids) // args.prefill_pp),
         "--prefill-max-num-seqs",
         "1",
         "--decode-max-num-seqs",

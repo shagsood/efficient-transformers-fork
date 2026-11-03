@@ -7,18 +7,36 @@
 
 `cohere2_moe_ai200_disagg.py` compiles separate MXFP6/MXINT8-KV QPCs for
 `CohereLabs/North-Mini-Code-1.0`, hands off retained KV state through DMA, and
-greedily generates 32 tokens. It requires 12 ready, disjoint AI200 QIDs:
+greedily generates 32 tokens. Defaults are 16,384-token context, PP2 TS4 prefill
+(eight devices total), and PP1 TS4 decode (four devices total). It requires 12
+ready, disjoint AI200 QIDs:
 
 ```bash
 python -m pip install --upgrade "transformers==5.9.0"
 python3 examples/disagg_serving/cohere2_moe_ai200_disagg.py \
   --prefill-device-group 0,1,2,3,4,5,6,7 \
-  --decode-device-group 8,9,10,11
+  --decode-device-group 8,9,10,11 \
+  --prefill-pp 2 --ctx-len 16384
 ```
 
 Reuse QPCs without recompiling by passing both `--prefill-qpc-path` and
 `--decode-qpc-path`. This is a direct QEff/QAIC runtime example; it has no
-vLLM dependency. Earlier Transformers releases do not expose the required
+vLLM dependency. Both packages must be compiled for the requested context and
+topology; old 1K
+or PP1 prefill packages cannot be reused as 16K/PP2 packages. Prefill PP is set
+through `compile(mdp_num_partitions=..., num_devices=...)`, with ONNX-derived
+partitions; the DMA session uses the same `stages` count. `--prefill-pp` must
+divide the prefill device count. PP and 128-token prompt chunking are independent.
+The prompt plus requested generation must fit the context, and the padded prefill
+chunk must fit too. These are example settings, not new 16K hardware parity or
+performance evidence.
+
+The AI100 example `examples/text_generation/cohere2_moe_example.py` also defaults
+to 16K and PP2 prefill. Its eight default QIDs split into PP2 TS2 prefill and
+PP1 TS4 decode (eight concurrent devices); pass explicit disjoint device groups
+to select a different total.
+
+Earlier Transformers releases do not expose the required
 `transformers.models.cohere2_moe` module.
 
 ### Serve precompiled QPCs with `qaic_disagg`
@@ -30,12 +48,15 @@ not recompile the QPCs below:
 ```bash
 python3 examples/disagg_serving/cohere2_moe_ai200_qaic_disagg.py \
   --prefill-qpc-path /absolute/path/to/prefill/qpc \
-  --decode-qpc-path /absolute/path/to/decode/qpc
+  --decode-qpc-path /absolute/path/to/decode/qpc \
+  --prefill-pp 2 --ctx-len 16384
 ```
 
 The launcher uses QIDs `0-7` for prefill and `8-11` for decode by default. It
 requires the two QPCs to have been compiled with the same 8+4 topology, AI200,
-MXFP6 weights, MXINT8 KV cache, and `ctx_len`. It starts the API server at
+MXFP6 weights, MXINT8 KV cache, prefill PP, and `ctx_len`. The launcher passes
+explicit `--prefill-pipeline-parallel-size` and `--prefill-tensor-parallel-size`
+to current `qaic_disagg`, rather than a deprecated `stages` override. It starts the API server at
 `http://localhost:18000`; prefill and decode child processes receive disjoint
 `QAIC_VISIBLE_DEVICES` values automatically.
 

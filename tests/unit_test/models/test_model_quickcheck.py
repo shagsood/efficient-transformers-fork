@@ -4805,3 +4805,106 @@ def test_kimi_k25_get_specializations_supports_multi_resolution_grid_sizes():
             num_patches=2508,
             kv_offload=True,
         )
+
+
+@pytest.mark.parametrize(
+    "example", ["text_generation/cohere2_moe_example.py", "disagg_serving/cohere2_moe_ai200_disagg.py"]
+)
+@pytest.mark.parametrize("pp", [2, 4])
+def test_cohere2_moe_example_pipeline_and_context(monkeypatch, example, pp):
+    import runpy
+    import sys
+
+    compiled, sessions, chunks = [], [], []
+
+    class Tokenizer:
+        def __call__(self, prompt, **kwargs):
+            length = kwargs.get("max_length", 129)
+            mask = np.zeros((1, length), dtype=np.int64)
+            mask[:, :129] = 1
+            return {"input_ids": np.ones_like(mask), "attention_mask": mask}
+
+        def decode(self, tokens):
+            return "example output"
+
+    def compile_qpc(**kwargs):
+        compiled.append(kwargs)
+        return "prefill" if kwargs.get("prefill_only") else "decode"
+
+    class Session:
+        def __init__(self, qpc, **kwargs):
+            sessions.append((qpc, kwargs))
+            self.kv_cache_info = [((1, 1, 16384, 1), np.dtype("uint8"))]
+            self.decode_buff_map = [("past_key.0", 0)]
+            self.decode_rs_kv_only_buff_map = [("past_key.0_RetainedState", 1)]
+            self.decode_execObj_idx = 0
+
+        def np_run_pipeline(self, inputs, **kwargs):
+            chunks.append((inputs["input_ids"].shape, kwargs["last_chunk"]))
+            return 0
+
+        def np_run(self, *args, **kwargs):
+            return 0
+
+        def complete_inf(self, *args, **kwargs):
+            pass
+
+        def set_data_for_kv_handoff(self, *args, **kwargs):
+            pass
+
+        def get_outputs(self, **kwargs):
+            return {"logits": np.array([[[0.0, 1.0]]])}
+
+    tokenizer = SimpleNamespace(from_pretrained=lambda *args, **kwargs: Tokenizer())
+    model = SimpleNamespace(from_pretrained=lambda *args, **kwargs: SimpleNamespace(compile=compile_qpc))
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(AutoTokenizer=tokenizer))
+    monkeypatch.setitem(sys.modules, "QEfficient", SimpleNamespace(QEFFAutoModelForCausalLM=model))
+    monkeypatch.setitem(sys.modules, "QEfficient.generation.cloud_infer", SimpleNamespace(QAICInferenceSession=Session))
+    path = Path(__file__).resolve().parents[3] / "examples" / example
+    main = runpy.run_path(str(path))["main"]
+    options = [] if pp == 2 else ["--prefill-pp", str(pp)]
+    monkeypatch.setattr(sys, "argv", [str(path), "--generation-len", "2", *options])
+    main()
+    decode, prefill = compiled
+    assert decode["ctx_len"] == prefill["ctx_len"] == 16384
+    assert decode["mdp_num_partitions"] == 1
+    assert prefill["mdp_num_partitions"] == pp and prefill["mdp_strategy"] == "onnx"
+    assert sessions[0][1]["stages"] == pp
+    assert len(sessions[0][1]["device_ids"]) == prefill["num_devices"]
+    assert chunks == [((1, 128), False), ((1, 128), True)]
+    for options in (["--prefill-pp", "3"], ["--ctx-len", "128"], ["--generation-len", "0"]):
+        monkeypatch.setattr(sys, "argv", [str(path), *options])
+        with pytest.raises(SystemExit):
+            main()
+    assert len(compiled) == 2
+
+
+def test_cohere2_moe_serving_pipeline_flags(monkeypatch, tmp_path):
+    import runpy
+    import sys
+    from types import ModuleType
+
+    disagg = SimpleNamespace(subprocess=SimpleNamespace(Popen=MagicMock()), main=lambda: None)
+    package = ModuleType("qaic_disagg")
+    package.__main__ = disagg
+    monkeypatch.setitem(sys.modules, "qaic_disagg", package)
+    monkeypatch.setitem(sys.modules, "qaic_disagg.__main__", disagg)
+    monkeypatch.setitem(sys.modules, "vllm.platforms", SimpleNamespace(current_platform=SimpleNamespace()))
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.models.cohere2_moe", SimpleNamespace(Cohere2MoeForCausalLM=object)
+    )
+    for name in ("prefill", "decode"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "programqpc.bin").touch()
+    path = Path(__file__).resolve().parents[3] / "examples/disagg_serving/cohere2_moe_ai200_qaic_disagg.py"
+    main = runpy.run_path(str(path))["main"]
+    options = ["--prefill-qpc-path", str(tmp_path / "prefill"), "--decode-qpc-path", str(tmp_path / "decode")]
+    for pp in (2, 4):
+        monkeypatch.setattr(sys, "argv", [str(path), *options, "--prefill-pp", str(pp)])
+        main()
+        assert sys.argv[sys.argv.index("--prefill-pipeline-parallel-size") + 1] == str(pp)
+        assert sys.argv[sys.argv.index("--prefill-tensor-parallel-size") + 1] == str(8 // pp)
+        assert sys.argv[sys.argv.index("--max-model-len") + 1] == "16384"
+    monkeypatch.setattr(sys, "argv", [str(path), *options, "--prefill-pp", "3"])
+    with pytest.raises(SystemExit):
+        main()
